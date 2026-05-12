@@ -1,70 +1,94 @@
 # PVT Studio — Equinor-themed PVT Application
 
-Streamlit app for petroleum-engineering PVT analysis. Five fluid types,
-correlation and EOS modes, four lab experiments, phase envelopes, standalone
-flash calculator, and ECLIPSE keyword export.
+Full-featured petroleum-engineering PVT analysis tool. Six analysis modes,
+correlation and EOS approaches, lab experiments, phase envelopes, EOS tuning,
+multi-region export, multi-stage separators, Monte Carlo uncertainty,
+hydrate likelihood screening, and ECLIPSE keyword export in FIELD or METRIC units.
 
 ## Run
-```
+```bash
 pip install -r requirements.txt
 streamlit run pvt_app.py
 ```
 
-## What's in this iteration
+## Modes (sidebar selector)
+1. **Oil (Black Oil)** — Standing / Vasquez-Beggs / Glaso / Lasater correlations
+   plus optional companion PVDG export, CCE experiment, and Monte Carlo
+   uncertainty analysis with tornado plot.
+2. **Dry Gas** — Hall-Yarborough / Dranchuk-Abou-Kassem Z-factor with
+   Wichert-Aziz sour-gas correction.
+3. **Wet Gas / Condensate** — McCain recombination + linear-Pdew Rv model,
+   plus optional companion PVTO export for dropped-out condensate.
+4. **Water** — McCain, Meehan, Numbere, Spivey-Valko-McCain correlations.
+5. **Compositional (EOS)** — full Peng-Robinson with 9 sub-tabs:
+   *Lab Experiments • Phase Envelope • Flash Calculator • Separator Train •
+   EOS Tuning • Multi-Region • Monte Carlo • Docs • ECLIPSE Export*.
+6. **❄️ Hydrate Likelihood** — Makogon hydrate envelope, P-T diagram with
+   operating-point indicator, traffic-light risk banner, and Hammerschmidt
+   inhibitor concentration recommendation.
 
-### Visual / UX
-- Equinor color palette (Torch Red `#EB0037`, dark navy `#00243D`, Karry, Pistachio)
-- Dark-navy header band with red accent stripe
-- Plotly-based interactive charts (zoom, hover tooltips, equinor color sequence)
-- Metric cards with red left borders
-- Custom CSS for tables, code blocks, buttons, alerts
-- `.streamlit/config.toml` sets primary color so widgets pick up the theme
+## Featured this revision
 
-### Fluids
-- **Oil (Black Oil)** — Standing, Vasquez-Beggs, Glaso, Lasater correlations
-- **Dry Gas** — HY / DAK Z, LGE / CKB viscosity, with Wichert-Aziz sour-gas
-- **Wet Gas / Condensate** — McCain recombination + linear-Pdew Rv model
-- **Water** — McCain, Meehan, Numbere, Spivey-Valko-McCain
-- **Compositional (EOS)** — full Peng-Robinson with C7+ characterization
+### Bug fix
+- **styled_dataframe crash** on string columns (newer pandas reports
+  dtype as `str`, not `object`). Switched to `pd.api.types.is_numeric_dtype`
+  and Streamlit `column_config` formatting.
 
-### Compositional mode — four tabs
-1. **Lab Experiments** — Black-oil table, Flash, CCE, CVD, DLE
-2. **Phase Envelope** — bubble locus, dew locus, estimated critical point,
-   reservoir (P,T) marker, cricondenbar / cricondentherm metrics
-3. **Flash Calculator** — single-stage flash at any (P,T): phase compositions,
-   K-values, Z-factors, densities, viscosities for each phase
-4. **ECLIPSE Export** — PVTO or PVTG with optional PVTW
+### ECLIPSE export
+- Separate **FIELD / METRIC** unit toggle inside the Export tab,
+  independent of the display-unit toggle in the sidebar.
+- **DENSITY keyword** correctly generated and included in all exports
+  (single-region and multi-region), with real surface densities computed
+  from the EOS standard-conditions split.
+- **RSVD / RVVD** vs depth keywords for compositional grading.
 
-### Units
-Field ↔ SI toggle in sidebar. Inputs, tables, and charts all flip; ECLIPSE
-output stays in field (the spec).
+### Multi-region PVT (fixed)
+- Each PVTNUM region gets its own PVTO/PVTG body stacked under a single
+  keyword.
+- DENSITY keyword now emits one entry per region using EOS-computed surface
+  densities (no more placeholder values).
 
-### Composition input
-- Normalize button (rescale Σz to 1.0)
-- Reset button (restore default black-oil composition)
-- Live Σz indicator (green if within 1e-3 of 1.0)
-- C7+ MW and SG → Kesler-Lee Tc/Pc/ω characterization
+### Multi-stage separator train
+- Configure 1–3 stages with P, T per stage, or load presets.
+- Reports per-stage breakdown (vapor mole fraction, oil/gas out),
+  total field GOR, ST oil API, combined gas SG.
+
+### ❄️ Hydrate likelihood (new)
+- **Makogon (1981) correlation** for hydrate formation P-T envelope.
+- **Sour-gas correction**: H2S lowers P_hyd by ~5% per mol%; CO2 by ~1.5% per mol%.
+- **Traffic-light risk banner** (red/amber/green) at operating (P, T).
+- **P-T diagram** with hydrate locus shaded and operating point marked.
+- **Hammerschmidt inhibitor calculator**: methanol, MEG, DEG, TEG wt%
+  required to suppress hydrate formation by a chosen ΔT.
+- Validity range: 32–75 °F, 0.55 ≤ gas SG ≤ 1.0.
 
 ## File map
-- `pvt_app.py`         — Streamlit UI (tabbed for Compositional mode)
-- `theme.py`           — Equinor colors, CSS, Plotly layout helpers
-- `phase_envelope.py`  — Bubble/dew locus tracer + critical estimation
-- `experiments.py`     — Flash, CCE, CVD, DLE simulations
-- `eos_pr.py`          — Peng-Robinson EOS, stability test, flash, saturation P
-- `lbc.py`             — Lohrenz-Bray-Clark viscosity
-- `composition_pvt.py` — Compositional black-oil table generation
-- `components.py`      — Component library + C7+ Kesler-Lee characterization
-- `correlations.py`    — Oil/gas/wet-gas/water correlations
-- `eclipse_export.py`  — PVTO/PVDG/PVTG/PVTW/DENSITY keyword formatters
-- `units.py`           — Field ↔ SI conversions
-- `.streamlit/config.toml` — Streamlit theme (Torch Red primary)
+- `pvt_app.py`                  — Streamlit UI (~2000 lines)
+- `hydrate.py`                  — Makogon hydrate prediction + Hammerschmidt
+- `theme.py`                    — Equinor colors, CSS, Plotly layout helpers
+- `phase_envelope.py`           — Bubble/dew locus tracer
+- `experiments.py`              — EOS-based Flash, CCE, CVD, DLE
+- `correlation_experiments.py`  — CCE/CVD from black-oil correlations
+- `separator.py`                — Multi-stage surface separator flash
+- `eos_tuning.py`               — Levenberg-Marquardt EOS regression
+- `multi_region.py`             — Multi-region ECLIPSE PVT export
+- `monte_carlo.py`              — MC sampling + tornado sensitivity
+- `eos_pr.py`                   — Peng-Robinson EOS, stability test, flash, sat-P
+- `lbc.py`                      — Lohrenz-Bray-Clark viscosity
+- `composition_pvt.py`          — Compositional black-oil table generation
+- `components.py`               — Component library + Kesler-Lee C7+
+- `correlations.py`             — Oil/gas/wet-gas/water correlations
+- `eclipse_export.py`           — ECLIPSE keyword formatters (FIELD + METRIC)
+- `units.py`                    — Field ↔ SI display conversion
+- `.streamlit/config.toml`      — Streamlit Equinor theme
 
 ## Notes
-The phase envelope uses single-T saturation searches at each sample point.
-This is robust but slower than a true predictor-corrector continuation method.
-For ~25 sampling points it takes 10–30 seconds. The critical point estimate
-is a midpoint between the two branch endpoints; it's a reasonable indicator
-but not a rigorously located critical.
-
-The flash calculator can be used independently of the experiments — change
-T or P inside the tab and re-flash without recomputing tables.
+- The DENSITY keyword is required by ECLIPSE when oil and gas phases are
+  present in the deck. The app now always emits it with EOS-computed
+  surface densities (rather than placeholders).
+- Hydrate analysis is a first-pass screening; for sour systems with
+  > 15% H2S or temperatures outside 32–75 °F, use a rigorous flash-based
+  hydrate model (CSMHyd, PVTsim, Multiflash).
+- Phase envelope tracing: 25 points takes 10–30 s; 60 points 1–2 min.
+- EOS tuning: 30 iterations × 5 fn-evals each typically 30–90 s.
+- Monte Carlo (Oil branch): 1000 samples ≈ 3 s.
