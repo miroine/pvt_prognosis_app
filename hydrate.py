@@ -68,7 +68,7 @@ def hydrate_pressure_makogon(T_F, gas_sg, H2S_frac=0.0, CO2_frac=0.0):
 
 
 def hydrate_temperature_makogon(P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
-                                  T_low=20.0, T_high=80.0):
+                                  T_low=33.0, T_high=75.0):
     """
     Inverse: find the hydrate-formation T at given P.
     Bisection over T to find P_hydrate(T) = P_psia.
@@ -211,6 +211,114 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
             )
 
     return result
+
+
+def cooldown_time_to_hydrate(T_op_F, P_op_psia, T_ambient_F,
+                                gas_sg, H2S_frac=0.0, CO2_frac=0.0,
+                                U_pipe=2.0, D_outer_ft=0.667,
+                                rho_fluid=50.0, cp_fluid=0.5):
+    """
+    Estimate the time for a subsea flowline to cool from operating T to the
+    hydrate-formation T at the operating P after shutdown.
+
+    Lumped-capacitance heat transfer model (no flow):
+        T(t) = T_ambient + (T_op - T_ambient) * exp(-k * t / (rho * cp * D/4))
+
+    Args:
+        T_op_F      : Initial fluid temperature (°F)
+        P_op_psia   : Operating pressure (psia)
+        T_ambient_F : Surrounding seawater temperature (°F), typically 36-40°F
+                      at subsea depth.
+        gas_sg, H2S_frac, CO2_frac : gas properties for hydrate-T lookup
+        U_pipe      : Overall heat-transfer coefficient (BTU/hr/ft2/°F),
+                      typical 1-3 for insulated pipe, 5-15 for bare.
+        D_outer_ft  : Pipe outer diameter (ft); 0.667 ≈ 8".
+        rho_fluid   : Fluid density (lb/ft3)
+        cp_fluid    : Fluid specific heat (BTU/lb/°F), ~0.5 for crude.
+
+    Returns dict with:
+        T_hydrate_F  : Hydrate-formation T at operating P
+        delta_T_F    : T_op - T_hydrate
+        time_hours   : Hours from shutdown to reach T_hydrate
+        time_minutes : Same in minutes (handy for cooldown protocol)
+    """
+    # Hydrate temperature at operating P
+    T_hyd_F = hydrate_temperature_makogon(P_op_psia, gas_sg, H2S_frac, CO2_frac)
+    if np.isnan(T_hyd_F):
+        return {
+            "T_hydrate_F": np.nan,
+            "delta_T_F":   np.nan,
+            "time_hours":  np.nan,
+            "time_minutes": np.nan,
+            "message": ("Hydrate temperature outside the Makogon correlation's "
+                         "valid range — use a rigorous hydrate model."),
+        }
+
+    if T_op_F <= T_hyd_F:
+        return {
+            "T_hydrate_F": T_hyd_F,
+            "delta_T_F":   T_op_F - T_hyd_F,
+            "time_hours":  0.0,
+            "time_minutes": 0.0,
+            "message": "Already at or below hydrate T — inject inhibitor now.",
+        }
+
+    if T_op_F <= T_ambient_F + 1.0:
+        # No driving force for cooldown
+        return {
+            "T_hydrate_F": T_hyd_F,
+            "delta_T_F":   T_op_F - T_hyd_F,
+            "time_hours":  float('inf'),
+            "time_minutes": float('inf'),
+            "message": "Fluid is already at ambient — won't cool further.",
+        }
+
+    # Lumped-capacitance: T(t) = T_amb + (T_op - T_amb) * exp(-t/tau)
+    # tau = rho * cp * V / (U * A) = rho * cp * D / (4 * U)  [for a pipe per unit length]
+    # Convert units: rho [lb/ft3], cp [BTU/lb/°F], D [ft], U [BTU/hr/ft2/°F]
+    tau_hr = rho_fluid * cp_fluid * D_outer_ft / (4.0 * U_pipe)
+
+    # Solve T(t) = T_hyd for t:
+    # T_hyd = T_amb + (T_op - T_amb) * exp(-t/tau)
+    # exp(-t/tau) = (T_hyd - T_amb) / (T_op - T_amb)
+    ratio = (T_hyd_F - T_ambient_F) / (T_op_F - T_ambient_F)
+    if ratio <= 0:
+        # Hydrate T is below ambient — pipe cools to ambient but never reaches
+        # hydrate-zone T, so it's "infinite" cooldown — actually safe.
+        return {
+            "T_hydrate_F": T_hyd_F,
+            "delta_T_F":   T_op_F - T_hyd_F,
+            "time_hours":  float('inf'),
+            "time_minutes": float('inf'),
+            "message": (f"Hydrate T ({T_hyd_F:.1f}°F) is below ambient "
+                         f"({T_ambient_F:.1f}°F). Pipe cannot cool below ambient — "
+                         f"no hydrate risk from cooldown alone."),
+        }
+
+    t_hr = -tau_hr * np.log(ratio)
+    return {
+        "T_hydrate_F": T_hyd_F,
+        "delta_T_F":   T_op_F - T_hyd_F,
+        "tau_hours":   tau_hr,
+        "time_hours":  t_hr,
+        "time_minutes": t_hr * 60.0,
+        "message": (f"Cooldown time to hydrate zone: {t_hr:.2f} hours "
+                     f"({t_hr*60:.0f} minutes). Pipe time constant τ = "
+                     f"{tau_hr:.2f} hr."),
+    }
+
+
+def cooldown_curve(T_op_F, T_ambient_F, U_pipe, D_outer_ft, rho_fluid,
+                    cp_fluid, t_end_hours=24.0, n_points=100):
+    """
+    Generate T vs time curve for the lumped-capacitance cooldown.
+
+    Returns (times_hours, temps_F) for plotting.
+    """
+    tau_hr = rho_fluid * cp_fluid * D_outer_ft / (4.0 * U_pipe)
+    times = np.linspace(0, t_end_hours, n_points)
+    temps = T_ambient_F + (T_op_F - T_ambient_F) * np.exp(-times / tau_hr)
+    return times, temps
 
 
 def inhibitor_concentration_hammerschmidt(T_shift_F, inhibitor="methanol"):

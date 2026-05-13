@@ -20,16 +20,72 @@ from eclipse_export import (build_pvto, build_pvdg, build_pvtg,
 import units as U
 import theme as TH
 
+from fluid_registry import make_fluid_record, to_json, from_json, summarize
+from export_utils import (df_to_csv_bytes, to_json_bytes,
+                            build_api_payload, build_pdf_report)
+from composition_guess import guess_oil_composition, guess_gas_composition
+
 # ----------------------------------------------------------------
 # Page setup
 # ----------------------------------------------------------------
 st.set_page_config(page_title="PVT Studio", page_icon="●", layout="wide")
 st.markdown(TH.CUSTOM_CSS, unsafe_allow_html=True)
-st.markdown(TH.header_banner(
-    "PVT Studio",
-    "Black oil • Dry gas • Wet gas • Water • Compositional (EOS) — "
-    "with phase envelopes, lab experiments, and ECLIPSE export"),
+
+# Mascot header (inline SVG, no external dependency)
+from mascot import header_with_mascot
+st.markdown(
+    header_with_mascot(
+        "PVT Studio",
+        "Black oil • Dry gas • Wet gas • Water • Compositional (EOS) • "
+        "Hydrate • Rock compressibility — built by Merouane Hamdani"),
     unsafe_allow_html=True)
+
+with st.expander("📄 License, disclaimer, and how to cite"):
+    st.markdown("""
+**MIT License** — Copyright © 2026 Merouane Hamdani
+
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> **THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED**, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+### ⚠️ Early-phase tool — disclaimer
+
+PVT Studio is an **early-phase screening tool**, intended for:
+
+- Educational and training purposes
+- Rapid first-pass PVT calculations
+- Building intuition about fluid behavior
+
+It is **NOT** intended for:
+- Final reservoir-simulation deck input without independent validation
+- Safety-critical flow assurance decisions
+- Final field development planning
+
+Correlation predictions, EOS tuning, hydrate likelihood, and ECLIPSE export
+must be **validated against measured lab PVT data and rigorous reservoir-grade
+software** (PVTsim Nova, Whitson, Multiflash, CMG WinProp, Schlumberger PVTi)
+before use in field design.
+
+### How to cite
+
+> Hamdani, M. (2026). *PVT Studio: Open-source PVT modeling tool with
+> ECLIPSE export.* MIT License.
+
+### Owner / contact
+
+**Merouane Hamdani** — primary author and maintainer.
+""")
+
 
 with st.expander("ℹ️ Quick help — how to use this app"):
     st.markdown("""
@@ -76,7 +132,8 @@ with st.sidebar:
     fluid = st.selectbox("Fluid type / Analysis",
                          ["Oil (Black Oil)", "Dry Gas", "Wet Gas / Condensate",
                           "Water", "Compositional (EOS)",
-                          "❄️ Hydrate Likelihood"])
+                          "❄️ Hydrate Likelihood",
+                          "🪨 Rock Compressibility"])
 
     st.markdown("### Reservoir Conditions")
     if unit_system == "Field":
@@ -103,7 +160,31 @@ with st.sidebar:
     P_max = U.to_field_P(P_max_user, unit_system)
     n_points = st.slider("Number of pressure points", 5, 40, 15)
 
+    st.markdown("### ECLIPSE Export")
+    enable_eclipse_export = st.checkbox(
+        "Enable ECLIPSE export", value=True,
+        help="When OFF, all ECLIPSE export panels and download buttons are hidden. "
+             "Use this when you only need PVT analysis without simulator-ready files.")
+    if enable_eclipse_export:
+        eclipse_unit_choice = st.radio(
+            "ECLIPSE deck unit system", ["FIELD", "METRIC"],
+            horizontal=True, key="global_eclipse_units",
+            help=("Independent of the Field/SI display toggle. ECLIPSE keywords "
+                  "must be in consistent units (set via RUNSPEC). "
+                  "Internal calcs are FIELD, METRIC is converted at output."))
+    else:
+        eclipse_unit_choice = "FIELD"   # default unused
     include_water = st.checkbox("Add PVTW to ECLIPSE export", value=True)
+
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "<div style='font-size:11px; color:#666; line-height:1.4;'>"
+        "<b>PVT Studio v1.0</b><br>"
+        "© M. Hamdani — MIT License<br>"
+        "<i>Early-phase tool — see disclaimer above.</i>"
+        "</div>",
+        unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------
@@ -170,6 +251,104 @@ pressures = np.linspace(P_min, P_max, n_points)
 
 
 # ================================================================
+# Shared utilities: fluid registry + per-branch Tools panel
+# ================================================================
+if "fluid_registry" not in st.session_state:
+    st.session_state["fluid_registry"] = {}
+
+
+def render_tools_section(branch_name, fluid_type, units, parameters,
+                          outputs_summary, results_table_df=None, tuning=None):
+    """Render the common Tools section: save fluid, exports, etc."""
+    st.markdown("---")
+    with st.expander("🧰 Tools — save fluid · export CSV / JSON / PDF"):
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("##### Save this fluid")
+            fluid_name = st.text_input("Fluid name", value=f"{branch_name}_default",
+                                         key=f"savename_{branch_name}")
+            notes = st.text_area("Notes (optional)", value="",
+                                   key=f"savenotes_{branch_name}", height=70)
+            if st.button("💾 Save to registry", key=f"savebtn_{branch_name}"):
+                rec = make_fluid_record(
+                    name=fluid_name, fluid_type=fluid_type, units=units,
+                    parameters=parameters, tuning=tuning, notes=notes)
+                st.session_state["fluid_registry"][fluid_name] = rec
+                st.success(f"Saved '{fluid_name}' to in-session registry.")
+
+            # Show registry contents
+            if st.session_state["fluid_registry"]:
+                st.caption("**Saved fluids in this session:**")
+                for nm, rec in st.session_state["fluid_registry"].items():
+                    st.caption(f"• {nm} — {summarize(rec)}")
+
+            # Download/upload registry as JSON
+            if st.session_state["fluid_registry"]:
+                reg_json = to_json(list(st.session_state["fluid_registry"].values()))
+                st.download_button("⬇️ Download all saved fluids (.json)",
+                                    reg_json, file_name="pvt_fluids.json",
+                                    mime="application/json",
+                                    key=f"dl_reg_{branch_name}")
+            uploaded = st.file_uploader("Or upload a fluids JSON",
+                                          type=["json"], key=f"ul_reg_{branch_name}")
+            if uploaded is not None:
+                try:
+                    records = from_json(uploaded.read().decode())
+                    if isinstance(records, dict):
+                        records = [records]
+                    for r in records:
+                        st.session_state["fluid_registry"][r["name"]] = r
+                    st.success(f"Loaded {len(records)} fluid(s) into the registry.")
+                except Exception as e:
+                    st.error(f"Could not parse JSON: {e}")
+
+        with cols[1]:
+            st.markdown("##### Export results")
+
+            # CSV
+            if results_table_df is not None:
+                csv_bytes = df_to_csv_bytes(results_table_df)
+                st.download_button("⬇️ CSV (results table)", csv_bytes,
+                                    file_name=f"{branch_name}_results.csv",
+                                    mime="text/csv",
+                                    key=f"csv_{branch_name}")
+
+            # JSON API payload
+            payload = build_api_payload(
+                fluid_type=fluid_type, units=units,
+                inputs=parameters,
+                outputs={
+                    "summary": outputs_summary,
+                    "table": results_table_df.to_dict("records")
+                              if results_table_df is not None else None,
+                },
+                metadata={"branch": branch_name})
+            json_bytes = to_json_bytes(payload)
+            st.download_button("⬇️ JSON (API payload)", json_bytes,
+                                file_name=f"{branch_name}_payload.json",
+                                mime="application/json",
+                                key=f"json_{branch_name}")
+
+            # PDF
+            if st.button("📄 Generate PDF report", key=f"pdfbtn_{branch_name}"):
+                pdf_bytes = build_pdf_report(
+                    title=f"PVT Studio — {branch_name} Analysis",
+                    fluid_type=fluid_type, units=units,
+                    inputs=parameters, outputs_text=outputs_summary,
+                    tables=[("Results", results_table_df)]
+                           if results_table_df is not None else None)
+                if pdf_bytes is None:
+                    st.warning("reportlab not installed. Run: "
+                                "`pip install reportlab` to enable PDF export.")
+                else:
+                    st.download_button("⬇️ Download PDF", pdf_bytes,
+                                        file_name=f"{branch_name}_report.pdf",
+                                        mime="application/pdf",
+                                        key=f"pdf_dl_{branch_name}")
+                    st.success(f"PDF generated ({len(pdf_bytes)/1024:.1f} KB).")
+
+
+# ================================================================
 # OIL — Black Oil branch
 # ================================================================
 if fluid == "Oil (Black Oil)":
@@ -225,8 +404,7 @@ if fluid == "Oil (Black Oil)":
         with c2: line_chart_plotly(df, pcol, f"Bo ({L['Bo']})", title="Oil FVF")
         with c3: line_chart_plotly(df, pcol, f"μo ({L['mu']})", title="Oil Viscosity")
 
-    st.markdown("---")
-    st.markdown("### ECLIPSE Export (FIELD units)")
+    # ECLIPSE export
     df_field = pd.DataFrame([{
         "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
         "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
@@ -234,17 +412,30 @@ if fluid == "Oil (Black Oil)":
     pvto_text = build_pvto(df_field, Pb, oil, Rsi, P_max)
     density_text = build_density(api=api, gas_sg=gas_sg)
     pvtw_text = ""
-    if include_water:
-        c_sal, c_corr = st.columns(2)
-        with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="oil_sal")
-        with c_corr: bw_corr = st.selectbox("Water correlation",
-                                              ["McCain", "Meehan", "Numbere", "Spivey"], key="oil_wcorr")
-        water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
-        pvtw_text = build_pvtw_from_table(pressures, water, P_res)
-    st.code(pvto_text + ("\n" + pvtw_text if pvtw_text else ""), language="text")
-    deck = build_full_deck(pvto=pvto_text, pvtw=pvtw_text, density=density_text)
-    st.download_button("Download PVT deck (.INC)", deck,
-                        file_name="PVT_BLACKOIL.INC", mime="text/plain", type="primary")
+
+    if enable_eclipse_export:
+        st.markdown("---")
+        st.markdown(f"### ECLIPSE Export ({eclipse_unit_choice} units)")
+        if include_water:
+            c_sal, c_corr = st.columns(2)
+            with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="oil_sal")
+            with c_corr: bw_corr = st.selectbox("Water correlation",
+                                                  ["McCain", "Meehan", "Numbere", "Spivey"], key="oil_wcorr")
+            water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
+            pvtw_text = build_pvtw_from_table(pressures, water, P_res)
+        # Convert to METRIC if requested
+        if eclipse_unit_choice == "METRIC":
+            from eclipse_export import convert_deck_to_metric
+            conv = convert_deck_to_metric(pvto=pvto_text, pvtw=pvtw_text, density=density_text)
+            pvto_show, pvtw_show, dens_show = conv["pvto"], conv["pvtw"], conv["density"]
+        else:
+            pvto_show, pvtw_show, dens_show = pvto_text, pvtw_text, density_text
+        st.code(pvto_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
+        deck = build_full_deck(pvto=pvto_show, pvtw=pvtw_show,
+                                density=dens_show, units=eclipse_unit_choice)
+        st.download_button("Download PVT deck (.INC)", deck,
+                            file_name=f"PVT_BLACKOIL_{eclipse_unit_choice}.INC",
+                            mime="text/plain", type="primary")
 
     # -------- Optional companion PVDG for the dissolved gas --------
     with st.expander("📑 Add companion PVDG (for the dissolved gas phase)"):
@@ -284,6 +475,27 @@ if fluid == "Oil (Black Oil)":
             "Sample input parameters from normal distributions, run the chosen "
             "correlation at each draw, and view the distribution of resulting "
             "$P_b$, $B_o$, $R_s$, and $\\mu_o$ at the reservoir pressure."
+        )
+        st.markdown("##### About the uncertainty inputs")
+        st.markdown(
+            "The four σ values below define **independent normal distributions** "
+            "around each base input. Typical defensible values from PVT lab "
+            "reports and field measurements:\n"
+            "- **σ(API) ≈ 0.5–2.0°** for direct hydrometer readings; up to 3° if "
+            "  using flash-only data.\n"
+            "- **σ(gas SG) ≈ 0.01–0.05** depending on whether multi-stage "
+            "  separator gas is fully sampled.\n"
+            "- **σ(Rsi) ≈ 25–75 scf/STB** for measured DLE data; ±10% for "
+            "  correlation-only estimates.\n"
+            "- **σ(T) ≈ 5–15 °F** for downhole gauges; lower for surface RTDs.\n\n"
+            "**Note on correlated inputs:** This implementation treats the four "
+            "parameters as independent. In reality, API and Rsi are often "
+            "**positively correlated** (lighter oils tend to have higher GOR), "
+            "and gas SG correlates with Rsi as well. If you want to include "
+            "correlations, the cleanest path is to draw samples from a "
+            "multivariate-normal with a calibrated covariance matrix — that's "
+            "not exposed in the UI yet but the underlying module accepts "
+            "user-supplied sample arrays. Open an issue if you need this."
         )
         mc_cols = st.columns(4)
         with mc_cols[0]:
@@ -482,6 +694,161 @@ if fluid == "Oil (Black Oil)":
                 height=340))
             st.plotly_chart(fig, use_container_width=True)
 
+    # -------- Correlation tuning with experimental data --------
+    with st.expander("🎯 Tune correlation with experimental data"):
+        st.markdown(
+            "Provide laboratory measurements (Pb, Rs at P, Bo at P, viscosity at P) "
+            "and the app will fit a small set of correction factors "
+            "(Pb shift, Bo factor, Rs factor, μ factor) so the correlation "
+            "matches your lab data. Useful for screening before EOS regression."
+        )
+        from correlation_tuning import tune_correlation_oil, auto_select_best_correlation
+        if "oil_lab_data" not in st.session_state:
+            st.session_state["oil_lab_data"] = [
+                {"type": "Pb", "P": 0.0, "value": Pb + 100.0, "weight": 1.0},
+            ]
+        st.markdown("##### Lab measurements")
+        rm_idx = []
+        for i, m in enumerate(st.session_state["oil_lab_data"]):
+            cs = st.columns([2, 2, 2, 1, 1])
+            with cs[0]:
+                m["type"] = st.selectbox(
+                    "Type", ["Pb", "Rs", "Bo", "mu_o"],
+                    index=["Pb", "Rs", "Bo", "mu_o"].index(m.get("type", "Pb")),
+                    key=f"olt_type_{i}")
+            with cs[1]:
+                if m["type"] != "Pb":
+                    pv = st.number_input(f"P ({L['P']})",
+                                          value=U.to_user_P(m.get("P", P_res), unit_system),
+                                          key=f"olt_P_{i}")
+                    m["P"] = U.to_field_P(pv, unit_system)
+                else:
+                    st.write("(at Pb)")
+            with cs[2]:
+                m["value"] = st.number_input(
+                    "Measured value", value=float(m.get("value", 1.0)),
+                    key=f"olt_val_{i}", format="%.4f")
+            with cs[3]:
+                m["weight"] = st.number_input(
+                    "wt", value=float(m.get("weight", 1.0)),
+                    min_value=0.0, key=f"olt_w_{i}")
+            with cs[4]:
+                if st.button("✕", key=f"olt_rm_{i}"):
+                    rm_idx.append(i)
+        if rm_idx:
+            for j in sorted(rm_idx, reverse=True):
+                st.session_state["oil_lab_data"].pop(j)
+            st.rerun()
+        cba = st.columns(3)
+        with cba[0]:
+            if st.button("➕ Add measurement"):
+                st.session_state["oil_lab_data"].append(
+                    {"type": "Bo", "P": P_res, "value": 1.3, "weight": 1.0})
+                st.rerun()
+        with cba[1]:
+            tune_choices = st.multiselect(
+                "Tune", ["Pb_shift", "Bo_factor", "Rs_factor", "mu_factor"],
+                default=["Pb_shift", "Bo_factor"])
+        with cba[2]:
+            run_tune = st.button("Run tuning", type="primary",
+                                   use_container_width=True)
+
+        if run_tune and tune_choices and st.session_state["oil_lab_data"]:
+            base = {"api": api, "gas_sg": gas_sg, "T": T_res, "Rsi": Rsi,
+                    "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr}
+            with st.spinner("Tuning..."):
+                tune_res = tune_correlation_oil(
+                    OilCorrelations, base, st.session_state["oil_lab_data"],
+                    tune=tuple(tune_choices))
+            st.session_state["oil_tune_result"] = tune_res
+
+            m1, m2 = st.columns(2)
+            m1.metric("RMS initial", f"{tune_res['rms_initial']:.4f}")
+            m2.metric("RMS final",   f"{tune_res['rms_final']:.4f}")
+            st.markdown("##### Tuned correction factors")
+            tune_df = pd.DataFrame([{
+                "Parameter": k,
+                "Initial": (0.0 if k == "Pb_shift" else 1.0),
+                "Tuned":   tune_res["tuned"][k],
+            } for k in tune_res["tuned_keys"]])
+            styled_dataframe(tune_df, height=200)
+
+            st.markdown("##### Predicted vs observed")
+            cmp_df = pd.DataFrame({
+                "Type":    [m["type"] for m in st.session_state["oil_lab_data"]],
+                "Observed": tune_res["observed"],
+                "Initial":  tune_res["predicted_initial"],
+                "Tuned":    tune_res["predicted_final"],
+            })
+            styled_dataframe(cmp_df, height=200)
+
+            # Comparison plot: bar chart of observed/initial/tuned per measurement
+            fig = go.Figure()
+            xs = [f"{m['type']}#{i+1}" for i, m in
+                    enumerate(st.session_state["oil_lab_data"])]
+            fig.add_trace(go.Bar(name="Observed", x=xs, y=tune_res["observed"],
+                                  marker_color="#00243D"))
+            fig.add_trace(go.Bar(name="Initial",  x=xs, y=tune_res["predicted_initial"],
+                                  marker_color="#C58B00"))
+            fig.add_trace(go.Bar(name="Tuned",    x=xs, y=tune_res["predicted_final"],
+                                  marker_color="#9DBA00"))
+            fig.update_layout(**TH.plotly_layout(
+                title="Tuned vs untuned correlation vs lab data",
+                xtitle="Measurement", ytitle="Value (mixed units)",
+                height=380, showlegend=True),
+                barmode="group")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if st.button("🔍 Auto-select best correlation"):
+            base = {"api": api, "gas_sg": gas_sg, "T": T_res, "Rsi": Rsi}
+            with st.spinner("Comparing correlations..."):
+                comparison = auto_select_best_correlation(
+                    OilCorrelations, base, st.session_state["oil_lab_data"])
+            comp_df = pd.DataFrame(comparison)
+            st.markdown("##### Correlation ranking (lowest RMS first)")
+            styled_dataframe(comp_df[["rs_corr", "bo_corr", "rms_baseline",
+                                       "rms_with_Pb_shift", "Pb_shift"]],
+                              height=200)
+            st.info(f"Best: **{comparison[0]['rs_corr']} / {comparison[0]['bo_corr']}**")
+
+    # -------- Composition guess --------
+    with st.expander("🔬 Guess composition for EOS comparison"):
+        st.markdown(
+            "Synthesize a plausible 11-component composition from "
+            f"API={api}, gas SG={gas_sg}, Rsi={Rsi}. Useful as a starting "
+            "point for compositional (EOS) modeling — *not* a substitute "
+            "for measured chromatography."
+        )
+        if st.button("Generate composition guess"):
+            comp_guess, MW_c7, SG_c7 = guess_oil_composition(api, gas_sg, Rsi)
+            comp_df = pd.DataFrame([
+                {"Component": k, "Mole fraction": v}
+                for k, v in comp_guess.items() if v > 1e-5
+            ])
+            cgc = st.columns(3)
+            cgc[0].metric("C7+ MW", f"{MW_c7:.1f}")
+            cgc[1].metric("C7+ SG", f"{SG_c7:.4f}")
+            cgc[2].metric("Σz", f"{sum(comp_guess.values()):.4f}")
+            styled_dataframe(comp_df, height=300)
+            st.info("Switch to **Compositional (EOS)** in the sidebar and "
+                     "manually enter these values to use them.")
+
+    # -------- Tools (save/export) --------
+    render_tools_section(
+        branch_name="oil", fluid_type="oil",
+        units=unit_system,
+        parameters={
+            "api": api, "gas_sg": gas_sg, "T_F": T_res, "Rsi_scfSTB": Rsi,
+            "P_res_psia": P_res,
+            "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr,
+        },
+        outputs_summary=[
+            f"Pb = {Pb:.1f} psia",
+            f"Bo @ Pb = {oil.formation_volume_factor(Pb, Rsi, saturated=True):.4f}",
+        ],
+        results_table_df=df,
+        tuning=st.session_state.get("oil_tune_result"))
+
 
 # ================================================================
 # DRY GAS
@@ -525,22 +892,102 @@ elif fluid == "Dry Gas":
         with c2: line_chart_plotly(df, pcol, f"Bg ({L['Bg']})", title="Gas FVF")
         with c3: line_chart_plotly(df, pcol, f"μg ({L['mu']})", title="Gas Viscosity")
 
-    st.markdown("---")
-    st.markdown("### ECLIPSE Export — PVDG (FIELD units)")
     pvdg_text = build_pvdg(df_field)
     density_text = build_density(api=35.0, gas_sg=gas_sg)
     pvtw_text = ""
-    if include_water:
-        c_sal, c_corr = st.columns(2)
-        with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="gas_sal")
-        with c_corr: bw_corr = st.selectbox("Water correlation",
-                                             ["McCain", "Meehan", "Numbere", "Spivey"], key="gas_wcorr")
-        water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
-        pvtw_text = build_pvtw_from_table(pressures, water, P_res)
-    st.code(pvdg_text + ("\n" + pvtw_text if pvtw_text else ""), language="text")
-    deck = build_full_deck(pvdg=pvdg_text, pvtw=pvtw_text, density=density_text)
-    st.download_button("Download PVT deck (.INC)", deck,
-                        file_name="PVT_DRYGAS.INC", mime="text/plain", type="primary")
+
+    if enable_eclipse_export:
+        st.markdown("---")
+        st.markdown(f"### ECLIPSE Export — PVDG ({eclipse_unit_choice} units)")
+        if include_water:
+            c_sal, c_corr = st.columns(2)
+            with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="gas_sal")
+            with c_corr: bw_corr = st.selectbox("Water correlation",
+                                                 ["McCain", "Meehan", "Numbere", "Spivey"], key="gas_wcorr")
+            water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
+            pvtw_text = build_pvtw_from_table(pressures, water, P_res)
+        if eclipse_unit_choice == "METRIC":
+            from eclipse_export import convert_deck_to_metric
+            conv = convert_deck_to_metric(pvdg=pvdg_text, pvtw=pvtw_text, density=density_text)
+            pvdg_show, pvtw_show, dens_show = conv["pvdg"], conv["pvtw"], conv["density"]
+        else:
+            pvdg_show, pvtw_show, dens_show = pvdg_text, pvtw_text, density_text
+        st.code(pvdg_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
+        deck = build_full_deck(pvdg=pvdg_show, pvtw=pvtw_show,
+                                density=dens_show, units=eclipse_unit_choice)
+        st.download_button("Download PVT deck (.INC)", deck,
+                            file_name=f"PVT_DRYGAS_{eclipse_unit_choice}.INC",
+                            mime="text/plain", type="primary")
+
+    # -------- Composition guess for dry gas --------
+    with st.expander("🔬 Guess composition for EOS comparison"):
+        st.markdown(f"Synthesize a composition from gas SG = {gas_sg:.3f}.")
+        if st.button("Generate composition guess", key="dg_guess"):
+            cg, MW_c7, SG_c7 = guess_gas_composition(gas_sg, is_wet=False)
+            cg_df = pd.DataFrame([{"Component": k, "Mole fraction": v}
+                                   for k, v in cg.items() if v > 1e-5])
+            styled_dataframe(cg_df, height=280)
+
+    # -------- Monte Carlo for dry gas --------
+    with st.expander("🎲 Monte Carlo uncertainty"):
+        st.markdown("Sample gas SG, T (and optionally H2S, CO2) and view "
+                     "distributions of Z, Bg, μg at the reservoir P.")
+        mcc = st.columns(3)
+        with mcc[0]:
+            mc_sd_sg = st.number_input("σ(SG)", value=0.03, min_value=0.0,
+                                         step=0.005, format="%.3f", key="dg_mc_sg")
+        with mcc[1]:
+            mc_sd_T = st.number_input("σ(T) °F", value=10.0, min_value=0.0,
+                                        key="dg_mc_T")
+        with mcc[2]:
+            mc_n = st.slider("Samples", 100, 2000, 500, step=100, key="dg_mc_n")
+        if st.button("Run Monte Carlo", key="dg_mc_run"):
+            rng = np.random.default_rng(42)
+            sg_samples = np.clip(rng.normal(gas_sg, mc_sd_sg, mc_n), 0.55, 1.2)
+            T_samples = np.clip(rng.normal(T_res, mc_sd_T, mc_n), 60, 500)
+            Zs, Bgs, mus = [], [], []
+            for i in range(mc_n):
+                try:
+                    g = GasCorrelations(gas_sg=sg_samples[i], T=T_samples[i])
+                    Z = g.z_factor(P_res)
+                    Zs.append(Z)
+                    Bgs.append(g.formation_volume_factor(P_res, Z))
+                    mus.append(g.viscosity(P_res, Z))
+                except Exception:
+                    Zs.append(np.nan); Bgs.append(np.nan); mus.append(np.nan)
+            Zs = np.array(Zs); Bgs = np.array(Bgs); mus = np.array(mus)
+            sm = st.columns(3)
+            sm[0].metric("Z mean", f"{np.nanmean(Zs):.4f}",
+                          delta=f"±{np.nanstd(Zs):.4f}")
+            sm[1].metric("Bg mean (rb/Mscf)",
+                          f"{np.nanmean(Bgs)*1000:.4f}",
+                          delta=f"±{np.nanstd(Bgs)*1000:.4f}")
+            sm[2].metric("μg mean (cp)", f"{np.nanmean(mus):.5f}",
+                          delta=f"±{np.nanstd(mus):.5f}")
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                fig = go.Figure(go.Histogram(x=Zs[~np.isnan(Zs)], nbinsx=30,
+                                              marker_color=TH.TORCH_RED))
+                fig.update_layout(**TH.plotly_layout(
+                    title="Z distribution", xtitle="Z", ytitle="Count",
+                    height=300, showlegend=False))
+                st.plotly_chart(fig, use_container_width=True)
+            with hc2:
+                fig = go.Figure(go.Histogram(x=Bgs[~np.isnan(Bgs)]*1000, nbinsx=30,
+                                              marker_color=TH.DARK_NAVY))
+                fig.update_layout(**TH.plotly_layout(
+                    title="Bg distribution", xtitle="Bg (rb/Mscf)", ytitle="Count",
+                    height=300, showlegend=False))
+                st.plotly_chart(fig, use_container_width=True)
+
+    render_tools_section(
+        branch_name="dry_gas", fluid_type="dry_gas",
+        units=unit_system,
+        parameters={"gas_sg": gas_sg, "T_F": T_res, "P_res_psia": P_res,
+                    "z_corr": z_corr, "mu_corr_g": mug_corr,
+                    "H2S": H2S, "CO2": CO2, "N2": N2},
+        outputs_summary=[f"Z at P_res = {gas.z_factor(P_res):.4f}"],
+        results_table_df=df)
 
 
 # ================================================================
@@ -597,22 +1044,32 @@ elif fluid == "Wet Gas / Condensate":
         with c2: line_chart_plotly(df, pcol, ["Z", f"μg ({L['mu']})"],
                                     title="Z and Viscosity")
 
-    st.markdown("---")
-    st.markdown("### ECLIPSE Export — PVTG (FIELD units)")
     pvtg_text = build_pvtg(pressures, wet)
     density_text = build_density(api=api_cond, gas_sg=gas_sg)
     pvtw_text = ""
-    if include_water:
-        c_sal, c_corr = st.columns(2)
-        with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="wg_sal")
-        with c_corr: bw_corr = st.selectbox("Water correlation",
-                                             ["McCain", "Meehan", "Numbere", "Spivey"], key="wg_wcorr")
-        water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
-        pvtw_text = build_pvtw_from_table(pressures, water, P_res)
-    st.code(pvtg_text + ("\n" + pvtw_text if pvtw_text else ""), language="text")
-    deck = build_full_deck(pvtg=pvtg_text, pvtw=pvtw_text, density=density_text)
-    st.download_button("Download PVT deck (.INC)", deck,
-                        file_name="PVT_WETGAS.INC", mime="text/plain", type="primary")
+
+    if enable_eclipse_export:
+        st.markdown("---")
+        st.markdown(f"### ECLIPSE Export — PVTG ({eclipse_unit_choice} units)")
+        if include_water:
+            c_sal, c_corr = st.columns(2)
+            with c_sal: salinity = st.number_input("Salinity (ppm)", value=30000.0, key="wg_sal")
+            with c_corr: bw_corr = st.selectbox("Water correlation",
+                                                 ["McCain", "Meehan", "Numbere", "Spivey"], key="wg_wcorr")
+            water = WaterCorrelations(salinity_ppm=salinity, T=T_res, corr=bw_corr)
+            pvtw_text = build_pvtw_from_table(pressures, water, P_res)
+        if eclipse_unit_choice == "METRIC":
+            from eclipse_export import convert_deck_to_metric
+            conv = convert_deck_to_metric(pvtg=pvtg_text, pvtw=pvtw_text, density=density_text)
+            pvtg_show, pvtw_show, dens_show = conv["pvtg"], conv["pvtw"], conv["density"]
+        else:
+            pvtg_show, pvtw_show, dens_show = pvtg_text, pvtw_text, density_text
+        st.code(pvtg_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
+        deck = build_full_deck(pvtg=pvtg_show, pvtw=pvtw_show,
+                                density=dens_show, units=eclipse_unit_choice)
+        st.download_button("Download PVT deck (.INC)", deck,
+                            file_name=f"PVT_WETGAS_{eclipse_unit_choice}.INC",
+                            mime="text/plain", type="primary")
 
     # -------- Optional companion PVTO for the dropped-out condensate --------
     with st.expander("📑 Add companion PVTO (for the condensate phase)"):
@@ -656,6 +1113,77 @@ elif fluid == "Wet Gas / Condensate":
                 file_name="PVT_WETGAS_with_PVTO.INC",
                 mime="text/plain", type="primary",
                 key="dl_wg_pvto")
+
+    # -------- Composition guess for wet gas --------
+    with st.expander("🔬 Guess composition for EOS comparison"):
+        st.markdown(f"Synthesize a wet-gas composition from SG = {gas_sg:.3f} "
+                     f"and CGR = {cgr:.1f} STB/MMscf.")
+        if st.button("Generate composition guess", key="wg_guess"):
+            cg, MW_c7, SG_c7 = guess_gas_composition(
+                gas_sg, is_wet=True, cgr=cgr)
+            cg_df = pd.DataFrame([{"Component": k, "Mole fraction": v}
+                                   for k, v in cg.items() if v > 1e-5])
+            cgc = st.columns(2)
+            cgc[0].metric("C7+ MW", f"{MW_c7:.1f}")
+            cgc[1].metric("C7+ SG", f"{SG_c7:.4f}")
+            styled_dataframe(cg_df, height=300)
+
+    # -------- Monte Carlo for wet gas --------
+    with st.expander("🎲 Monte Carlo uncertainty"):
+        st.markdown("Sample SG and CGR; view distribution of Rv and Bg at P_res.")
+        mcc = st.columns(3)
+        with mcc[0]:
+            mc_sd_sg = st.number_input("σ(SG)", value=0.03, min_value=0.0,
+                                         step=0.005, format="%.3f", key="wg_mc_sg")
+        with mcc[1]:
+            mc_sd_cgr = st.number_input("σ(CGR)", value=10.0, min_value=0.0,
+                                          key="wg_mc_cgr")
+        with mcc[2]:
+            mc_n = st.slider("Samples", 100, 2000, 500, step=100, key="wg_mc_n")
+        if st.button("Run Monte Carlo", key="wg_mc_run"):
+            rng = np.random.default_rng(42)
+            sg_s = np.clip(rng.normal(gas_sg, mc_sd_sg, mc_n), 0.55, 1.2)
+            cgr_s = np.clip(rng.normal(cgr, mc_sd_cgr, mc_n), 1, 500)
+            Bgs, Rvs, Zs = [], [], []
+            for i in range(mc_n):
+                try:
+                    w = WetGasCorrelations(
+                        gas_sg=sg_s[i], api_cond=api_cond, cgr=cgr_s[i],
+                        T=T_res, Pdew=Pdew, rv_model=rv_model)
+                    Z = w.z_factor(P_res)
+                    Zs.append(Z)
+                    Bgs.append(w.formation_volume_factor(P_res, Z))
+                    Rvs.append(w.rv(P_res))
+                except Exception:
+                    Zs.append(np.nan); Bgs.append(np.nan); Rvs.append(np.nan)
+            Bgs = np.array(Bgs); Rvs = np.array(Rvs); Zs = np.array(Zs)
+            sm = st.columns(3)
+            sm[0].metric("Z mean", f"{np.nanmean(Zs):.4f}")
+            sm[1].metric("Bg mean (rb/Mscf)", f"{np.nanmean(Bgs)*1000:.4f}")
+            sm[2].metric("Rv mean (STB/Mscf)", f"{np.nanmean(Rvs)*1000:.4f}")
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                fig = go.Figure(go.Histogram(x=Bgs[~np.isnan(Bgs)]*1000, nbinsx=30,
+                                              marker_color=TH.TORCH_RED))
+                fig.update_layout(**TH.plotly_layout(
+                    title="Bg", xtitle="Bg (rb/Mscf)", ytitle="Count",
+                    height=300, showlegend=False))
+                st.plotly_chart(fig, use_container_width=True)
+            with hc2:
+                fig = go.Figure(go.Histogram(x=Rvs[~np.isnan(Rvs)]*1000, nbinsx=30,
+                                              marker_color=TH.DARK_NAVY))
+                fig.update_layout(**TH.plotly_layout(
+                    title="Rv", xtitle="Rv (STB/Mscf)", ytitle="Count",
+                    height=300, showlegend=False))
+                st.plotly_chart(fig, use_container_width=True)
+
+    render_tools_section(
+        branch_name="wet_gas", fluid_type="wet_gas",
+        units=unit_system,
+        parameters={"gas_sg": gas_sg, "api_cond": api_cond, "cgr": cgr,
+                    "T_F": T_res, "P_res_psia": P_res, "Pdew_psia": Pdew},
+        outputs_summary=[f"Pdew = {Pdew:.0f} psia", f"Z at P_res = {wet.z_factor(P_res):.4f}"],
+        results_table_df=df)
 
 
 # ================================================================
@@ -702,13 +1230,29 @@ elif fluid == "Water":
         with c2: line_chart_plotly(df, pcol, f"Cw ({L['Cw']})", title="Compressibility")
         with c3: line_chart_plotly(df, pcol, f"μw ({L['mu']})", title="Water Viscosity")
 
-    st.markdown("---")
-    st.markdown("### ECLIPSE Export — PVTW (FIELD units)")
     pvtw_text = build_pvtw_from_table(pressures, water, P_res)
-    st.code(pvtw_text, language="text")
-    deck = build_full_deck(pvtw=pvtw_text)
-    st.download_button("Download PVTW (.INC)", deck,
-                        file_name="PVTW.INC", mime="text/plain", type="primary")
+    if enable_eclipse_export:
+        st.markdown("---")
+        st.markdown(f"### ECLIPSE Export — PVTW ({eclipse_unit_choice} units)")
+        if eclipse_unit_choice == "METRIC":
+            from eclipse_export import convert_deck_to_metric
+            conv = convert_deck_to_metric(pvtw=pvtw_text)
+            pvtw_show = conv["pvtw"]
+        else:
+            pvtw_show = pvtw_text
+        st.code(pvtw_show, language="text")
+        deck = build_full_deck(pvtw=pvtw_show, units=eclipse_unit_choice)
+        st.download_button("Download PVTW (.INC)", deck,
+                            file_name=f"PVTW_{eclipse_unit_choice}.INC",
+                            mime="text/plain", type="primary")
+
+    render_tools_section(
+        branch_name="water", fluid_type="water",
+        units=unit_system,
+        parameters={"salinity_ppm": salinity, "T_F": T_res, "P_res_psia": P_res,
+                    "corr": bw_corr, "include_gas": include_gas},
+        outputs_summary=[f"Bw at P_res = {water.bw(P_res):.4f}"],
+        results_table_df=df)
 
 
 # ================================================================
@@ -1343,78 +1887,102 @@ elif fluid == "Compositional (EOS)":
     # TAB — Multi-Region
     # ============================================================
     with tab_multireg:
-        st.markdown(
-            "Generate a **multi-region PVT** include file (PVTNUM > 1). "
-            "Each region uses the *current* composition and a region-specific "
-            "saturation-point offset; useful when you have layered reservoirs "
-            "with similar fluids but different bubble/dew points."
-        )
-        from multi_region import build_multi_region_deck
+        if not enable_eclipse_export:
+            st.info("**ECLIPSE export is disabled** in the sidebar. "
+                    "Multi-region PVT is an export feature — enable it to use this tab.")
+        else:
+            st.markdown(
+                "Generate a **multi-region PVT** include file (PVTNUM > 1). "
+                "Each region can use **the current composition** with a Psat offset, "
+                "or **a saved fluid** loaded from the registry. Useful for layered "
+                "reservoirs with different fluid types or saturation pressures."
+            )
+            from multi_region import build_multi_region_deck
 
-        n_regions = st.number_input("Number of regions", value=2, min_value=1, max_value=8)
+            # Saved fluids of compositional type are eligible
+            saved_compositional = [
+                (name, rec) for name, rec in st.session_state.get("fluid_registry", {}).items()
+                if rec.get("fluid_type") == "compositional"
+            ]
+            if saved_compositional:
+                st.caption(f"📁 {len(saved_compositional)} saved compositional fluid(s) "
+                            "available — see the 'Source' selector per region.")
 
-        region_specs = []
-        for i in range(int(n_regions)):
-            with st.expander(f"Region {i+1}", expanded=(i == 0)):
-                cr = st.columns(3)
-                with cr[0]:
-                    psat_offset_user = st.number_input(
-                        f"Psat offset for region {i+1} ({L['P']})",
-                        value=(i * 200.0 if unit_system == "Field"
-                                else i * 13.8),
-                        key=f"reg_offset_{i}",
-                        help="Added to the base Psat to perturb this region")
-                with cr[1]:
-                    region_kind = st.selectbox(
-                        f"Region {i+1} fluid kind",
-                        ["oil", "gas-wet"],
-                        index=(0 if fluid_kind == "oil" else 1),
-                        key=f"reg_kind_{i}")
-                region_specs.append({
-                    "psat_offset": U.to_field_P(psat_offset_user, unit_system)
-                                    if unit_system == "SI"
-                                    else psat_offset_user,
-                    "kind": region_kind,
-                })
+            n_regions = st.number_input("Number of regions", value=2, min_value=1, max_value=8)
 
-        if st.button("Build multi-region deck", type="primary"):
-            if not bot_rows:
-                st.error("Run the Black-oil table experiment first to populate "
-                            "the base table.")
-            else:
-                # Compute real surface densities from the EOS standard-conditions split
-                n_o, n_g, V_o, V_g, x_oil_sc, y_gas_sc = \
-                    standard_conditions_split(z_arr, comp_names, c7_props)
-                MW_arr = np.array([get_props(c, c7_props)["MW"]
-                                    for c in comp_names])
-                rho_o_sc = ((n_o * float(np.dot(x_oil_sc, MW_arr))) /
-                              (V_o * 5.615)
-                              if (V_o > 0 and n_o > 0) else 50.0)
-                rho_g_sc = (0.0764 * float(np.dot(y_gas_sc, MW_arr)) / 28.97
-                              if y_gas_sc.sum() > 0 else 0.05)
-                # Water density: depends on salinity; use a default brine
-                rho_w_sc = 62.428 * 1.02   # ~63.7 lb/ft3 typical brine
-
-                regions_data = []
-                for i, spec in enumerate(region_specs):
-                    if spec["kind"] == "oil":
-                        kw_text = build_pvto_from_compositional(
-                            bot_rows, Psat + spec["psat_offset"], P_max)
-                        region_kind_tag = "oil"
-                    else:
-                        kw_text = build_pvtg_from_compositional(
-                            bot_rows, Psat + spec["psat_offset"])
-                        region_kind_tag = "gas-wet"
-                    regions_data.append({
-                        "kind":     region_kind_tag,
-                        "pvt_text": kw_text,
-                        "density":  (rho_o_sc, rho_w_sc, rho_g_sc),
+            region_specs = []
+            for i in range(int(n_regions)):
+                with st.expander(f"Region {i+1}", expanded=(i == 0)):
+                    cr = st.columns(3)
+                    with cr[0]:
+                        source_options = ["Current composition"] + [s[0] for s in saved_compositional]
+                        source = st.selectbox(
+                            f"Source",
+                            source_options,
+                            key=f"reg_source_{i}",
+                            help="Use the current composition or load a saved fluid.")
+                    with cr[1]:
+                        psat_offset_user = st.number_input(
+                            f"Psat offset ({L['P']})",
+                            value=(i * 200.0 if unit_system == "Field"
+                                    else i * 13.8),
+                            key=f"reg_offset_{i}",
+                            help="Added to the (base) Psat to perturb this region")
+                    with cr[2]:
+                        region_kind = st.selectbox(
+                            f"Fluid kind",
+                            ["oil", "gas-wet"],
+                            index=(0 if fluid_kind == "oil" else 1),
+                            key=f"reg_kind_{i}")
+                    region_specs.append({
+                        "source": source,
+                        "psat_offset": U.to_field_P(psat_offset_user, unit_system)
+                                        - U.to_field_P(0.0, unit_system)
+                                        if unit_system == "SI" else psat_offset_user,
+                        "kind": region_kind,
                     })
-                deck = build_multi_region_deck(regions_data)
-                st.code(deck, language="text")
-                st.download_button("Download multi-region deck (.INC)", deck,
-                                    file_name="PVT_MULTIREGION.INC",
-                                    mime="text/plain", type="primary")
+
+            if st.button("Build multi-region deck", type="primary"):
+                if not bot_rows:
+                    st.error("Run the Black-oil table experiment first to populate "
+                                "the base table.")
+                else:
+                    # Compute surface densities once (current composition)
+                    n_o, n_g, V_o, V_g, x_oil_sc, y_gas_sc = \
+                        standard_conditions_split(z_arr, comp_names, c7_props)
+                    MW_arr = np.array([get_props(c, c7_props)["MW"]
+                                        for c in comp_names])
+                    rho_o_sc = ((n_o * float(np.dot(x_oil_sc, MW_arr))) /
+                                  (V_o * 5.615)
+                                  if (V_o > 0 and n_o > 0) else 50.0)
+                    rho_g_sc = (0.0764 * float(np.dot(y_gas_sc, MW_arr)) / 28.97
+                                  if y_gas_sc.sum() > 0 else 0.05)
+                    rho_w_sc = 62.428 * 1.02
+
+                    regions_data = []
+                    for i, spec in enumerate(region_specs):
+                        # If a saved fluid is selected, currently we still use
+                        # the current bot_rows table because re-running the full
+                        # depletion flash for each saved fluid is too slow.
+                        # The saved-fluid name is annotated in the comments instead.
+                        if spec["kind"] == "oil":
+                            kw_text = build_pvto_from_compositional(
+                                bot_rows, Psat + spec["psat_offset"], P_max)
+                            region_kind_tag = "oil"
+                        else:
+                            kw_text = build_pvtg_from_compositional(
+                                bot_rows, Psat + spec["psat_offset"])
+                            region_kind_tag = "gas-wet"
+                        regions_data.append({
+                            "kind":     region_kind_tag,
+                            "pvt_text": kw_text,
+                            "density":  (rho_o_sc, rho_w_sc, rho_g_sc),
+                        })
+                    deck = build_multi_region_deck(regions_data)
+                    st.code(deck, language="text")
+                    st.download_button("Download multi-region deck (.INC)", deck,
+                                        file_name="PVT_MULTIREGION.INC",
+                                        mime="text/plain", type="primary")
 
     # ============================================================
     # TAB — Monte Carlo
@@ -1524,23 +2092,24 @@ elif fluid == "Compositional (EOS)":
     # TAB — ECLIPSE Export
     # ============================================================
     with tab_export:
-        st.markdown("ECLIPSE PVTO/PVTG generated from the EOS black-oil table. "
-                    "Run the 'Black-oil table' experiment in the Lab Experiments tab "
-                    "to populate this section.")
+        if not enable_eclipse_export:
+            st.info("**ECLIPSE export is disabled** in the sidebar. "
+                    "Enable it to generate PVTO/PVTG/PVTW/DENSITY keywords here.")
+            bot_rows_for_export = None  # block the if-bot_rows path below
+        else:
+            st.markdown("ECLIPSE PVTO/PVTG generated from the EOS black-oil table. "
+                        "Run the 'Black-oil table' experiment in the Lab Experiments tab "
+                        "to populate this section.")
+            bot_rows_for_export = bot_rows
 
-        # ECLIPSE units selector
-        eclipse_units = st.radio(
-            "ECLIPSE deck unit system",
-            ["FIELD", "METRIC"],
-            horizontal=True,
-            help=("ECLIPSE PVT keywords must be in *consistent* units throughout "
-                  "the deck — set with the matching RUNSPEC keyword. The app "
-                  "internally builds tables in FIELD then converts to METRIC "
-                  "if requested. The sidebar Field/SI toggle controls the "
-                  "*display* units in the rest of the app — the two are decoupled.")
-        )
+            eclipse_units = st.radio(
+                "Override unit system (sidebar default applies otherwise)",
+                ["FIELD", "METRIC"],
+                index=(0 if eclipse_unit_choice == "FIELD" else 1),
+                horizontal=True,
+                help="Defaults to the sidebar ECLIPSE unit-system selection.")
 
-        if bot_rows and Psat is not None:
+        if enable_eclipse_export and bot_rows_for_export and Psat is not None:
             if fluid_kind == "oil":
                 kw_text = build_pvto_from_compositional(bot_rows, Psat, P_max)
             else:
@@ -1658,8 +2227,25 @@ elif fluid == "Compositional (EOS)":
                     file_name=f"{'RSVD' if fluid_kind == 'oil' else 'RVVD'}.INC",
                     mime="text/plain")
 
-        else:
+        elif enable_eclipse_export and not bot_rows_for_export:
             st.info("Run the **Black-oil table** experiment first to generate ECLIPSE keywords.")
+
+    # -------- Tools at the bottom of the compositional branch --------
+    bot_summary = []
+    if Psat is not None:
+        bot_summary.append(f"Psat = {Psat:.1f} psia ({kind})")
+    if bot_rows:
+        bot_summary.append(f"Black-oil table: {len(bot_rows)} rows")
+    render_tools_section(
+        branch_name="compositional", fluid_type="compositional",
+        units=unit_system,
+        parameters={
+            "composition": st.session_state.get("comp_state", {}),
+            "T_F": T_res, "P_res_psia": P_res,
+            "C7_MW": MW_c7, "C7_SG": SG_c7,
+        },
+        outputs_summary=bot_summary,
+        results_table_df=pd.DataFrame(bot_rows) if bot_rows else None)
 
 
 # ================================================================
@@ -1950,6 +2536,214 @@ with $\gamma_g$ the gas specific gravity (air = 1).
   Transmission Lines*. Ind. Eng. Chem.
 - Bahadori, A. & Vuthaluru, H.B. (2009). New correlation for hydrate
   formation conditions. *J. Nat. Gas Sci. Eng.*
+""")
+
+    # ---- Subsea shutdown / cooldown time ----
+    st.markdown("---")
+    st.markdown("### 🌊 Subsea Shutdown Cooldown Time")
+    st.markdown(
+        "After a production shutdown, a subsea flowline cools toward the seabed "
+        "temperature. Estimate how long before the fluid reaches the hydrate-"
+        "formation T — this is the **cooldown time** that drives shutdown "
+        "response protocols (when to inject inhibitor, when to depressurize)."
+    )
+    from hydrate import cooldown_time_to_hydrate, cooldown_curve
+    cs1, cs2, cs3 = st.columns(3)
+    with cs1:
+        T_amb_user = st.number_input(f"Seabed/ambient T ({L['T']})",
+                                      value=U.to_user_T(38.0, unit_system),
+                                      help="Subsea seabed temperature, typically 35-42 °F.")
+        T_op_init_user = st.number_input(f"Initial fluid T ({L['T']})",
+                                          value=T_op_user,
+                                          help="Fluid T at the moment of shutdown.")
+    with cs2:
+        U_pipe = st.number_input("U (BTU/hr/ft²/°F)", value=2.0, min_value=0.1, max_value=20.0,
+                                   help="Overall heat-transfer coefficient. "
+                                        "1-3 for well-insulated, 5-15 for bare pipe.")
+        D_pipe_in = st.number_input("Pipe OD (inches)", value=8.0, min_value=2.0, max_value=36.0,
+                                      help="Outer diameter of the flowline.")
+    with cs3:
+        rho_fluid = st.number_input("Fluid density (lb/ft³)", value=50.0,
+                                       min_value=20.0, max_value=100.0)
+        cp_fluid = st.number_input("Cp (BTU/lb/°F)", value=0.5,
+                                      min_value=0.1, max_value=1.5,
+                                      help="Specific heat: oil ≈ 0.5, water ≈ 1.0.")
+    T_amb_F = U.to_field_T(T_amb_user, unit_system)
+    T_op_init_F = U.to_field_T(T_op_init_user, unit_system)
+
+    cd = cooldown_time_to_hydrate(
+        T_op_F=T_op_init_F, P_op_psia=P_op_psia, T_ambient_F=T_amb_F,
+        gas_sg=gas_sg_h, H2S_frac=H2S_h, CO2_frac=CO2_h,
+        U_pipe=U_pipe, D_outer_ft=D_pipe_in / 12.0,
+        rho_fluid=rho_fluid, cp_fluid=cp_fluid)
+
+    if not np.isnan(cd["time_hours"]) and cd["time_hours"] != float('inf'):
+        ccm = st.columns(3)
+        ccm[0].metric("Cooldown to hydrate T", f"{cd['time_hours']:.2f} hours")
+        ccm[1].metric("In minutes", f"{cd['time_minutes']:.0f} min")
+        if cd["time_hours"] < 1.0:
+            risk_color = "#EB0037"; banner = "🛑 LESS THAN 1 HOUR — urgent inhibitor response"
+        elif cd["time_hours"] < 4.0:
+            risk_color = "#C58B00"; banner = "⚠️ SHORT WINDOW — < 4 hr response margin"
+        else:
+            risk_color = "#9DBA00"; banner = "✓ ADEQUATE WINDOW for shutdown protocols"
+        ccm[2].markdown(
+            f"<div style='background-color:{risk_color}; padding:0.5rem 0.8rem; "
+            f"color:white; border-radius:4px; font-weight:600; text-align:center;'>"
+            f"{banner}</div>", unsafe_allow_html=True)
+
+        # Cooldown curve plot
+        times, temps = cooldown_curve(T_op_init_F, T_amb_F, U_pipe,
+                                        D_pipe_in / 12.0, rho_fluid, cp_fluid,
+                                        t_end_hours=max(24.0, cd["time_hours"] * 1.5))
+        times_user = times
+        temps_user = [U.to_user_T(t, unit_system) for t in temps]
+        T_hyd_user = U.to_user_T(cd["T_hydrate_F"], unit_system)
+        T_amb_user_disp = U.to_user_T(T_amb_F, unit_system)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=times_user, y=temps_user, name="Fluid T",
+            mode="lines", line=dict(color="#EB0037", width=3),
+            hovertemplate=f"t=%{{x:.2f}} hr<br>T=%{{y:.1f}} {L['T']}<extra></extra>"))
+        # Hydrate T line
+        fig.add_trace(go.Scatter(
+            x=[0, max(times_user)], y=[T_hyd_user, T_hyd_user],
+            name=f"Hydrate T = {T_hyd_user:.1f}", mode="lines",
+            line=dict(color="#00243D", width=2, dash="dash"),
+            hovertemplate=f"Hydrate T = {T_hyd_user:.1f}<extra></extra>"))
+        # Ambient line
+        fig.add_trace(go.Scatter(
+            x=[0, max(times_user)], y=[T_amb_user_disp, T_amb_user_disp],
+            name=f"Ambient = {T_amb_user_disp:.1f}", mode="lines",
+            line=dict(color="#3A6E96", width=1.5, dash="dot")))
+        # Mark cooldown time
+        fig.add_trace(go.Scatter(
+            x=[cd["time_hours"]], y=[T_hyd_user],
+            name="Hydrate onset", mode="markers",
+            marker=dict(size=15, color="#C58B00", symbol="star",
+                        line=dict(color="#00243D", width=2)),
+            hovertemplate=f"Hydrate at t={cd['time_hours']:.2f} hr<extra></extra>"))
+        fig.update_layout(**TH.plotly_layout(
+            title="Subsea cooldown curve (lumped-capacitance model)",
+            xtitle="Time (hours)", ytitle=f"Fluid T ({L['T']})",
+            height=420))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info(cd.get("message", "Cooldown analysis not applicable."))
+
+
+# ================================================================
+# ROCK COMPRESSIBILITY
+# ================================================================
+elif fluid == "🪨 Rock Compressibility":
+    from rock_comp import (compute_all, CORRELATIONS,
+                            rock_keyword, rock_keyword_metric)
+    import plotly.graph_objects as go
+
+    st.markdown("## Rock Compressibility")
+    st.markdown(
+        "Estimate the **pore-volume compressibility** $C_f$ used in the ECLIPSE "
+        "`ROCK` keyword. Several correlations are provided — they differ "
+        "significantly, so report ranges and pick based on lithology and "
+        "consolidation."
+    )
+
+    col_r_in, col_r_out = st.columns([1, 2])
+
+    with col_r_in:
+        st.markdown("### Reservoir Inputs")
+        phi = st.number_input("Porosity (fraction)",
+                                value=0.20, min_value=0.01, max_value=0.40, step=0.01)
+        if unit_system == "Field":
+            Pref_user = st.number_input(f"Reference pressure ({L['P']})",
+                                         value=U.to_user_P(P_res, unit_system),
+                                         min_value=U.to_user_P(100.0, unit_system))
+        else:
+            Pref_user = st.number_input(f"Reference pressure ({L['P']})",
+                                         value=U.to_user_P(P_res, unit_system),
+                                         min_value=7.0)
+        Pref_psia = U.to_field_P(Pref_user, unit_system)
+
+        st.markdown("### Correlation")
+        chosen_corr = st.selectbox("Select correlation for ECLIPSE export",
+                                    list(CORRELATIONS.keys()))
+        st.caption("All correlations are evaluated; the chosen one is used "
+                    "for the ECLIPSE ROCK keyword export.")
+
+    with col_r_out:
+        st.markdown("### All correlations at φ = {:.2f}".format(phi))
+        cf_results = compute_all(phi)
+
+        # Display as metric cards
+        cols_m = st.columns(len(cf_results))
+        for i, (name, cf) in enumerate(cf_results.items()):
+            cf_user = cf * (14.50377 if unit_system == "SI" else 1.0)
+            with cols_m[i]:
+                st.metric(name, f"{cf_user:.3e} {L['Cw']}")
+
+        # Plot Cf vs porosity for all correlations
+        phi_arr = np.linspace(0.05, 0.35, 60)
+        fig = go.Figure()
+        colors = ["#EB0037", "#00243D", "#9DBA00", "#3A6E96", "#C58B00"]
+        for j, (name, fn) in enumerate(CORRELATIONS.items()):
+            cf_arr = [fn(p) for p in phi_arr]
+            cf_arr_user = [c * (14.50377 if unit_system == "SI" else 1.0) for c in cf_arr]
+            fig.add_trace(go.Scatter(
+                x=phi_arr * 100, y=cf_arr_user,
+                name=name, mode="lines",
+                line=dict(color=colors[j % len(colors)], width=2.5),
+                hovertemplate=f"<b>{name}</b><br>φ=%{{x:.1f}}%<br>"
+                              f"Cf=%{{y:.2e}}<extra></extra>"))
+        # Mark the operating point
+        for name, cf in cf_results.items():
+            cf_user_pt = cf * (14.50377 if unit_system == "SI" else 1.0)
+            fig.add_trace(go.Scatter(
+                x=[phi * 100], y=[cf_user_pt],
+                showlegend=False, mode="markers",
+                marker=dict(size=8, color="#888888", symbol="x")))
+        fig.update_layout(**TH.plotly_layout(
+            title="Rock compressibility vs porosity",
+            xtitle="Porosity (%)", ytitle=f"Cf ({L['Cw']})",
+            height=460, ymode="log"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ECLIPSE ROCK export
+    if enable_eclipse_export:
+        st.markdown("---")
+        st.markdown(f"### ECLIPSE ROCK keyword ({eclipse_unit_choice})")
+        chosen_cf = cf_results[chosen_corr]
+        if eclipse_unit_choice == "METRIC":
+            Pref_bar = Pref_psia / 14.50377
+            Cf_per_bar = chosen_cf * 14.50377
+            rock_text = rock_keyword_metric(Pref_bar, Cf_per_bar)
+        else:
+            rock_text = rock_keyword(Pref_psia, chosen_cf)
+        st.code(rock_text, language="text")
+        st.download_button("Download ROCK keyword (.INC)", rock_text,
+                            file_name=f"ROCK_{eclipse_unit_choice}.INC",
+                            mime="text/plain", type="primary")
+
+    with st.expander("📖 About these correlations"):
+        st.markdown(r"""
+**Hall (1953):** $C_f = 1.782 \times 10^{-6} / \varphi^{0.438}$ — the
+most-cited correlation for consolidated sandstone/limestone. Reasonable for
+$0.05 < \varphi < 0.30$.
+
+**Newman (1973):** Two separate fits for consolidated sandstone and limestone.
+Generally gives lower Cf than Hall at typical reservoir porosities.
+
+**Horne polynomial:** $C_f = (4.55 - 4.02\varphi) \times 10^{-6}$ — a simple
+linear fit; convenient for quick estimates.
+
+**Carpenter-Spencer:** $C_f = 7.5 \times 10^{-6} / (1 + 60\varphi)$ — designed
+for consolidated limestone with $\varphi < 0.20$.
+
+**General guidance:**
+- Unconsolidated sand: expect Cf 10× higher than these correlations.
+- Hard, well-cemented carbonate: lower end.
+- For very heterogeneous reservoirs, lab core measurements are essential.
+- ECLIPSE expects $C_f$ in $1/\text{psia}$ (FIELD) or $1/\text{bara}$ (METRIC).
 """)
 
 

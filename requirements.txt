@@ -3,3 +3,4 @@ numpy
 pandas
 plotly>=5.18
 scipy>=1.10
+reportlab
