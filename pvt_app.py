@@ -438,35 +438,48 @@ if fluid == "Oil (Black Oil)":
                             mime="text/plain", type="primary")
 
     # -------- Optional companion PVDG for the dissolved gas --------
-    with st.expander("📑 Add companion PVDG (for the dissolved gas phase)"):
-        st.markdown(
-            "ECLIPSE black-oil with live oil also needs gas-phase properties "
-            "(PVDG) for free gas — gas that comes out of solution and flows "
-            "separately. This block builds PVDG using a dry-gas correlation "
-            "for the *solution gas* (using the gas SG you provided)."
-        )
-        if st.button("Build companion PVDG", key="pvdg_companion_oil"):
-            gas_companion = GasCorrelations(gas_sg=gas_sg, T=T_res)
-            pvdg_rows = []
-            for P in pressures:
-                if P < 14.7: continue
-                Zg = gas_companion.z_factor(P)
-                pvdg_rows.append({
-                    "P (psia)": P, "Z": Zg,
-                    "Bg (rb/scf)": gas_companion.formation_volume_factor(P, Zg),
-                    "μg (cp)": gas_companion.viscosity(P, Zg)})
-            pvdg_df = pd.DataFrame(pvdg_rows)
-            pvdg_companion_text = build_pvdg(pvdg_df)
-            st.code(pvdg_companion_text, language="text")
-            deck_with_pvdg = build_full_deck(
-                pvto=pvto_text, pvdg=pvdg_companion_text,
-                pvtw=pvtw_text, density=density_text)
-            st.download_button(
-                "Download deck with PVTO + PVDG (.INC)",
-                deck_with_pvdg,
-                file_name="PVT_BLACKOIL_with_PVDG.INC",
-                mime="text/plain", type="primary",
-                key="dl_oil_pvdg")
+    if enable_eclipse_export:
+        with st.expander("📑 Add companion PVDG (for the dissolved gas phase)"):
+            st.markdown(
+                "ECLIPSE black-oil with live oil also needs gas-phase properties "
+                "(PVDG) for free gas — gas that comes out of solution and flows "
+                "separately. This block builds PVDG using a dry-gas correlation "
+                f"for the *solution gas*. Output follows the **{eclipse_unit_choice}** "
+                "unit choice from the sidebar."
+            )
+            if st.button("Build companion PVDG", key="pvdg_companion_oil"):
+                gas_companion = GasCorrelations(gas_sg=gas_sg, T=T_res)
+                pvdg_rows = []
+                for P in pressures:
+                    if P < 14.7: continue
+                    Zg = gas_companion.z_factor(P)
+                    pvdg_rows.append({
+                        "P (psia)": P, "Z": Zg,
+                        "Bg (rb/scf)": gas_companion.formation_volume_factor(P, Zg),
+                        "μg (cp)": gas_companion.viscosity(P, Zg)})
+                pvdg_df = pd.DataFrame(pvdg_rows)
+                pvdg_companion_text = build_pvdg(pvdg_df)
+                # Follow the sidebar unit choice
+                if eclipse_unit_choice == "METRIC":
+                    from eclipse_export import convert_deck_to_metric
+                    conv = convert_deck_to_metric(
+                        pvto=pvto_text, pvdg=pvdg_companion_text,
+                        pvtw=pvtw_text, density=density_text)
+                    pvto_c, pvdg_c = conv["pvto"], conv["pvdg"]
+                    pvtw_c, dens_c = conv["pvtw"], conv["density"]
+                else:
+                    pvto_c, pvdg_c = pvto_text, pvdg_companion_text
+                    pvtw_c, dens_c = pvtw_text, density_text
+                st.code(pvdg_c, language="text")
+                deck_with_pvdg = build_full_deck(
+                    pvto=pvto_c, pvdg=pvdg_c,
+                    pvtw=pvtw_c, density=dens_c, units=eclipse_unit_choice)
+                st.download_button(
+                    "Download deck with PVTO + PVDG (.INC)",
+                    deck_with_pvdg,
+                    file_name=f"PVT_BLACKOIL_with_PVDG_{eclipse_unit_choice}.INC",
+                    mime="text/plain", type="primary",
+                    key="dl_oil_pvdg")
 
     # -------- Monte Carlo uncertainty --------
     st.markdown("---")
@@ -625,74 +638,218 @@ if fluid == "Oil (Black Oil)":
                     height=320, showlegend=False))
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Tornado for Pb
-            tornado = tornado_sensitivity(base, unc, OilCorrelations,
-                                            target_P=P_res, output="Pb")
-            if tornado["rows"]:
-                st.markdown("##### Tornado sensitivity (Pb)")
+            # Tornado plots — separate for Pb and Bo
+            st.markdown("##### Tornado sensitivity")
+            st.caption("Each bar shows how far the output moves when one input "
+                        "is perturbed by ±1σ while the others stay at base.")
+
+            def render_tornado(output_name, unit_converter, unit_label):
+                tor = tornado_sensitivity(base, unc, OilCorrelations,
+                                            target_P=P_res, output=output_name)
+                if not tor["rows"]:
+                    st.info(f"No tornado data for {output_name} — check that at "
+                             f"least one σ value is greater than zero.")
+                    return
+                base_v = tor["base_value"]
+                if base_v is None or (isinstance(base_v, float) and np.isnan(base_v)):
+                    st.info(f"Could not compute a base value for {output_name}.")
+                    return
                 tor_df = pd.DataFrame([{
                     "Parameter": param,
-                    "Low":   U.to_user_P(lo, unit_system),
-                    "High":  U.to_user_P(hi, unit_system),
-                    "Range": U.to_user_P(rng, unit_system) -
-                             U.to_user_P(0, unit_system),
-                } for param, lo, hi, rng in tornado["rows"]])
-                styled_dataframe(tor_df, height=200)
+                    "Low":   unit_converter(lo),
+                    "High":  unit_converter(hi),
+                    "Range": abs(unit_converter(hi) - unit_converter(lo)),
+                } for param, lo, hi, rng in tor["rows"]])
+                styled_dataframe(tor_df, height=180)
+
                 fig = go.Figure()
-                for j, (param, lo, hi, rng) in enumerate(tornado["rows"]):
-                    base_v = tornado["base_value"]
+                base_disp = unit_converter(base_v)
+                for j, (param, lo, hi, rng) in enumerate(tor["rows"]):
+                    lo_disp = unit_converter(lo)
+                    hi_disp = unit_converter(hi)
+                    # bar from base to high
                     fig.add_trace(go.Bar(
-                        y=[param], x=[U.to_user_P(hi, unit_system) -
-                                       U.to_user_P(base_v, unit_system)],
-                        base=U.to_user_P(base_v, unit_system),
-                        orientation="h", name=f"{param} high",
+                        y=[param], x=[hi_disp - base_disp], base=base_disp,
+                        orientation="h", name="+1σ",
                         marker_color=TH.TORCH_RED,
                         showlegend=(j == 0), legendgroup="hi"))
+                    # bar from base to low
                     fig.add_trace(go.Bar(
-                        y=[param], x=[U.to_user_P(lo, unit_system) -
-                                       U.to_user_P(base_v, unit_system)],
-                        base=U.to_user_P(base_v, unit_system),
-                        orientation="h", name=f"{param} low",
+                        y=[param], x=[lo_disp - base_disp], base=base_disp,
+                        orientation="h", name="−1σ",
                         marker_color=TH.DARK_NAVY,
                         showlegend=(j == 0), legendgroup="lo"))
-                fig.add_vline(x=U.to_user_P(tornado["base_value"], unit_system),
-                              line_dash="dash", line_color="black")
+                fig.add_vline(x=base_disp, line_dash="dash", line_color="black")
                 fig.update_layout(**TH.plotly_layout(
-                    title="Tornado: Pb sensitivity to ±1σ parameter perturbation",
-                    xtitle=f"Pb ({L['P']})", ytitle="",
-                    height=320, showlegend=True))
+                    title=f"Tornado — {output_name} sensitivity to ±1σ",
+                    xtitle=f"{output_name} ({unit_label})", ytitle="",
+                    height=300, showlegend=True),
+                    barmode="overlay")
                 st.plotly_chart(fig, use_container_width=True)
 
-    # -------- CCE / CVD experiments for correlation oil --------
-    with st.expander("🧪 CCE / CVD experiments (correlation-based)"):
-        st.markdown(
-            "Run a black-oil CCE simulation using the chosen correlation. "
-            "Below Pb, the cell contains both liberated gas and remaining oil; "
-            "V/Vsat grows rapidly and Y-function is reported."
-        )
-        from correlation_experiments import cce_blackoil
-        from correlations import GasCorrelations as GasCorrForCce
+            tcol1, tcol2 = st.columns(2)
+            with tcol1:
+                render_tornado("Pb",
+                                lambda v: U.to_user_P(v, unit_system),
+                                L['P'])
+            with tcol2:
+                render_tornado("Bo", lambda v: v, "rb/STB")
 
+    # -------- Oil compressibility plot --------
+    with st.expander("📉 Oil compressibility (Co vs P)"):
+        st.markdown(
+            "Isothermal oil compressibility $c_o = -\\frac{1}{B_o}"
+            "\\frac{\\partial B_o}{\\partial P}$. Above $P_b$ it reflects "
+            "under-saturated liquid compression; below $P_b$ the apparent "
+            "compressibility is dominated by gas coming out of solution."
+        )
+        co_rows = []
+        for P in pressures:
+            try:
+                if P <= Pb:
+                    Rs_co = oil.solution_gor(P)
+                    co = oil.oil_compressibility(P, Rs_co)
+                else:
+                    co = oil.oil_compressibility(P, Rsi)
+                co_rows.append({"P": P, "Co": co})
+            except Exception:
+                co_rows.append({"P": P, "Co": np.nan})
+        co_df = pd.DataFrame(co_rows)
+        co_df_display = pd.DataFrame({
+            f"P ({L['P']})": [U.to_user_P(r["P"], unit_system) for r in co_rows],
+            f"Co ({L['Cw']})": [U.to_user_Cw(r["Co"], unit_system)
+                                  if not np.isnan(r["Co"]) else np.nan
+                                  for r in co_rows],
+        })
+        styled_dataframe(co_df_display, height=260)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=co_df_display[f"P ({L['P']})"],
+            y=co_df_display[f"Co ({L['Cw']})"],
+            mode="lines+markers", name="Co",
+            line=dict(color=TH.TORCH_RED, width=2.5)))
+        fig.add_vline(x=U.to_user_P(Pb, unit_system), line_dash="dash",
+                      line_color=TH.DARK_NAVY,
+                      annotation_text="Pb")
+        fig.update_layout(**TH.plotly_layout(
+            title="Oil compressibility vs pressure",
+            xtitle=f"P ({L['P']})", ytitle=f"Co ({L['Cw']})",
+            height=380, ymode="log"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # -------- Lab experiments for correlation oil --------
+    with st.expander("🧪 Lab experiments — CCE / CVD / Flash / Separator"):
+        st.markdown(
+            "Black-oil lab experiment approximations using the chosen "
+            "correlations. CCE and CVD trace the depletion behavior; "
+            "Flash and Separator give surface-condition GOR and shrinkage."
+        )
+        from correlation_experiments import (cce_blackoil, cvd_blackoil,
+            flash_blackoil, multistage_separator_blackoil)
+        from correlations import GasCorrelations as GasCorrForCce
         gas_corr_for_cce = GasCorrForCce(gas_sg=gas_sg, T=T_res)
-        if st.button("Run CCE", key="run_cce_oil"):
-            cce_rows = cce_blackoil(oil, gas_corr_for_cce, Rsi, Pb, pressures)
-            cce_df = pd.DataFrame([{
-                f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
-                "Phase": r["phase"],
-                "V / Vsat": r["V_rel"],
-                "Liquid dropout (% Vsat)": r["L_dropout_pct"],
-                "Y-function": r["Y_function"],
-            } for r in cce_rows])
-            styled_dataframe(cce_df, height=320)
-            import plotly.graph_objects as go
-            fig = go.Figure()
-            fig.add_trace(TH.line_trace(cce_df[f"P ({L['P']})"], cce_df["V / Vsat"],
-                                         "V / Vsat", color_idx=0))
-            fig.update_layout(**TH.plotly_layout(
-                title="CCE — V/Vsat vs P",
-                xtitle=f"P ({L['P']})", ytitle="V / Vsat",
-                height=340))
-            st.plotly_chart(fig, use_container_width=True)
+
+        exp_choice = st.radio("Experiment", ["CCE", "CVD", "Flash",
+                                              "Multi-stage separator"],
+                               horizontal=True, key="oil_exp_choice")
+
+        if exp_choice == "CCE":
+            if st.button("Run CCE", key="run_cce_oil"):
+                cce_rows = cce_blackoil(oil, gas_corr_for_cce, Rsi, Pb, pressures)
+                cce_df = pd.DataFrame([{
+                    f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                    "Phase": r["phase"],
+                    "V / Vsat": r["V_rel"],
+                    "Liquid dropout (% Vsat)": r["L_dropout_pct"],
+                    "Y-function": r["Y_function"],
+                } for r in cce_rows])
+                styled_dataframe(cce_df, height=300)
+                fig = go.Figure()
+                fig.add_trace(TH.line_trace(cce_df[f"P ({L['P']})"],
+                                             cce_df["V / Vsat"],
+                                             "V / Vsat", color_idx=0))
+                fig.update_layout(**TH.plotly_layout(
+                    title="CCE — V/Vsat vs P",
+                    xtitle=f"P ({L['P']})", ytitle="V / Vsat", height=340))
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif exp_choice == "CVD":
+            if st.button("Run CVD", key="run_cvd_oil"):
+                cvd_rows = cvd_blackoil(oil, gas_corr_for_cce, Rsi, Pb, pressures)
+                cvd_df = pd.DataFrame([{
+                    f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                    "Phase": r["phase"],
+                    f"Rs ({L['Rs']})": U.to_user_Rs(r["Rs"], unit_system),
+                    "Liquid fraction": r["liquid_frac"],
+                    f"Cum. gas produced ({L['Rs']})":
+                        U.to_user_Rs(r["cum_gas_produced_scfSTB"], unit_system),
+                } for r in cvd_rows])
+                styled_dataframe(cvd_df, height=300)
+                fig = go.Figure()
+                fig.add_trace(TH.line_trace(
+                    cvd_df[f"P ({L['P']})"], cvd_df["Liquid fraction"],
+                    "Liquid fraction", color_idx=0))
+                fig.update_layout(**TH.plotly_layout(
+                    title="CVD — remaining liquid fraction vs P",
+                    xtitle=f"P ({L['P']})", ytitle="Liquid fraction",
+                    height=340))
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif exp_choice == "Flash":
+            if st.button("Run single-stage flash", key="run_flash_oil"):
+                fl = flash_blackoil(oil, Rsi, Pb, P_res)
+                fc = st.columns(3)
+                fc[0].metric(f"GOR ({L['Rs']})",
+                              f"{U.to_user_Rs(fl['GOR_scfSTB'], unit_system):.1f}")
+                fc[1].metric("Bo at P_res", f"{fl['Bo_initial']:.4f}")
+                fc[2].metric("Shrinkage (STB/rb)", f"{fl['shrinkage']:.4f}")
+                st.caption("Single-stage flash from reservoir pressure directly "
+                            "to standard conditions (60 °F, 14.7 psia).")
+
+        else:  # Multi-stage separator
+            st.markdown("##### Separator stages")
+            if "oil_sep_stages" not in st.session_state:
+                st.session_state["oil_sep_stages"] = [
+                    (800.0, 100.0), (100.0, 80.0), (14.7, 60.0)]
+            new_stages = []
+            for i, (Ps, Ts) in enumerate(st.session_state["oil_sep_stages"]):
+                sc = st.columns([1, 2, 2])
+                sc[0].markdown(f"**Stage {i+1}**")
+                Ps_u = sc[1].number_input(
+                    f"P ({L['P']})", value=U.to_user_P(Ps, unit_system),
+                    key=f"oilsep_P_{i}")
+                Ts_u = sc[2].number_input(
+                    f"T ({L['T']})", value=U.to_user_T(Ts, unit_system),
+                    key=f"oilsep_T_{i}")
+                new_stages.append((U.to_field_P(Ps_u, unit_system),
+                                   U.to_field_T(Ts_u, unit_system)))
+            st.session_state["oil_sep_stages"] = new_stages
+            if st.button("Run multi-stage separator", key="run_ms_oil"):
+                ms = multistage_separator_blackoil(
+                    oil, gas_corr_for_cce, Rsi, Pb, T_res,
+                    st.session_state["oil_sep_stages"])
+                mc = st.columns(3)
+                mc[0].metric(f"Total GOR ({L['Rs']})",
+                              f"{U.to_user_Rs(ms['total_GOR_scfSTB'], unit_system):.1f}")
+                mc[1].metric(f"Single-stage GOR ({L['Rs']})",
+                              f"{U.to_user_Rs(ms['single_stage_GOR_scfSTB'], unit_system):.1f}")
+                mc[2].metric("GOR reduction", f"{ms['GOR_reduction_pct']:.1f}%")
+                # Per-stage breakdown with GOR + densities
+                stage_df = pd.DataFrame([{
+                    "Stage": s["stage"],
+                    f"P ({L['P']})": U.to_user_P(s["P"], unit_system),
+                    f"T ({L['T']})": U.to_user_T(s["T_F"], unit_system),
+                    f"Stage GOR ({L['Rs']})":
+                        U.to_user_Rs(s["stage_GOR_scfSTB"], unit_system),
+                    "Fraction of total (%)": s["fraction_of_total"] * 100,
+                } for s in ms["stage_results"]])
+                styled_dataframe(stage_df, height=200)
+                st.markdown("##### Stock-tank properties")
+                stc = st.columns(2)
+                stc[0].metric("ST oil API", f"{ms['st_oil_API']:.1f}")
+                stc[1].metric(f"ST oil density ({L['rho']})",
+                               f"{U.to_user_rho(ms['st_oil_density'], unit_system):.2f}")
+
 
     # -------- Correlation tuning with experimental data --------
     with st.expander("🎯 Tune correlation with experimental data"):
@@ -702,10 +859,15 @@ if fluid == "Oil (Black Oil)":
             "(Pb shift, Bo factor, Rs factor, μ factor) so the correlation "
             "matches your lab data. Useful for screening before EOS regression."
         )
+        st.caption(f"All values are entered and displayed in **{unit_system}** "
+                    f"units; the optimizer works internally in field units.")
         from correlation_tuning import tune_correlation_oil, auto_select_best_correlation
+
+        # oil_lab_data stores values in DISPLAY units; conversion happens at tune time.
         if "oil_lab_data" not in st.session_state:
             st.session_state["oil_lab_data"] = [
-                {"type": "Pb", "P": 0.0, "value": Pb + 100.0, "weight": 1.0},
+                {"type": "Pb", "P": 0.0,
+                 "value": U.to_user_P(Pb + 100.0, unit_system), "weight": 1.0},
             ]
         st.markdown("##### Lab measurements")
         rm_idx = []
@@ -718,15 +880,25 @@ if fluid == "Oil (Black Oil)":
                     key=f"olt_type_{i}")
             with cs[1]:
                 if m["type"] != "Pb":
-                    pv = st.number_input(f"P ({L['P']})",
-                                          value=U.to_user_P(m.get("P", P_res), unit_system),
-                                          key=f"olt_P_{i}")
-                    m["P"] = U.to_field_P(pv, unit_system)
+                    # P stored in DISPLAY units
+                    m["P"] = st.number_input(
+                        f"P ({L['P']})",
+                        value=float(m.get("P", U.to_user_P(P_res, unit_system))),
+                        key=f"olt_P_{i}")
                 else:
                     st.write("(at Pb)")
             with cs[2]:
+                # value units depend on type
+                if m["type"] == "Pb":
+                    val_label = f"Pb ({L['P']})"
+                elif m["type"] == "Rs":
+                    val_label = f"Rs ({L['Rs']})"
+                elif m["type"] == "Bo":
+                    val_label = "Bo (rb/STB = rm³/Sm³)"
+                else:
+                    val_label = "μo (cP)"
                 m["value"] = st.number_input(
-                    "Measured value", value=float(m.get("value", 1.0)),
+                    val_label, value=float(m.get("value", 1.0)),
                     key=f"olt_val_{i}", format="%.4f")
             with cs[3]:
                 m["weight"] = st.number_input(
@@ -743,7 +915,8 @@ if fluid == "Oil (Black Oil)":
         with cba[0]:
             if st.button("➕ Add measurement"):
                 st.session_state["oil_lab_data"].append(
-                    {"type": "Bo", "P": P_res, "value": 1.3, "weight": 1.0})
+                    {"type": "Bo", "P": U.to_user_P(P_res, unit_system),
+                     "value": 1.3, "weight": 1.0})
                 st.rerun()
         with cba[1]:
             tune_choices = st.multiselect(
@@ -753,57 +926,135 @@ if fluid == "Oil (Black Oil)":
             run_tune = st.button("Run tuning", type="primary",
                                    use_container_width=True)
 
+        def _lab_to_field(lab_list):
+            """Convert a display-unit lab-data list to field units for the tuner."""
+            out = []
+            for m in lab_list:
+                fm = {"type": m["type"], "weight": m.get("weight", 1.0)}
+                if m["type"] == "Pb":
+                    fm["P"] = 0.0
+                    fm["value"] = U.to_field_P(m["value"], unit_system)
+                elif m["type"] == "Rs":
+                    fm["P"] = U.to_field_P(m["P"], unit_system)
+                    fm["value"] = U.to_field_Rs(m["value"], unit_system)
+                else:  # Bo, mu_o — dimensionless / cP, no conversion
+                    fm["P"] = U.to_field_P(m["P"], unit_system)
+                    fm["value"] = m["value"]
+                out.append(fm)
+            return out
+
+        def _field_pred_to_user(pred_array, lab_list):
+            """Convert tuner's field-unit predictions back to display units."""
+            out = []
+            for val, m in zip(pred_array, lab_list):
+                if m["type"] == "Pb":
+                    out.append(U.to_user_P(val, unit_system))
+                elif m["type"] == "Rs":
+                    out.append(U.to_user_Rs(val, unit_system))
+                else:
+                    out.append(val)
+            return np.array(out)
+
         if run_tune and tune_choices and st.session_state["oil_lab_data"]:
             base = {"api": api, "gas_sg": gas_sg, "T": T_res, "Rsi": Rsi,
                     "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr}
+            lab_field = _lab_to_field(st.session_state["oil_lab_data"])
             with st.spinner("Tuning..."):
                 tune_res = tune_correlation_oil(
-                    OilCorrelations, base, st.session_state["oil_lab_data"],
+                    OilCorrelations, base, lab_field,
                     tune=tuple(tune_choices))
+            # Store result with display-unit predictions for plotting
+            tune_res["observed_user"] = _field_pred_to_user(
+                tune_res["observed"], st.session_state["oil_lab_data"])
+            tune_res["pred_init_user"] = _field_pred_to_user(
+                tune_res["predicted_initial"], st.session_state["oil_lab_data"])
+            tune_res["pred_final_user"] = _field_pred_to_user(
+                tune_res["predicted_final"], st.session_state["oil_lab_data"])
+            tune_res["lab_snapshot"] = list(st.session_state["oil_lab_data"])
             st.session_state["oil_tune_result"] = tune_res
 
-            m1, m2 = st.columns(2)
+        # Render last tuning result (persists across reruns so Undo works)
+        if st.session_state.get("oil_tune_result"):
+            tune_res = st.session_state["oil_tune_result"]
+            lab_snap = tune_res.get("lab_snapshot",
+                                     st.session_state["oil_lab_data"])
+
+            m1, m2, m3 = st.columns(3)
             m1.metric("RMS initial", f"{tune_res['rms_initial']:.4f}")
             m2.metric("RMS final",   f"{tune_res['rms_final']:.4f}")
+            improvement = (1 - tune_res['rms_final'] /
+                            max(tune_res['rms_initial'], 1e-9)) * 100
+            m3.metric("Improvement", f"{improvement:.0f}%")
+
+            if tune_res['rms_final'] > tune_res['rms_initial']:
+                st.warning("Tuning did not improve the fit — the optimizer may "
+                            "be stuck, or the measurements may be inconsistent. "
+                            "Consider the Undo button below.")
+
             st.markdown("##### Tuned correction factors")
             tune_df = pd.DataFrame([{
                 "Parameter": k,
                 "Initial": (0.0 if k == "Pb_shift" else 1.0),
                 "Tuned":   tune_res["tuned"][k],
             } for k in tune_res["tuned_keys"]])
-            styled_dataframe(tune_df, height=200)
+            styled_dataframe(tune_df, height=180)
 
-            st.markdown("##### Predicted vs observed")
+            st.markdown(f"##### Predicted vs observed (in {unit_system} units)")
             cmp_df = pd.DataFrame({
-                "Type":    [m["type"] for m in st.session_state["oil_lab_data"]],
-                "Observed": tune_res["observed"],
-                "Initial":  tune_res["predicted_initial"],
-                "Tuned":    tune_res["predicted_final"],
+                "Type":     [m["type"] for m in lab_snap],
+                "Observed": tune_res["observed_user"],
+                "Initial":  tune_res["pred_init_user"],
+                "Tuned":    tune_res["pred_final_user"],
             })
-            styled_dataframe(cmp_df, height=200)
+            styled_dataframe(cmp_df, height=180)
 
-            # Comparison plot: bar chart of observed/initial/tuned per measurement
-            fig = go.Figure()
-            xs = [f"{m['type']}#{i+1}" for i, m in
-                    enumerate(st.session_state["oil_lab_data"])]
-            fig.add_trace(go.Bar(name="Observed", x=xs, y=tune_res["observed"],
-                                  marker_color="#00243D"))
-            fig.add_trace(go.Bar(name="Initial",  x=xs, y=tune_res["predicted_initial"],
-                                  marker_color="#C58B00"))
-            fig.add_trace(go.Bar(name="Tuned",    x=xs, y=tune_res["predicted_final"],
-                                  marker_color="#9DBA00"))
-            fig.update_layout(**TH.plotly_layout(
-                title="Tuned vs untuned correlation vs lab data",
-                xtitle="Measurement", ytitle="Value (mixed units)",
-                height=380, showlegend=True),
-                barmode="group")
-            st.plotly_chart(fig, use_container_width=True)
+            # Comparison plot — all series now in consistent DISPLAY units.
+            # Group by measurement type so the y-axis is meaningful.
+            st.markdown("##### Tuned vs untuned comparison")
+            types_present = list(dict.fromkeys(m["type"] for m in lab_snap))
+            for t in types_present:
+                idxs = [i for i, m in enumerate(lab_snap) if m["type"] == t]
+                if t == "Pb":
+                    unit_lbl = L['P']
+                elif t == "Rs":
+                    unit_lbl = L['Rs']
+                elif t == "Bo":
+                    unit_lbl = "rb/STB"
+                else:
+                    unit_lbl = "cP"
+                xs = [f"{t} #{j+1}" for j in range(len(idxs))]
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    name="Observed", x=xs,
+                    y=[tune_res["observed_user"][i] for i in idxs],
+                    marker_color="#00243D"))
+                fig.add_trace(go.Bar(
+                    name="Untuned", x=xs,
+                    y=[tune_res["pred_init_user"][i] for i in idxs],
+                    marker_color="#C58B00"))
+                fig.add_trace(go.Bar(
+                    name="Tuned", x=xs,
+                    y=[tune_res["pred_final_user"][i] for i in idxs],
+                    marker_color="#9DBA00"))
+                fig.update_layout(**TH.plotly_layout(
+                    title=f"{t} — tuned vs untuned vs lab data",
+                    xtitle="Measurement", ytitle=f"{t} ({unit_lbl})",
+                    height=320, showlegend=True),
+                    barmode="group")
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Undo button
+            if st.button("↩️ Undo tuning (discard this match)",
+                          key="undo_oil_tune"):
+                st.session_state["oil_tune_result"] = None
+                st.rerun()
 
         if st.button("🔍 Auto-select best correlation"):
             base = {"api": api, "gas_sg": gas_sg, "T": T_res, "Rsi": Rsi}
+            lab_field = _lab_to_field(st.session_state["oil_lab_data"])
             with st.spinner("Comparing correlations..."):
                 comparison = auto_select_best_correlation(
-                    OilCorrelations, base, st.session_state["oil_lab_data"])
+                    OilCorrelations, base, lab_field)
             comp_df = pd.DataFrame(comparison)
             st.markdown("##### Correlation ranking (lowest RMS first)")
             styled_dataframe(comp_df[["rs_corr", "bo_corr", "rms_baseline",
@@ -918,6 +1169,72 @@ elif fluid == "Dry Gas":
         st.download_button("Download PVT deck (.INC)", deck,
                             file_name=f"PVT_DRYGAS_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
+
+    # -------- Lab experiments for dry gas --------
+    with st.expander("🧪 Lab experiments — CCE / CVD / Flash"):
+        st.markdown(
+            "Dry-gas lab experiment approximations. A dry gas has no liquid "
+            "dropout, so CCE is the gas-expansion curve; CVD gives the "
+            "volumetric recovery factor from the P/Z material balance."
+        )
+        from correlation_experiments import cce_drygas, cvd_drygas, flash_drygas
+
+        dg_exp = st.radio("Experiment", ["CCE", "CVD", "Flash"],
+                           horizontal=True, key="dg_exp_choice")
+
+        if dg_exp == "CCE":
+            if st.button("Run CCE", key="run_cce_dg"):
+                rows = cce_drygas(gas, pressures)
+                cce_df = pd.DataFrame([{
+                    f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                    "Z": r["Z"],
+                    f"Bg ({L['Bg']})": U.to_user_Bg(r["Bg"], unit_system),
+                    "Expansion factor": r["E_factor"],
+                    "μg (cP)": r["mu_g"],
+                } for r in rows])
+                styled_dataframe(cce_df, height=300)
+                fig = go.Figure()
+                fig.add_trace(TH.line_trace(cce_df[f"P ({L['P']})"],
+                                             cce_df["Z"], "Z", color_idx=0))
+                fig.update_layout(**TH.plotly_layout(
+                    title="CCE — Z-factor vs P", xtitle=f"P ({L['P']})",
+                    ytitle="Z", height=340))
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif dg_exp == "CVD":
+            if st.button("Run CVD", key="run_cvd_dg"):
+                rows = cvd_drygas(gas, pressures, P_res)
+                if not rows:
+                    st.warning("No pressures below the initial reservoir "
+                                "pressure — widen the pressure range.")
+                else:
+                    cvd_df = pd.DataFrame([{
+                        f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                        "Z": r["Z"],
+                        "P/Z": r["P_over_Z"],
+                        "Recovery factor (%)": r["recovery_factor_pct"],
+                    } for r in rows])
+                    styled_dataframe(cvd_df, height=300)
+                    fig = go.Figure()
+                    fig.add_trace(TH.line_trace(
+                        cvd_df[f"P ({L['P']})"], cvd_df["Recovery factor (%)"],
+                        "Recovery factor", color_idx=0))
+                    fig.update_layout(**TH.plotly_layout(
+                        title="CVD — gas recovery factor vs P",
+                        xtitle=f"P ({L['P']})", ytitle="Recovery factor (%)",
+                        height=340))
+                    st.plotly_chart(fig, use_container_width=True)
+
+        else:  # Flash
+            if st.button("Run flash", key="run_flash_dg"):
+                fl = flash_drygas(gas, P_res)
+                fc = st.columns(2)
+                fc[0].metric("Z at P_res", f"{fl['Z_initial']:.4f}")
+                fc[1].metric("Expansion (scf/rb)",
+                              f"{fl['expansion_scf_per_rb']:.2f}")
+                st.caption("Dry-gas flash to standard conditions — the "
+                            "expansion factor is the reservoir-to-surface "
+                            "volume ratio.")
 
     # -------- Composition guess for dry gas --------
     with st.expander("🔬 Guess composition for EOS comparison"):
@@ -1072,47 +1389,210 @@ elif fluid == "Wet Gas / Condensate":
                             mime="text/plain", type="primary")
 
     # -------- Optional companion PVTO for the dropped-out condensate --------
-    with st.expander("📑 Add companion PVTO (for the condensate phase)"):
-        st.markdown(
-            "ECLIPSE wet-gas with vaporized oil also needs oil-phase properties "
-            "(PVTO) for condensate that drops out and flows as a separate "
-            "liquid phase. This block builds a PVTO using a black-oil "
-            "correlation on the condensate (using the condensate API and "
-            "the gas SG you provided)."
-        )
-        if st.button("Build companion PVTO", key="pvto_companion_wg"):
-            oil_companion = OilCorrelations(
-                api=api_cond, gas_sg=gas_sg, T=T_res,
-                rs_corr="Standing", bo_corr="Standing",
-                mu_corr="Beggs-Robinson")
-            # Use a typical condensate Rsi based on CGR (heavy ends -> low Rs)
-            Rsi_cond = max(50.0, cgr * 0.5)  # rough estimate
-            Pb_cond = oil_companion.bubble_point(Rsi_cond)
-            cond_rows = []
-            for P in pressures:
-                if P <= Pb_cond:
-                    Rs_c = oil_companion.solution_gor(P)
-                    Bo_c = oil_companion.formation_volume_factor(P, Rs_c, saturated=True)
-                    mu_c = oil_companion.viscosity(P, Rs_c, Pb_cond, saturated=True)
+    if enable_eclipse_export:
+        with st.expander("📑 Add companion PVTO (for the condensate phase)"):
+            st.markdown(
+                "ECLIPSE wet-gas with vaporized oil also needs oil-phase properties "
+                "(PVTO) for condensate that drops out and flows as a separate "
+                "liquid phase. This block builds a PVTO using a black-oil "
+                "correlation on the condensate. Output follows the "
+                f"**{eclipse_unit_choice}** unit choice from the sidebar."
+            )
+            if st.button("Build companion PVTO", key="pvto_companion_wg"):
+                oil_companion = OilCorrelations(
+                    api=api_cond, gas_sg=gas_sg, T=T_res,
+                    rs_corr="Standing", bo_corr="Standing",
+                    mu_corr="Beggs-Robinson")
+                Rsi_cond = max(50.0, cgr * 0.5)
+                Pb_cond = oil_companion.bubble_point(Rsi_cond)
+                cond_rows = []
+                for P in pressures:
+                    if P <= Pb_cond:
+                        Rs_c = oil_companion.solution_gor(P)
+                        Bo_c = oil_companion.formation_volume_factor(P, Rs_c, saturated=True)
+                        mu_c = oil_companion.viscosity(P, Rs_c, Pb_cond, saturated=True)
+                    else:
+                        Rs_c = Rsi_cond
+                        Bo_c = oil_companion.formation_volume_factor(
+                            P, Rsi_cond, saturated=False, Pb=Pb_cond)
+                        mu_c = oil_companion.viscosity(P, Rsi_cond, Pb_cond, saturated=False)
+                    cond_rows.append({"P (psia)": P, "Rs (scf/STB)": Rs_c,
+                                      "Bo (rb/STB)": Bo_c, "μo (cp)": mu_c})
+                cond_df = pd.DataFrame(cond_rows)
+                pvto_cond_text = build_pvto(cond_df, Pb_cond, oil_companion,
+                                             Rsi_cond, P_max)
+                # Follow the sidebar unit choice
+                if eclipse_unit_choice == "METRIC":
+                    from eclipse_export import convert_deck_to_metric
+                    conv = convert_deck_to_metric(
+                        pvto=pvto_cond_text, pvtg=pvtg_text,
+                        pvtw=pvtw_text, density=density_text)
+                    pvto_c, pvtg_c = conv["pvto"], conv["pvtg"]
+                    pvtw_c, dens_c = conv["pvtw"], conv["density"]
                 else:
-                    Rs_c = Rsi_cond
-                    Bo_c = oil_companion.formation_volume_factor(
-                        P, Rsi_cond, saturated=False, Pb=Pb_cond)
-                    mu_c = oil_companion.viscosity(P, Rsi_cond, Pb_cond, saturated=False)
-                cond_rows.append({"P (psia)": P, "Rs (scf/STB)": Rs_c,
-                                  "Bo (rb/STB)": Bo_c, "μo (cp)": mu_c})
-            cond_df = pd.DataFrame(cond_rows)
-            pvto_cond_text = build_pvto(cond_df, Pb_cond, oil_companion, Rsi_cond, P_max)
-            st.code(pvto_cond_text, language="text")
-            deck_with_pvto = build_full_deck(
-                pvto=pvto_cond_text, pvtg=pvtg_text,
-                pvtw=pvtw_text, density=density_text)
-            st.download_button(
-                "Download deck with PVTG + PVTO (.INC)",
-                deck_with_pvto,
-                file_name="PVT_WETGAS_with_PVTO.INC",
-                mime="text/plain", type="primary",
-                key="dl_wg_pvto")
+                    pvto_c, pvtg_c = pvto_cond_text, pvtg_text
+                    pvtw_c, dens_c = pvtw_text, density_text
+                st.code(pvto_c, language="text")
+                deck_with_pvto = build_full_deck(
+                    pvto=pvto_c, pvtg=pvtg_c,
+                    pvtw=pvtw_c, density=dens_c, units=eclipse_unit_choice)
+                st.download_button(
+                    "Download deck with PVTG + PVTO (.INC)",
+                    deck_with_pvto,
+                    file_name=f"PVT_WETGAS_with_PVTO_{eclipse_unit_choice}.INC",
+                    mime="text/plain", type="primary",
+                    key="dl_wg_pvto")
+
+    # -------- Wet gas tuning with experimental data --------
+    with st.expander("🎯 Tune correlation with experimental data"):
+        st.markdown(
+            "Provide lab measurements (dew point, Z-factor, Rv, Bg at various P) "
+            "and fit a small set of correction factors (Pdew shift, Rv factor, "
+            "Z factor) so the wet-gas correlation matches your data."
+        )
+        st.caption(f"Values entered and displayed in **{unit_system}** units.")
+        from correlation_tuning import tune_wetgas
+
+        if "wg_lab_data" not in st.session_state:
+            st.session_state["wg_lab_data"] = [
+                {"type": "Pdew", "P": 0.0,
+                 "value": U.to_user_P(Pdew, unit_system), "weight": 2.0},
+            ]
+        wg_rm = []
+        for i, m in enumerate(st.session_state["wg_lab_data"]):
+            cs = st.columns([2, 2, 2, 1, 1])
+            with cs[0]:
+                m["type"] = st.selectbox(
+                    "Type", ["Pdew", "Z", "Rv", "Bg"],
+                    index=["Pdew", "Z", "Rv", "Bg"].index(m.get("type", "Pdew")),
+                    key=f"wglt_type_{i}")
+            with cs[1]:
+                if m["type"] != "Pdew":
+                    m["P"] = st.number_input(
+                        f"P ({L['P']})",
+                        value=float(m.get("P", U.to_user_P(P_res, unit_system))),
+                        key=f"wglt_P_{i}")
+                else:
+                    st.write("(dew point)")
+            with cs[2]:
+                if m["type"] == "Pdew":
+                    vlabel = f"Pdew ({L['P']})"
+                elif m["type"] == "Z":
+                    vlabel = "Z (-)"
+                elif m["type"] == "Rv":
+                    vlabel = "Rv (STB/scf)"
+                else:
+                    vlabel = "Bg (rb/scf)"
+                m["value"] = st.number_input(
+                    vlabel, value=float(m.get("value", 1.0)),
+                    format="%.6f", key=f"wglt_val_{i}")
+            with cs[3]:
+                m["weight"] = st.number_input(
+                    "wt", value=float(m.get("weight", 1.0)),
+                    min_value=0.0, key=f"wglt_w_{i}")
+            with cs[4]:
+                if st.button("✕", key=f"wglt_rm_{i}"):
+                    wg_rm.append(i)
+        if wg_rm:
+            for j in sorted(wg_rm, reverse=True):
+                st.session_state["wg_lab_data"].pop(j)
+            st.rerun()
+
+        wgc = st.columns(3)
+        with wgc[0]:
+            if st.button("➕ Add measurement", key="wg_add_meas"):
+                st.session_state["wg_lab_data"].append(
+                    {"type": "Z", "P": U.to_user_P(P_res, unit_system),
+                     "value": 0.9, "weight": 1.0})
+                st.rerun()
+        with wgc[1]:
+            wg_tune_choices = st.multiselect(
+                "Tune", ["Pdew_shift", "Rv_factor", "Z_factor"],
+                default=["Pdew_shift", "Z_factor"], key="wg_tune_choices")
+        with wgc[2]:
+            wg_run_tune = st.button("Run tuning", type="primary",
+                                     use_container_width=True, key="wg_run_tune")
+
+        def _wg_lab_to_field(lab_list):
+            out = []
+            for m in lab_list:
+                fm = {"type": m["type"], "weight": m.get("weight", 1.0)}
+                if m["type"] == "Pdew":
+                    fm["P"] = 0.0
+                    fm["value"] = U.to_field_P(m["value"], unit_system)
+                else:
+                    fm["P"] = U.to_field_P(m["P"], unit_system)
+                    # Z and Rv and Bg are unit-agnostic enough at this level
+                    fm["value"] = m["value"]
+                out.append(fm)
+            return out
+
+        if wg_run_tune and wg_tune_choices and st.session_state["wg_lab_data"]:
+            wg_base = {"gas_sg": gas_sg, "api_cond": api_cond, "cgr": cgr,
+                       "T": T_res, "N2": N2, "CO2": CO2, "H2S": H2S,
+                       "z_corr": z_corr, "mu_corr": mug_corr,
+                       "rv_corr": rv_corr, "Pdew": Pdew}
+            lab_field = _wg_lab_to_field(st.session_state["wg_lab_data"])
+            with st.spinner("Tuning wet-gas correlation..."):
+                wg_tune_res = tune_wetgas(WetGasCorrelations, wg_base,
+                                           lab_field, tune=tuple(wg_tune_choices))
+            wg_tune_res["lab_snapshot"] = list(st.session_state["wg_lab_data"])
+            st.session_state["wg_tune_result"] = wg_tune_res
+
+        if st.session_state.get("wg_tune_result"):
+            wg_tr = st.session_state["wg_tune_result"]
+            lab_snap = wg_tr.get("lab_snapshot", st.session_state["wg_lab_data"])
+            mm1, mm2, mm3 = st.columns(3)
+            mm1.metric("RMS initial", f"{wg_tr['rms_initial']:.4f}")
+            mm2.metric("RMS final",   f"{wg_tr['rms_final']:.4f}")
+            wg_impr = (1 - wg_tr['rms_final'] /
+                        max(wg_tr['rms_initial'], 1e-9)) * 100
+            mm3.metric("Improvement", f"{wg_impr:.0f}%")
+
+            if wg_tr['rms_final'] > wg_tr['rms_initial']:
+                st.warning("Tuning did not improve the fit — consider Undo.")
+
+            st.markdown("##### Tuned correction factors")
+            wg_tune_df = pd.DataFrame([{
+                "Parameter": k,
+                "Initial": (0.0 if k == "Pdew_shift" else 1.0),
+                "Tuned":   wg_tr["tuned"][k],
+            } for k in wg_tr["tuned_keys"]])
+            styled_dataframe(wg_tune_df, height=160)
+
+            st.markdown("##### Predicted vs observed")
+            wg_cmp = pd.DataFrame({
+                "Type":     [m["type"] for m in lab_snap],
+                "Observed": wg_tr["observed"],
+                "Initial":  wg_tr["predicted_initial"],
+                "Tuned":    wg_tr["predicted_final"],
+            })
+            styled_dataframe(wg_cmp, height=160)
+
+            # Comparison plot grouped by type
+            wg_types = list(dict.fromkeys(m["type"] for m in lab_snap))
+            for t in wg_types:
+                idxs = [i for i, m in enumerate(lab_snap) if m["type"] == t]
+                xs = [f"{t} #{j+1}" for j in range(len(idxs))]
+                figc = go.Figure()
+                figc.add_trace(go.Bar(name="Observed", x=xs,
+                    y=[wg_tr["observed"][i] for i in idxs],
+                    marker_color="#00243D"))
+                figc.add_trace(go.Bar(name="Untuned", x=xs,
+                    y=[wg_tr["predicted_initial"][i] for i in idxs],
+                    marker_color="#C58B00"))
+                figc.add_trace(go.Bar(name="Tuned", x=xs,
+                    y=[wg_tr["predicted_final"][i] for i in idxs],
+                    marker_color="#9DBA00"))
+                figc.update_layout(**TH.plotly_layout(
+                    title=f"{t} — tuned vs untuned vs lab data",
+                    xtitle="Measurement", ytitle=t, height=300,
+                    showlegend=True), barmode="group")
+                st.plotly_chart(figc, use_container_width=True)
+
+            if st.button("↩️ Undo tuning", key="undo_wg_tune"):
+                st.session_state["wg_tune_result"] = None
+                st.rerun()
 
     # -------- Composition guess for wet gas --------
     with st.expander("🔬 Guess composition for EOS comparison"):
@@ -1128,54 +1608,132 @@ elif fluid == "Wet Gas / Condensate":
             cgc[1].metric("C7+ SG", f"{SG_c7:.4f}")
             styled_dataframe(cg_df, height=300)
 
+    # -------- Lab experiments for wet gas --------
+    with st.expander("🧪 Lab experiments — CCE / CVD / Flash"):
+        st.markdown(
+            "Wet-gas lab experiment approximations. CVD traces the condensate "
+            "dropout as the gas depletes below the dew point."
+        )
+        from correlation_experiments import cvd_wetgas, cce_drygas, flash_drygas
+
+        wg_exp = st.radio("Experiment", ["CVD (condensate dropout)",
+                                          "CCE (gas expansion)", "Flash"],
+                           horizontal=True, key="wg_exp_choice")
+
+        if wg_exp == "CVD (condensate dropout)":
+            if st.button("Run CVD", key="run_cvd_wg"):
+                rows = cvd_wetgas(wet, Pdew, pressures)
+                cvd_df = pd.DataFrame([{
+                    f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                    "Z": r["Z"],
+                    "Liquid dropout (%)": r["L_dropout_pct"],
+                    "Rv produced (STB/Mscf)": r["Rv_produced"],
+                    "Phase": r["phase"],
+                } for r in rows])
+                styled_dataframe(cvd_df, height=300)
+                fig = go.Figure()
+                fig.add_trace(TH.line_trace(
+                    cvd_df[f"P ({L['P']})"], cvd_df["Liquid dropout (%)"],
+                    "Liquid dropout", color_idx=0))
+                fig.add_vline(x=U.to_user_P(Pdew, unit_system),
+                              line_dash="dash", line_color=TH.DARK_NAVY,
+                              annotation_text="Pdew")
+                fig.update_layout(**TH.plotly_layout(
+                    title="CVD — condensate liquid dropout vs P",
+                    xtitle=f"P ({L['P']})", ytitle="Liquid dropout (%)",
+                    height=340))
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif wg_exp == "CCE (gas expansion)":
+            if st.button("Run CCE", key="run_cce_wg"):
+                rows = cce_drygas(wet, pressures)
+                cce_df = pd.DataFrame([{
+                    f"P ({L['P']})": U.to_user_P(r["P"], unit_system),
+                    "Z": r["Z"],
+                    f"Bg ({L['Bg']})": U.to_user_Bg(r["Bg"], unit_system),
+                    "Expansion factor": r["E_factor"],
+                } for r in rows])
+                styled_dataframe(cce_df, height=300)
+
+        else:  # Flash
+            if st.button("Run flash", key="run_flash_wg"):
+                fl = flash_drygas(wet, P_res)
+                fc = st.columns(2)
+                fc[0].metric("Z at P_res", f"{fl['Z_initial']:.4f}")
+                fc[1].metric("Expansion (scf/rb)",
+                              f"{fl['expansion_scf_per_rb']:.2f}")
+
     # -------- Monte Carlo for wet gas --------
     with st.expander("🎲 Monte Carlo uncertainty"):
-        st.markdown("Sample SG and CGR; view distribution of Rv and Bg at P_res.")
+        st.markdown("Sample SG and CGR; view distribution of Z, Bg, Rv at P_res.")
         mcc = st.columns(3)
         with mcc[0]:
             mc_sd_sg = st.number_input("σ(SG)", value=0.03, min_value=0.0,
                                          step=0.005, format="%.3f", key="wg_mc_sg")
         with mcc[1]:
-            mc_sd_cgr = st.number_input("σ(CGR)", value=10.0, min_value=0.0,
-                                          key="wg_mc_cgr")
+            # CGR uncertainty: in display units, convert to field if SI
+            mc_sd_cgr_disp = st.number_input(
+                f"σ(CGR) [{'STB/MMscf' if unit_system == 'Field' else 'Sm³/MSm³'}]",
+                value=10.0 if unit_system == "Field" else 1.8,
+                min_value=0.0, key="wg_mc_cgr")
+            mc_sd_cgr = (mc_sd_cgr_disp * 5.6146 if unit_system == "SI"
+                          else mc_sd_cgr_disp)
         with mcc[2]:
             mc_n = st.slider("Samples", 100, 2000, 500, step=100, key="wg_mc_n")
         if st.button("Run Monte Carlo", key="wg_mc_run"):
             rng = np.random.default_rng(42)
-            sg_s = np.clip(rng.normal(gas_sg, mc_sd_sg, mc_n), 0.55, 1.2)
-            cgr_s = np.clip(rng.normal(cgr, mc_sd_cgr, mc_n), 1, 500)
+            sg_s = np.clip(rng.normal(gas_sg, mc_sd_sg, mc_n), 0.55, 1.5)
+            cgr_s = np.clip(rng.normal(cgr, mc_sd_cgr, mc_n), 1.0, 500.0)
             Bgs, Rvs, Zs = [], [], []
+            n_fail = 0
             for i in range(mc_n):
                 try:
                     w = WetGasCorrelations(
-                        gas_sg=sg_s[i], api_cond=api_cond, cgr=cgr_s[i],
-                        T=T_res, Pdew=Pdew, rv_model=rv_model)
+                        gas_sg=float(sg_s[i]), api_cond=api_cond,
+                        cgr_stb_per_mmscf=float(cgr_s[i]),
+                        T=T_res, N2=N2, CO2=CO2, H2S=H2S,
+                        z_corr=z_corr, mu_corr=mug_corr,
+                        rv_corr=rv_corr, Pdew=Pdew)
                     Z = w.z_factor(P_res)
+                    if Z is None or np.isnan(Z):
+                        raise ValueError("Z is NaN")
                     Zs.append(Z)
                     Bgs.append(w.formation_volume_factor(P_res, Z))
                     Rvs.append(w.rv(P_res))
                 except Exception:
+                    n_fail += 1
                     Zs.append(np.nan); Bgs.append(np.nan); Rvs.append(np.nan)
             Bgs = np.array(Bgs); Rvs = np.array(Rvs); Zs = np.array(Zs)
-            sm = st.columns(3)
-            sm[0].metric("Z mean", f"{np.nanmean(Zs):.4f}")
-            sm[1].metric("Bg mean (rb/Mscf)", f"{np.nanmean(Bgs)*1000:.4f}")
-            sm[2].metric("Rv mean (STB/Mscf)", f"{np.nanmean(Rvs)*1000:.4f}")
-            hc1, hc2 = st.columns(2)
-            with hc1:
-                fig = go.Figure(go.Histogram(x=Bgs[~np.isnan(Bgs)]*1000, nbinsx=30,
-                                              marker_color=TH.TORCH_RED))
-                fig.update_layout(**TH.plotly_layout(
-                    title="Bg", xtitle="Bg (rb/Mscf)", ytitle="Count",
-                    height=300, showlegend=False))
-                st.plotly_chart(fig, use_container_width=True)
-            with hc2:
-                fig = go.Figure(go.Histogram(x=Rvs[~np.isnan(Rvs)]*1000, nbinsx=30,
-                                              marker_color=TH.DARK_NAVY))
-                fig.update_layout(**TH.plotly_layout(
-                    title="Rv", xtitle="Rv (STB/Mscf)", ytitle="Count",
-                    height=300, showlegend=False))
-                st.plotly_chart(fig, use_container_width=True)
+            n_ok = np.sum(~np.isnan(Zs))
+            if n_ok == 0:
+                st.error("All Monte Carlo draws failed — check input ranges.")
+            else:
+                if n_fail > 0:
+                    st.caption(f"{n_fail} of {mc_n} draws failed and were dropped.")
+                sm = st.columns(3)
+                sm[0].metric("Z mean", f"{np.nanmean(Zs):.4f}",
+                              delta=f"±{np.nanstd(Zs):.4f}")
+                sm[1].metric(f"Bg mean ({L['Bg']})",
+                              f"{U.to_user_Bg(np.nanmean(Bgs)*1000, unit_system):.4f}")
+                sm[2].metric("Rv mean (STB/Mscf)",
+                              f"{np.nanmean(Rvs)*1000:.4f}")
+                hc1, hc2 = st.columns(2)
+                with hc1:
+                    fig = go.Figure(go.Histogram(
+                        x=Bgs[~np.isnan(Bgs)]*1000, nbinsx=30,
+                        marker_color=TH.TORCH_RED))
+                    fig.update_layout(**TH.plotly_layout(
+                        title="Bg distribution", xtitle="Bg (rb/Mscf)",
+                        ytitle="Count", height=300, showlegend=False))
+                    st.plotly_chart(fig, use_container_width=True)
+                with hc2:
+                    fig = go.Figure(go.Histogram(
+                        x=Rvs[~np.isnan(Rvs)]*1000, nbinsx=30,
+                        marker_color=TH.DARK_NAVY))
+                    fig.update_layout(**TH.plotly_layout(
+                        title="Rv distribution", xtitle="Rv (STB/Mscf)",
+                        ytitle="Count", height=300, showlegend=False))
+                    st.plotly_chart(fig, use_container_width=True)
 
     render_tools_section(
         branch_name="wet_gas", fluid_type="wet_gas",
@@ -1769,10 +2327,30 @@ elif fluid == "Compositional (EOS)":
                     f"P ({L['P']})": U.to_user_P(s["P"], unit_system),
                     f"T ({L['T']})": U.to_user_T(s["T_F"], unit_system),
                     "Vapor mol frac": s["V_frac"],
-                    "n_oil_out (lbmol)": s["n_oil_out"],
-                    "n_gas_out (lbmol)": s["n_gas_out"],
+                    f"Stage GOR ({L['Rs']})":
+                        U.to_user_Rs(s["stage_GOR_scfSTB"], unit_system),
+                    "Gas SG": s["gas_SG_stage"],
+                    f"Oil ρ ({L['rho']})":
+                        U.to_user_rho(s["rho_oil_stage"], unit_system)
+                        if not np.isnan(s["rho_oil_stage"]) else np.nan,
+                    f"Gas ρ ({L['rho']})":
+                        U.to_user_rho(s["rho_gas_stage"], unit_system)
+                        if not np.isnan(s["rho_gas_stage"]) else np.nan,
                 } for s in sep_result["stage_results"]])
                 styled_dataframe(stage_df, height=240)
+
+                # Per-stage GOR bar chart
+                fig = go.Figure(go.Bar(
+                    x=[f"Stage {s['stage']}\n{U.to_user_P(s['P'], unit_system):.0f} {L['P']}"
+                       for s in sep_result["stage_results"]],
+                    y=[U.to_user_Rs(s["stage_GOR_scfSTB"], unit_system)
+                       for s in sep_result["stage_results"]],
+                    marker_color=TH.TORCH_RED))
+                fig.update_layout(**TH.plotly_layout(
+                    title="Gas released per separator stage",
+                    xtitle="Stage", ytitle=f"Stage GOR ({L['Rs']})",
+                    height=320, showlegend=False))
+                st.plotly_chart(fig, use_container_width=True)
 
     # ============================================================
     # TAB — EOS Tuning
@@ -2285,19 +2863,45 @@ elif fluid == "❄️ Hydrate Likelihood":
         P_op_psia = U.to_field_P(P_op_user, unit_system)
 
         st.markdown("### Gas Properties")
+
+        # Option to load gas properties from a saved fluid
+        gas_fluids = [
+            (name, rec) for name, rec in
+            st.session_state.get("fluid_registry", {}).items()
+            if rec.get("fluid_type") in ("dry_gas", "wet_gas", "oil")
+        ]
+        fluid_source = st.selectbox(
+            "Gas property source",
+            ["Manual entry"] + [f"📁 {n}" for n, _ in gas_fluids],
+            help="Load gas SG (and H2S/CO2 if stored) from a fluid you saved "
+                 "in another branch's Tools section.")
+
+        loaded_sg = None; loaded_h2s = None; loaded_co2 = None
+        if fluid_source != "Manual entry":
+            sel_name = fluid_source.replace("📁 ", "")
+            rec = dict(gas_fluids)[sel_name]
+            params = rec.get("parameters", {})
+            loaded_sg = params.get("gas_sg")
+            loaded_h2s = params.get("H2S", 0.0)
+            loaded_co2 = params.get("CO2", 0.0)
+            st.caption(f"Loaded from **{sel_name}** ({summarize(rec)})")
+
         gas_sg_h = st.number_input(
             "Gas specific gravity (air = 1)",
-            value=0.65, min_value=0.55, max_value=1.0, step=0.01,
+            value=float(loaded_sg) if loaded_sg is not None else 0.65,
+            min_value=0.55, max_value=1.0, step=0.01,
             help="Specific gravity of the gas phase. Heavier (richer) gas "
                  "forms hydrates at lower P / higher T.")
         H2S_h = st.number_input(
             "H2S mol fraction",
-            value=0.0, min_value=0.0, max_value=0.3, step=0.01, format="%.4f",
+            value=float(loaded_h2s) if loaded_h2s is not None else 0.0,
+            min_value=0.0, max_value=0.3, step=0.01, format="%.4f",
             help="H2S strongly promotes hydrate formation: each 1% lowers the "
                  "hydrate-formation pressure by ~5%.")
         CO2_h = st.number_input(
             "CO2 mol fraction",
-            value=0.0, min_value=0.0, max_value=0.5, step=0.01, format="%.4f",
+            value=float(loaded_co2) if loaded_co2 is not None else 0.0,
+            min_value=0.0, max_value=0.5, step=0.01, format="%.4f",
             help="CO2 modestly promotes hydrates: each 1% lowers P_hyd by ~1.5%.")
 
         st.markdown("### Safety Margin")
@@ -2442,61 +3046,116 @@ elif fluid == "❄️ Hydrate Likelihood":
 
     # ---- Inhibitor selection ----
     st.markdown("---")
-    st.markdown("### Inhibitor Requirement (Hammerschmidt)")
+    st.markdown("### Inhibitor Effect (Hammerschmidt)")
     st.markdown(
-        "If operating in the hydrate zone, an inhibitor (methanol or glycol) "
-        "can suppress the hydrate-formation temperature by binding water and "
-        "depressing its freezing point. The Hammerschmidt equation estimates "
-        "the required inhibitor concentration:"
+        "An inhibitor (methanol or glycol) suppresses the hydrate-formation "
+        "temperature by binding water. Drag the slider to set the inhibitor "
+        "concentration — the **inhibited hydrate curve** (dashed) shifts left "
+        "relative to the **uninhibited curve** (solid). The Hammerschmidt "
+        "equation relates concentration to temperature shift:"
     )
-    st.latex(r"W = \frac{\Delta T \cdot M \cdot 100}{K_H + \Delta T \cdot M}")
+    st.latex(r"\Delta T = \frac{K_H \cdot W}{M \cdot (100 - W)}")
     st.caption(
-        "where $W$ = inhibitor concentration (wt %), $\\Delta T$ = required "
-        "temperature suppression (°F), $M$ = inhibitor molecular weight, "
-        "and $K_H$ = Hammerschmidt constant (2335 for methanol, 2222 for MEG)."
+        "where $W$ = inhibitor concentration (wt %), $\\Delta T$ = hydrate-T "
+        "suppression (°F), $M$ = inhibitor molecular weight, $K_H$ = "
+        "Hammerschmidt constant (2335 methanol, 2222 MEG, 4000 DEG, 5400 TEG)."
     )
 
-    # Required temperature suppression
-    if not np.isnan(risk["T_hydrate"]) and risk["in_hydrate_zone"]:
-        delta_T_default = (risk["T_hydrate"] - T_op_F) + 5.0  # 5 °F safety margin
-    else:
-        delta_T_default = 0.0
-
-    cinh = st.columns(2)
+    cinh = st.columns([1, 2])
     with cinh[0]:
-        delta_T_user = st.number_input(
-            f"Required ΔT suppression ({L['T']})",
-            value=max(delta_T_default, 0.0) if unit_system == "Field"
-                   else max(delta_T_default * 5.0/9.0, 0.0),
-            min_value=0.0, step=1.0,
-            help="How many degrees the hydrate-formation T must be depressed "
-                 "to clear the operating point with margin.")
-        delta_T_F = delta_T_user if unit_system == "Field" else delta_T_user * 9.0/5.0
-    with cinh[1]:
         inhibitor = st.selectbox(
             "Inhibitor",
             ["methanol", "MEG", "DEG", "TEG"],
-            help="Methanol is the most common offshore inhibitor (cheap, "
-                 "effective, but volatile). MEG is preferred when recovery "
-                 "and regeneration is feasible.")
+            help="Methanol: cheap, effective, volatile. MEG: preferred when "
+                 "recovery and regeneration are feasible.")
+        inhibitor_wt = st.slider(
+            "Inhibitor concentration (wt %)",
+            min_value=0.0, max_value=60.0, value=20.0, step=1.0,
+            help="Aqueous-phase concentration. Drag to see the curve move.")
 
-    if delta_T_F > 0:
-        W_required = inhibitor_concentration_hammerschmidt(delta_T_F, inhibitor)
-        st.success(
-            f"**{inhibitor.upper()} concentration required: "
-            f"{W_required:.1f} wt%** "
-            f"(to suppress hydrate formation T by {delta_T_F:.1f} °F)"
-        )
-        # Also display all four inhibitors for comparison
-        comp_rows = []
-        for inh in ["methanol", "MEG", "DEG", "TEG"]:
-            W = inhibitor_concentration_hammerschmidt(delta_T_F, inh)
-            comp_rows.append({"Inhibitor": inh, "Concentration (wt %)": W})
-        comp_df = pd.DataFrame(comp_rows)
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+    # Hammerschmidt: ΔT (°F) for the chosen W
+    _M = {"methanol": 32.04, "MEG": 62.07, "DEG": 106.12, "TEG": 150.17}[inhibitor]
+    _KH = {"methanol": 2335, "MEG": 2222, "DEG": 4000, "TEG": 5400}[inhibitor]
+    if inhibitor_wt < 99.9:
+        delta_T_F = (_KH * inhibitor_wt) / (_M * (100.0 - inhibitor_wt))
     else:
-        st.info("No inhibitor needed — the current operating point is already "
-                "outside the hydrate-forming region.")
+        delta_T_F = 0.0
+    delta_T_disp = delta_T_F if unit_system == "Field" else delta_T_F * 5.0 / 9.0
+
+    with cinh[0]:
+        st.metric(f"Hydrate-T suppression",
+                   f"{delta_T_disp:.1f} {L['T']}")
+        # Does this clear the operating point?
+        if not np.isnan(risk["T_hydrate"]):
+            new_T_hyd_F = risk["T_hydrate"] - delta_T_F
+            if T_op_F > new_T_hyd_F:
+                st.success(f"✓ Clears the operating point "
+                            f"(inhibited hydrate-T = "
+                            f"{U.to_user_T(new_T_hyd_F, unit_system):.1f} {L['T']})")
+            else:
+                still_need = T_op_F - new_T_hyd_F
+                st.warning(f"⚠️ Still in hydrate zone — need "
+                            f"{abs(still_need):.1f} °F more suppression.")
+
+    with cinh[1]:
+        # Plot: uninhibited curve vs inhibited curve (shifted by ΔT in T)
+        T_curve_F2, P_curve_psia2 = hydrate_curve(gas_sg_h, H2S_h, CO2_h,
+                                                    n_points=60)
+        T_unInh = [U.to_user_T(t, unit_system) for t in T_curve_F2]
+        P_unInh = [U.to_user_P(p, unit_system) for p in P_curve_psia2]
+        # The inhibited curve: same P, but each T is shifted DOWN by ΔT
+        # (it now takes a colder temperature to form hydrates at that P)
+        T_inh = [U.to_user_T(t - delta_T_F, unit_system) for t in T_curve_F2]
+
+        fig_inh = go.Figure()
+        fig_inh.add_trace(go.Scatter(
+            x=T_unInh, y=P_unInh, name="No inhibitor",
+            mode="lines", line=dict(color="#3A6E96", width=3),
+            hovertemplate=f"No inhibitor<br>T=%{{x:.1f}} {L['T']}<br>"
+                          f"P=%{{y:.0f}} {L['P']}<extra></extra>"))
+        fig_inh.add_trace(go.Scatter(
+            x=T_inh, y=P_unInh,
+            name=f"{inhibitor} {inhibitor_wt:.0f} wt%",
+            mode="lines", line=dict(color="#EB0037", width=3, dash="dash"),
+            hovertemplate=f"{inhibitor} {inhibitor_wt:.0f}wt%<br>"
+                          f"T=%{{x:.1f}} {L['T']}<br>"
+                          f"P=%{{y:.0f}} {L['P']}<extra></extra>"))
+        # Operating point
+        op_color2 = ("#EB0037" if risk["risk_level"] == "in_zone"
+                      else "#C58B00" if risk["risk_level"] == "marginal"
+                      else "#9DBA00")
+        fig_inh.add_trace(go.Scatter(
+            x=[T_op_user], y=[P_op_user], name="Operating point",
+            mode="markers", marker=dict(size=16, color=op_color2,
+                                         symbol="diamond",
+                                         line=dict(color="#00243D", width=2)),
+            hovertemplate=f"Operating point<br>T={T_op_user:.1f} {L['T']}"
+                          f"<br>P={P_op_user:.0f} {L['P']}<extra></extra>"))
+        fig_inh.update_layout(**TH.plotly_layout(
+            title=f"Inhibition shifts the hydrate curve left by "
+                  f"{delta_T_disp:.1f} {L['T']}",
+            xtitle=f"Temperature ({L['T']})",
+            ytitle=f"Pressure ({L['P']})",
+            height=420))
+        st.plotly_chart(fig_inh, use_container_width=True)
+
+    # Comparison table of all four inhibitors at the slider concentration
+    st.markdown("##### All inhibitors at {:.0f} wt%".format(inhibitor_wt))
+    comp_rows = []
+    for inh in ["methanol", "MEG", "DEG", "TEG"]:
+        Mi = {"methanol": 32.04, "MEG": 62.07, "DEG": 106.12, "TEG": 150.17}[inh]
+        KHi = {"methanol": 2335, "MEG": 2222, "DEG": 4000, "TEG": 5400}[inh]
+        if inhibitor_wt < 99.9:
+            dT = (KHi * inhibitor_wt) / (Mi * (100.0 - inhibitor_wt))
+        else:
+            dT = 0.0
+        comp_rows.append({
+            "Inhibitor": inh,
+            f"ΔT suppression ({L['T']})":
+                dT if unit_system == "Field" else dT * 5.0 / 9.0,
+        })
+    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True,
+                 hide_index=True)
 
     # ---- Notes ----
     st.markdown("---")

@@ -177,3 +177,104 @@ def auto_select_best_correlation(corr_class, base_params, lab_data,
             })
     results.sort(key=lambda r: r["rms_with_Pb_shift"])
     return results
+
+
+# ============================================================
+# Wet-gas correlation tuning
+# ============================================================
+def tune_wetgas(wet_class, base_params, lab_data,
+                 tune=("Pdew_shift", "Rv_factor"), max_iter=40):
+    """
+    Tune a wet-gas correlation against lab data.
+
+    Tunable adjustments:
+        Pdew_shift : additive shift on dew point (psia)
+        Rv_factor  : multiplicative scale on Rv (vaporized oil ratio)
+        Z_factor   : multiplicative scale on Z-factor
+
+    base_params: dict with gas_sg, api_cond, cgr, T, N2, CO2, H2S,
+                 z_corr, mu_corr, rv_corr, Pdew
+    lab_data: list of dicts with 'type' ('Pdew','Z','Rv','Bg'),
+              'P' (psia, except Pdew), 'value', optional 'weight'
+
+    Returns dict similar to tune_correlation_oil.
+    """
+    from scipy.optimize import minimize
+
+    def build(adj):
+        """Build a wet-gas instance with the given adjustments."""
+        Pdew_shift = adj.get("Pdew_shift", 0.0)
+        w = wet_class(
+            gas_sg=base_params["gas_sg"],
+            api_cond=base_params["api_cond"],
+            cgr_stb_per_mmscf=base_params["cgr"],
+            T=base_params["T"],
+            N2=base_params.get("N2", 0.0),
+            CO2=base_params.get("CO2", 0.0),
+            H2S=base_params.get("H2S", 0.0),
+            z_corr=base_params.get("z_corr", "Hall-Yarborough"),
+            mu_corr=base_params.get("mu_corr", "Lee-Gonzalez-Eakin"),
+            rv_corr=base_params.get("rv_corr", "Linear-Pdew"),
+            Pdew=base_params["Pdew"] + Pdew_shift)
+        return w
+
+    def predict_one(adj, m):
+        Rv_factor = adj.get("Rv_factor", 1.0)
+        Z_factor = adj.get("Z_factor", 1.0)
+        w = build(adj)
+        if m["type"] == "Pdew":
+            return base_params["Pdew"] + adj.get("Pdew_shift", 0.0)
+        P = m["P"]
+        Z = w.z_factor(P) * Z_factor
+        if m["type"] == "Z":
+            return Z
+        if m["type"] == "Rv":
+            return w.rv(P) * Rv_factor
+        if m["type"] == "Bg":
+            return w.formation_volume_factor(P, Z)
+        return np.nan
+
+    y_obs = np.array([m["value"] for m in lab_data])
+    scales = np.where(np.abs(y_obs) > 1e-9, np.abs(y_obs), 1.0)
+    pred_init = np.array([predict_one({}, m) for m in lab_data])
+
+    tune_init = {"Pdew_shift": 0.0, "Rv_factor": 1.0, "Z_factor": 1.0}
+    bounds_map = {
+        "Pdew_shift": (-2000.0, 2000.0),
+        "Rv_factor":  (0.5, 2.0),
+        "Z_factor":   (0.85, 1.15),
+    }
+    tune_keys = list(tune)
+    x0 = np.array([tune_init[k] for k in tune_keys])
+    bounds = [bounds_map[k] for k in tune_keys]
+
+    def objective(x):
+        adj = dict(tune_init)
+        for i, k in enumerate(tune_keys):
+            adj[k] = x[i]
+        try:
+            pred = np.array([predict_one(adj, m) for m in lab_data])
+        except Exception:
+            return 1e9
+        bad = ~np.isfinite(pred)
+        if np.any(bad):
+            pred = np.where(bad, y_obs * 10.0, pred)
+        return float(np.sum(((pred - y_obs) / scales) ** 2))
+
+    res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
+                    options={"maxiter": max_iter})
+    adj_final = dict(tune_init)
+    for i, k in enumerate(tune_keys):
+        adj_final[k] = res.x[i]
+    pred_final = np.array([predict_one(adj_final, m) for m in lab_data])
+
+    return {
+        "tuned":             adj_final,
+        "tuned_keys":        tune_keys,
+        "predicted_initial": pred_init,
+        "predicted_final":   pred_final,
+        "observed":          y_obs,
+        "rms_initial": float(np.sqrt(np.mean(((pred_init - y_obs) / scales) ** 2))),
+        "rms_final":   float(np.sqrt(np.mean(((pred_final - y_obs) / scales) ** 2))),
+        "success":     bool(res.success),
+    }

@@ -71,12 +71,36 @@ def run_separator_train(z, comp_names, train, c7_props=None):
         if n_gas > 0:
             total_gas_comp += n_gas * y
 
+        # Per-stage gas SG and densities
+        if n_gas > 1e-12:
+            gas_MW_stage = float(np.dot(y, MW))
+            gas_SG_stage = gas_MW_stage / 28.97
+            # gas density at stage P,T using Z_V
+            if not np.isnan(Z_V):
+                rho_gas_stage = phase_density(comp_names, y, Z_V,
+                                                P_s, T_s_R, c7_props)
+            else:
+                rho_gas_stage = np.nan
+        else:
+            gas_MW_stage = np.nan; gas_SG_stage = np.nan
+            rho_gas_stage = np.nan
+        # Stage liquid (oil) density
+        if n_oil > 1e-12 and not np.isnan(Z_L):
+            rho_oil_stage = phase_density(comp_names, x, Z_L,
+                                            P_s, T_s_R, c7_props)
+        else:
+            rho_oil_stage = np.nan
+
         gas_streams.append({"stage": i + 1, "n_gas": n_gas, "y": y,
                              "V_scf": V_gas_scf_this, "P": P_s, "T_F": T_s_F})
         stage_results.append({
             "stage": i + 1, "P": P_s, "T_F": T_s_F,
             "n_in": current_lbmol, "n_oil_out": n_oil, "n_gas_out": n_gas,
             "x": x, "y": y, "Z_L": Z_L, "Z_V": Z_V, "V_frac": V,
+            "gas_scf_this_stage": V_gas_scf_this,
+            "gas_SG_stage": gas_SG_stage,
+            "rho_gas_stage": rho_gas_stage,
+            "rho_oil_stage": rho_oil_stage,
         })
 
         current_feed = x
@@ -108,6 +132,11 @@ def run_separator_train(z, comp_names, train, c7_props=None):
         total_gas_comp_norm = np.zeros_like(z); gas_MW = np.nan
 
     GOR = (total_gas_scf / V_oil_bbl) if V_oil_bbl > 0 else 0.0
+
+    # Per-stage GOR: gas released at that stage per STB of final stock-tank oil
+    for s in stage_results:
+        s["stage_GOR_scfSTB"] = (s["gas_scf_this_stage"] / V_oil_bbl
+                                  if V_oil_bbl > 0 else 0.0)
 
     # API gravity of stock-tank oil
     api = (141.5 / (rho_st / 62.428) - 131.5) if (rho_st and rho_st > 0

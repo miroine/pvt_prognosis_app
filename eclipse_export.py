@@ -240,27 +240,29 @@ def _convert_pvto_to_metric(field_text):
     PSI_PER_BAR = 14.50377
     SCF_PER_SM3 = 5.6146
     out_lines = []
-    header_done = False
+    seen_data = False
     for line in field_text.splitlines():
         s = line.strip()
         if s.startswith("PVTO"):
             out_lines.append(line)
             out_lines.append("-- Rs        Psat       Bo        Muo")
             out_lines.append("-- Sm3/Sm3   bara       rm3/Sm3   cP")
-            header_done = True
             continue
-        if not header_done and s.startswith("--"):
-            continue   # drop original FIELD header comments
         if s == "/" or not s:
             out_lines.append(line); continue
+        # comment lines: drop the original FIELD headers (before any data),
+        # keep inline comments that come after data has started
         if s.startswith("--"):
-            out_lines.append(line); continue
+            if seen_data:
+                out_lines.append(line)
+            continue
         has_slash = s.endswith("/")
         core = s.rstrip("/").strip()
         toks = core.split()
         try: vals = [float(t) for t in toks]
         except ValueError:
             out_lines.append(line); continue
+        seen_data = True
         if len(vals) == 4:
             Rs, P, Bo, Mu = vals
             Rs_si = Rs * 1000.0 / SCF_PER_SM3
@@ -278,21 +280,27 @@ def _convert_pvto_to_metric(field_text):
 def _convert_pvdg_to_metric(field_text):
     """Convert PVDG: P [psia]->bara, Bg [rb/Mscf]->rm3/Sm3."""
     PSI_PER_BAR = 14.50377
-    SCF_PER_SM3 = 5.6146
     out = []
+    seen_data = False
     for line in field_text.splitlines():
         s = line.strip()
-        if not s or s.startswith("--") or s.startswith("PVDG") or s == "/":
+        if s.startswith("PVDG"):
+            out.append(line)
+            out.append("-- P          Bg            Mug")
+            out.append("-- bara       rm3/Sm3       cP")
+            continue
+        if not s or s == "/":
             out.append(line); continue
+        if s.startswith("--"):
+            if seen_data:
+                out.append(line)
+            continue
         toks = s.rstrip("/").split()
         try: P, Bg, Mu = [float(t) for t in toks]
         except ValueError: out.append(line); continue
-        # Bg rb/Mscf → rm3/Sm3:  rb/Mscf * 5.6146/1000 = rm3/Mscf, /5.6146 again = rm3/Sm3... no
-        # Cleaner: 1 rb = 5.6146 cuft = 0.158987 m3; 1 Mscf = 28.3168 m3 at SC; so Bg(rm3/Sm3) = Bg(rb/Mscf)*0.158987/28.3168
-        Bg_si = Bg * 0.158987 / 28.3168 * 1000.0  # rm3/Mscf normalized... wait
-        # Field PVDG Bg is rb/Mscf. Metric PVDG Bg is rm3/Sm3.
+        seen_data = True
+        # Field PVDG Bg is rb/Mscf -> Metric rm3/Sm3:
         # rb -> rm3: × 0.158987;  Mscf -> Sm3: × 28.3168
-        # so Bg(rm3/Sm3) = Bg(rb/Mscf) × 0.158987 / 28.3168
         Bg_si = Bg * 0.158987 / 28.3168
         out.append(f"  {P/PSI_PER_BAR:9.3f}   {Bg_si:11.7f}   {Mu:8.5f}")
     return "\n".join(out) + "\n"
@@ -301,19 +309,27 @@ def _convert_pvdg_to_metric(field_text):
 def _convert_pvtg_to_metric(field_text):
     """Convert PVTG: P, Rv [STB/Mscf]->Sm3/Sm3, Bg [rb/Mscf]->rm3/Sm3."""
     PSI_PER_BAR = 14.50377
-    SCF_PER_SM3 = 5.6146  # 1 Sm3 = 35.3147 scf? Actually 1 Sm3 (at 15°C, 1 atm) = 5.6146 scf? No.
-    # STB/Mscf: barrels per thousand scf.  Sm3/Sm3 dimensionless. Conversion:
-    # 1 STB = 0.158987 Sm3,  1 Mscf = 28.3168 Sm3.  So STB/Mscf × 0.158987/28.3168 = Sm3/Sm3
     out = []
+    seen_data = False
     for line in field_text.splitlines():
         s = line.strip()
-        if not s or s.startswith("--") or s.startswith("PVTG") or s == "/":
+        if s.startswith("PVTG"):
+            out.append(line)
+            out.append("-- P         Rv           Bg           Mug")
+            out.append("-- bara      Sm3/Sm3      rm3/Sm3      cP")
+            continue
+        if not s or s == "/":
             out.append(line); continue
+        if s.startswith("--"):
+            if seen_data:
+                out.append(line)
+            continue
         has_slash = s.endswith("/")
         core = s.rstrip("/").strip()
         toks = core.split()
         try: vals = [float(t) for t in toks]
         except ValueError: out.append(line); continue
+        seen_data = True
         if len(vals) == 4:
             P, Rv, Bg, Mu = vals
             Rv_si = Rv * 0.158987 / 28.3168
@@ -335,15 +351,26 @@ def _convert_pvtw_to_metric(field_text):
     """Convert PVTW: Pref [psia]->bara, Cw [1/psi]->1/bar."""
     PSI_PER_BAR = 14.50377
     out = []
+    seen_data = False
     for line in field_text.splitlines():
         s = line.strip()
-        if not s or s.startswith("--") or s.startswith("PVTW"):
+        if s.startswith("PVTW"):
+            out.append(line)
+            out.append("-- Pref     Bwref     Cw           Muw       Viscosibility")
+            out.append("-- bara     rm3/Sm3   1/bar        cP        1/bar")
+            continue
+        if not s:
             out.append(line); continue
+        if s.startswith("--"):
+            if seen_data:
+                out.append(line)
+            continue
         has_slash = s.endswith("/")
         core = s.rstrip("/").strip()
         toks = core.split()
         try: vals = [float(t) for t in toks]
         except ValueError: out.append(line); continue
+        seen_data = True
         if len(vals) >= 4:
             P, Bw, Cw, Mu = vals[:4]
             visc = vals[4] if len(vals) > 4 else 0.0
@@ -360,15 +387,25 @@ def _convert_density_to_metric(field_text):
     """Convert DENSITY: lb/ft3 -> kg/m3."""
     F = 16.01846
     out = []
+    seen_data = False
     for line in field_text.splitlines():
         s = line.strip()
-        if not s or s.startswith("--") or s.startswith("DENSITY"):
+        if s.startswith("DENSITY"):
+            out.append(line)
+            out.append("-- Oil       Water     Gas      (kg/m3)")
+            continue
+        if not s:
             out.append(line); continue
+        if s.startswith("--"):
+            if seen_data:
+                out.append(line)
+            continue
         has_slash = s.endswith("/")
         core = s.rstrip("/").strip()
         toks = core.split()
         try: vals = [float(t) for t in toks]
         except ValueError: out.append(line); continue
+        seen_data = True
         if len(vals) >= 3:
             ro, rw, rg = vals[:3]
             new = f"   {ro*F:7.2f}   {rw*F:7.2f}   {rg*F:7.3f}"
