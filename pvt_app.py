@@ -770,34 +770,48 @@ if fluid == "Oil (Black Oil)":
                 })
                 styled_dataframe(tor_df, height=180)
 
-                # Standard tornado: two bar traces (one for the low side, one
-                # for the high side). Each bar is drawn as an offset from the
-                # base value via the `base` array, so a single trace carries
-                # all parameters. barmode='overlay' lets the two sides share
-                # the same y-categories without shrinking the bars.
+                # Tornado chart. To avoid every Plotly bar-placement quirk
+                # (categorical axes, base= with overlay/stack), each parameter
+                # is placed at an explicit NUMERIC y-position and drawn as a
+                # filled rectangle via add_shape. Shapes honour absolute x0/x1
+                # coordinates exactly, so the bars cannot collapse. The y-axis
+                # ticks are then labelled with the parameter names.
                 fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    y=params,
-                    x=[l - base_disp for l in lo_disp],
-                    base=[base_disp] * len(params),
-                    orientation="h", name="−1σ",
-                    marker_color=TH.DARK_NAVY,
-                    hovertemplate="%{y} −1σ<br>" + output_name +
-                                  "=%{base:.3f}%{x:+.3f}<extra></extra>"))
-                fig.add_trace(go.Bar(
-                    y=params,
-                    x=[h - base_disp for h in hi_disp],
-                    base=[base_disp] * len(params),
-                    orientation="h", name="+1σ",
-                    marker_color=TH.TORCH_RED,
-                    hovertemplate="%{y} +1σ<br>" + output_name +
-                                  "=%{base:.3f}%{x:+.3f}<extra></extra>"))
+                n = len(params)
+                bar_h = 0.36   # half-height of each bar
+                for i in range(n):
+                    lo, hi = lo_disp[i], hi_disp[i]
+                    # Low-side rectangle: base -> lo
+                    x0_lo, x1_lo = sorted([base_disp, lo])
+                    fig.add_shape(type="rect", y0=i - bar_h, y1=i + bar_h,
+                                   x0=x0_lo, x1=x1_lo,
+                                   fillcolor=TH.DARK_NAVY,
+                                   line=dict(width=0), layer="above")
+                    # High-side rectangle: base -> hi
+                    x0_hi, x1_hi = sorted([base_disp, hi])
+                    fig.add_shape(type="rect", y0=i - bar_h, y1=i + bar_h,
+                                   x0=x0_hi, x1=x1_hi,
+                                   fillcolor=TH.TORCH_RED,
+                                   line=dict(width=0), layer="above")
+
+                # Invisible scatter points carry hover info + drive autoscale
+                fig.add_trace(go.Scatter(
+                    x=lo_disp, y=list(range(n)), mode="markers",
+                    marker=dict(size=1, color=TH.DARK_NAVY), name="−1σ",
+                    hovertemplate="%{text}: low=%{x:.3f}<extra></extra>",
+                    text=params))
+                fig.add_trace(go.Scatter(
+                    x=hi_disp, y=list(range(n)), mode="markers",
+                    marker=dict(size=1, color=TH.TORCH_RED), name="+1σ",
+                    hovertemplate="%{text}: high=%{x:.3f}<extra></extra>",
+                    text=params))
+                # Base reference line
                 fig.add_vline(x=base_disp, line_dash="dash",
                                line_color="black",
                                annotation_text=f"base = {base_disp:.1f}",
                                annotation_position="top")
 
-                # Explicit x-range with padding so the bars are clearly visible
+                # Explicit ranges with padding
                 all_vals = lo_disp + hi_disp + [base_disp]
                 span = max(all_vals) - min(all_vals)
                 pad = span * 0.15 if span > 1e-9 else max(abs(base_disp) * 0.1, 1.0)
@@ -805,11 +819,13 @@ if fluid == "Oil (Black Oil)":
                     title=f"Tornado — {output_name} sensitivity (±1σ)",
                     xtitle=f"{output_name} ({unit_label})",
                     ytitle="Parameter", height=320, showlegend=True)
-                layout["barmode"] = "overlay"
-                layout["bargap"] = 0.35
                 fig.update_layout(**layout)
                 fig.update_xaxes(range=[min(all_vals) - pad,
                                          max(all_vals) + pad])
+                fig.update_yaxes(tickmode="array",
+                                  tickvals=list(range(n)),
+                                  ticktext=params,
+                                  range=[-0.6, n - 0.4])
                 st.plotly_chart(fig, use_container_width=True)
 
             tcol1, tcol2 = st.columns(2)
