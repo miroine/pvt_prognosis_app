@@ -1,5 +1,40 @@
 # PVT Studio — Equinor-themed PVT Application
 
+By **Merouane Hamdani** · MIT License · Early-phase screening tool
+
+## Latest round — robustness: validation, presets, unit audit
+
+- **Input validation** (`validators.py`) — hard guards reject physically
+  impossible inputs (negative pressure, zero GOR, empty composition,
+  porosity entered as a percent); soft warnings flag inputs outside a
+  correlation's published validity envelope, with the range and source.
+- **Example fluid presets** (`presets.py`) — 16 representative literature
+  fluids across all branches. "Load an example fluid" fills every input
+  so a new user sees a complete worked result immediately.
+- **Tuning staleness detection** — each tuning result stores a fingerprint
+  of the fluid it was tuned against; the tuned overlay/export is hidden
+  with a warning if the current inputs no longer match.
+- **Unit-conversion audit** — every conversion now routes through
+  `units.py`; all inline conversion factors removed. New CGR converters
+  added. The validation suite checks round-trip identity for all 8
+  conversion families (pressure, T, GOR, Bg, Rv, Cw, density, CGR).
+- **Validation suite is now 51 checks** (was 38) — `python test_validation.py`.
+
+## How to run
+
+```
+pip install -r requirements.txt
+streamlit run pvt_app.py
+```
+
+Validation suite: `python test_validation.py`
+
+---
+
+## Earlier rounds
+
+# PVT Studio — Equinor-themed PVT Application
+
 By **Merouane Hamdani** · MIT License · Early-phase tool
 
 ## What's new this round

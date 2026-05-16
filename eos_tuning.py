@@ -126,8 +126,13 @@ def predict_all(z, comp_names, T_R, params, c7_base, measurements):
 
 
 def tune_eos(z, comp_names, T_R, c7_base, measurements,
-              free_params=None, max_iter=30, tol=1e-6):
-    """Run LM least-squares regression on EOS parameters."""
+              free_params=None, max_iter=30, tol=1e-6,
+              progress_callback=None):
+    """Run LM least-squares regression on EOS parameters.
+
+    progress_callback : optional callable(fraction, message) — invoked as
+        the optimizer evaluates the model so the UI can show progress.
+    """
     if free_params is None:
         free_params = ["Pc_C7+", "Tc_C7+", "omega_C7+", "kij_C1_C7+"]
     free_map = {"Pc_C7+": 0, "Tc_C7+": 1, "omega_C7+": 2,
@@ -148,7 +153,17 @@ def tune_eos(z, comp_names, T_R, c7_base, measurements,
 
     pred_init = predict_all(z, comp_names, T_R, x0_full, c7_base, measurements)
 
+    _nfev_budget = max(max_iter * 5, 60)
+    _eval_state = {"n": 0}
+    if progress_callback is not None:
+        progress_callback(0.0, "Starting EOS regression...")
+
     def residual_fn(x_free):
+        _eval_state["n"] += 1
+        if progress_callback is not None:
+            progress_callback(
+                min(_eval_state["n"] / _nfev_budget, 0.99),
+                f"Model evaluation {_eval_state['n']}")
         full = x0_full.copy()
         for i, idx in enumerate(free_idx):
             full[idx] = x_free[i]
@@ -163,9 +178,11 @@ def tune_eos(z, comp_names, T_R, c7_base, measurements,
         return weights * (pred - y_obs) / scales
 
     result = least_squares(residual_fn, x0=x0, bounds=(lo, hi),
-                            method="trf", max_nfev=max(max_iter * 5, 60),
+                            method="trf", max_nfev=_nfev_budget,
                             xtol=tol, ftol=tol,
                             diff_step=0.02)
+    if progress_callback is not None:
+        progress_callback(1.0, "Done")
 
     full_opt = x0_full.copy()
     for i, idx in enumerate(free_idx):

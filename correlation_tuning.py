@@ -46,9 +46,13 @@ def apply_corrections(rows, Pb_base, Pb_shift=0.0,
 
 def tune_correlation_oil(corr_class, base_params, lab_data,
                           tune=("Pb_shift", "Bo_factor"),
-                          n_grid_points=50, max_iter=100, tol=1e-6):
+                          n_grid_points=50, max_iter=100, tol=1e-6,
+                          progress_callback=None):
     """
     Optimize correlation tuning parameters against lab measurements.
+
+    progress_callback : optional callable(fraction, message). Called as the
+        optimizer iterates so the UI can show a progress bar.
 
     Args:
         corr_class   : OilCorrelations class
@@ -119,8 +123,26 @@ def tune_correlation_oil(corr_class, base_params, lab_data,
         pred = np.array([predict_one(adj, m) for m in lab_data])
         return np.sum(((pred - y_obs) / scales) ** 2)
 
+    # L-BFGS-B estimates the gradient by finite differences. Its default
+    # relative step (~1e-8) is far too small for a variable like Pb_shift
+    # whose meaningful scale is hundreds of psi and whose start value is 0.
+    # An explicit larger relative step makes the gradient observable.
+    _iter_state = {"n": 0}
+
+    def _cb(xk):
+        _iter_state["n"] += 1
+        if progress_callback is not None:
+            frac = min(_iter_state["n"] / max(max_iter, 1), 0.99)
+            progress_callback(frac, f"Iteration {_iter_state['n']}")
+
+    if progress_callback is not None:
+        progress_callback(0.0, "Starting optimizer...")
     res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
-                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
+                    callback=_cb,
+                    options={"maxiter": max_iter,
+                             "ftol": 1e-12, "gtol": 1e-10})
+    if progress_callback is not None:
+        progress_callback(1.0, "Done")
     adj_final = dict(tune_init)
     for i, k in enumerate(tune_keys):
         adj_final[k] = res.x[i]
@@ -184,7 +206,8 @@ def auto_select_best_correlation(corr_class, base_params, lab_data,
 # Wet-gas correlation tuning
 # ============================================================
 def tune_wetgas(wet_class, base_params, lab_data,
-                 tune=("Pdew_shift", "Rv_factor"), max_iter=40, tol=1e-6):
+                 tune=("Pdew_shift", "Rv_factor"), max_iter=40, tol=1e-6,
+                 progress_callback=None):
     """
     Tune a wet-gas correlation against lab data.
 
@@ -263,8 +286,21 @@ def tune_wetgas(wet_class, base_params, lab_data,
             pred = np.where(bad, y_obs * 10.0, pred)
         return float(np.sum(((pred - y_obs) / scales) ** 2))
 
+    _iter_state = {"n": 0}
+
+    def _cb(xk):
+        _iter_state["n"] += 1
+        if progress_callback is not None:
+            progress_callback(min(_iter_state["n"] / max(max_iter, 1), 0.99),
+                               f"Iteration {_iter_state['n']}")
+
+    if progress_callback is not None:
+        progress_callback(0.0, "Starting optimizer...")
     res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
-                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
+                    callback=_cb,
+                    options={"maxiter": max_iter, "ftol": 1e-12, "gtol": 1e-10})
+    if progress_callback is not None:
+        progress_callback(1.0, "Done")
     adj_final = dict(tune_init)
     for i, k in enumerate(tune_keys):
         adj_final[k] = res.x[i]
@@ -286,7 +322,8 @@ def tune_wetgas(wet_class, base_params, lab_data,
 # Dry-gas correlation tuning
 # ============================================================
 def tune_drygas(gas_class, base_params, lab_data,
-                 tune=("Z_factor",), max_iter=40, tol=1e-6):
+                 tune=("Z_factor",), max_iter=40, tol=1e-6,
+                 progress_callback=None):
     """
     Tune a dry-gas correlation against lab data.
 
@@ -346,8 +383,21 @@ def tune_drygas(gas_class, base_params, lab_data,
             pred = np.where(bad, y_obs * 10.0, pred)
         return float(np.sum(((pred - y_obs) / scales) ** 2))
 
+    _iter_state = {"n": 0}
+
+    def _cb(xk):
+        _iter_state["n"] += 1
+        if progress_callback is not None:
+            progress_callback(min(_iter_state["n"] / max(max_iter, 1), 0.99),
+                               f"Iteration {_iter_state['n']}")
+
+    if progress_callback is not None:
+        progress_callback(0.0, "Starting optimizer...")
     res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
-                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
+                    callback=_cb,
+                    options={"maxiter": max_iter, "ftol": 1e-12, "gtol": 1e-10})
+    if progress_callback is not None:
+        progress_callback(1.0, "Done")
     adj_final = dict(tune_init)
     for i, k in enumerate(tune_keys):
         adj_final[k] = res.x[i]
