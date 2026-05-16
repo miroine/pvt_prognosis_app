@@ -105,3 +105,68 @@ def rock_keyword_metric(Pref_bar, Cf_per_bar):
              "-- bara       1/bar",
              f"   {Pref_bar:8.3f}   {Cf_per_bar:11.4e}  /"]
     return "\n".join(lines) + "\n"
+
+
+# ============================================================
+# Compaction model (ECLIPSE ROCKTAB-style or simple power-law)
+# ============================================================
+def compaction_table(P_ref_psia, Cf_per_psi, pressures,
+                      multiplier_at_Pref=1.0, model="linear"):
+    """
+    Generate a pore-volume multiplier vs pressure table for compaction.
+
+    ECLIPSE uses ROCKTAB or ROCKCOMP keywords to apply pressure-dependent
+    pore-volume multipliers. The pore volume changes as:
+        PV(P) = PV_ref * mult(P)
+
+    For a simple linear compaction:
+        mult(P) = 1 + Cf * (P - P_ref)
+
+    For an exponential model:
+        mult(P) = exp(Cf * (P - P_ref))
+
+    Args:
+        P_ref_psia : Reference pressure where multiplier = 1
+        Cf_per_psi : Compressibility (1/psi)
+        pressures  : List of pressures to evaluate
+        multiplier_at_Pref : Should be 1.0 (sanity check)
+        model      : 'linear' or 'exponential'
+
+    Returns list of (P, multiplier, transmissibility_mult) rows.
+    """
+    import numpy as np
+    rows = []
+    for P in pressures:
+        if model == "exponential":
+            mult = multiplier_at_Pref * np.exp(Cf_per_psi * (P - P_ref_psia))
+        else:  # linear
+            mult = multiplier_at_Pref * (1.0 + Cf_per_psi * (P - P_ref_psia))
+        # Transmissibility multiplier: more compaction -> tighter pores -> lower trans.
+        # A common approximation: t_mult = mult^n with n ~ 2-3 for sandstone
+        t_mult = mult ** 2.0
+        rows.append({
+            "P": P, "PV_mult": mult, "T_mult": t_mult,
+        })
+    return rows
+
+
+def rocktab_keyword(P_ref_psia, Cf_per_psi, pressures, model="linear",
+                     units="FIELD"):
+    """Build the ECLIPSE ROCKTAB keyword from a compaction table.
+
+    Format:
+        ROCKTAB
+        -- P    PV_mult   T_mult
+        ...
+        /
+    """
+    rows = compaction_table(P_ref_psia, Cf_per_psi, pressures, model=model)
+    PSI_PER_BAR = 14.50377
+    p_unit = "psia" if units == "FIELD" else "bara"
+    lines = ["ROCKTAB",
+             f"-- P ({p_unit})    PV multiplier    T multiplier"]
+    for r in rows:
+        P_out = r["P"] if units == "FIELD" else r["P"] / PSI_PER_BAR
+        lines.append(f"   {P_out:9.3f}   {r['PV_mult']:11.6f}   {r['T_mult']:11.6f}")
+    lines.append("/")
+    return "\n".join(lines) + "\n"

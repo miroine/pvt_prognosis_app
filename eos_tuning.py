@@ -126,7 +126,7 @@ def predict_all(z, comp_names, T_R, params, c7_base, measurements):
 
 
 def tune_eos(z, comp_names, T_R, c7_base, measurements,
-              free_params=None, max_iter=30):
+              free_params=None, max_iter=30, tol=1e-6):
     """Run LM least-squares regression on EOS parameters."""
     if free_params is None:
         free_params = ["Pc_C7+", "Tc_C7+", "omega_C7+", "kij_C1_C7+"]
@@ -163,13 +163,17 @@ def tune_eos(z, comp_names, T_R, c7_base, measurements,
         return weights * (pred - y_obs) / scales
 
     result = least_squares(residual_fn, x0=x0, bounds=(lo, hi),
-                            method="trf", max_nfev=max_iter * 5,
-                            xtol=1e-6, ftol=1e-6)
+                            method="trf", max_nfev=max(max_iter * 5, 60),
+                            xtol=tol, ftol=tol,
+                            diff_step=0.02)
 
     full_opt = x0_full.copy()
     for i, idx in enumerate(free_idx):
         full_opt[idx] = result.x[i]
     pred_final = predict_all(z, comp_names, T_R, full_opt, c7_base, measurements)
+
+    # Build the tuned C7+ property set so callers can re-use it
+    tuned_c7 = apply_c7_multipliers(c7_base, full_opt[0], full_opt[1], full_opt[2])
 
     return {
         "param_names": all_param_names,
@@ -184,4 +188,7 @@ def tune_eos(z, comp_names, T_R, c7_base, measurements,
         "n_iter":   int(result.nfev),
         "success":  bool(result.success),
         "message":  str(result.message),
+        "tuned_c7_props": tuned_c7,
+        "kij_C1_C7": float(full_opt[3]),
+        "kij_N2_C7": float(full_opt[4]),
     }

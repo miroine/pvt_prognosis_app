@@ -46,7 +46,7 @@ def apply_corrections(rows, Pb_base, Pb_shift=0.0,
 
 def tune_correlation_oil(corr_class, base_params, lab_data,
                           tune=("Pb_shift", "Bo_factor"),
-                          n_grid_points=50):
+                          n_grid_points=50, max_iter=100, tol=1e-6):
     """
     Optimize correlation tuning parameters against lab measurements.
 
@@ -119,7 +119,8 @@ def tune_correlation_oil(corr_class, base_params, lab_data,
         pred = np.array([predict_one(adj, m) for m in lab_data])
         return np.sum(((pred - y_obs) / scales) ** 2)
 
-    res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B")
+    res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
+                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
     adj_final = dict(tune_init)
     for i, k in enumerate(tune_keys):
         adj_final[k] = res.x[i]
@@ -183,7 +184,7 @@ def auto_select_best_correlation(corr_class, base_params, lab_data,
 # Wet-gas correlation tuning
 # ============================================================
 def tune_wetgas(wet_class, base_params, lab_data,
-                 tune=("Pdew_shift", "Rv_factor"), max_iter=40):
+                 tune=("Pdew_shift", "Rv_factor"), max_iter=40, tol=1e-6):
     """
     Tune a wet-gas correlation against lab data.
 
@@ -196,6 +197,7 @@ def tune_wetgas(wet_class, base_params, lab_data,
                  z_corr, mu_corr, rv_corr, Pdew
     lab_data: list of dicts with 'type' ('Pdew','Z','Rv','Bg'),
               'P' (psia, except Pdew), 'value', optional 'weight'
+    tol: L-BFGS-B function-tolerance.
 
     Returns dict similar to tune_correlation_oil.
     """
@@ -262,7 +264,7 @@ def tune_wetgas(wet_class, base_params, lab_data,
         return float(np.sum(((pred - y_obs) / scales) ** 2))
 
     res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
-                    options={"maxiter": max_iter})
+                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
     adj_final = dict(tune_init)
     for i, k in enumerate(tune_keys):
         adj_final[k] = res.x[i]
@@ -278,3 +280,222 @@ def tune_wetgas(wet_class, base_params, lab_data,
         "rms_final":   float(np.sqrt(np.mean(((pred_final - y_obs) / scales) ** 2))),
         "success":     bool(res.success),
     }
+
+
+# ============================================================
+# Dry-gas correlation tuning
+# ============================================================
+def tune_drygas(gas_class, base_params, lab_data,
+                 tune=("Z_factor",), max_iter=40, tol=1e-6):
+    """
+    Tune a dry-gas correlation against lab data.
+
+    Tunable adjustments:
+        Z_factor   : multiplicative scale on Z-factor
+        mu_factor  : multiplicative scale on viscosity
+
+    base_params: dict with gas_sg, T, N2, CO2, H2S, z_corr, mu_corr
+    lab_data: list of dicts with 'type' ('Z','Bg','mu_g'),
+              'P' (psia), 'value', optional 'weight'
+
+    Returns dict similar to other tuning functions.
+    """
+    def build():
+        return gas_class(
+            gas_sg=base_params["gas_sg"], T=base_params["T"],
+            N2=base_params.get("N2", 0.0),
+            CO2=base_params.get("CO2", 0.0),
+            H2S=base_params.get("H2S", 0.0),
+            z_corr=base_params.get("z_corr", "Hall-Yarborough"),
+            mu_corr=base_params.get("mu_corr", "Lee-Gonzalez-Eakin"))
+
+    def predict_one(adj, m):
+        Z_factor = adj.get("Z_factor", 1.0)
+        mu_factor = adj.get("mu_factor", 1.0)
+        g = build()
+        P = m["P"]
+        Z = g.z_factor(P) * Z_factor
+        if m["type"] == "Z":
+            return Z
+        if m["type"] == "Bg":
+            return g.formation_volume_factor(P, Z)
+        if m["type"] == "mu_g":
+            return g.viscosity(P, Z) * mu_factor
+        return np.nan
+
+    y_obs = np.array([m["value"] for m in lab_data])
+    scales = np.where(np.abs(y_obs) > 1e-9, np.abs(y_obs), 1.0)
+    pred_init = np.array([predict_one({}, m) for m in lab_data])
+
+    tune_init = {"Z_factor": 1.0, "mu_factor": 1.0}
+    bounds_map = {"Z_factor": (0.85, 1.15), "mu_factor": (0.5, 2.0)}
+    tune_keys = list(tune)
+    x0 = np.array([tune_init[k] for k in tune_keys])
+    bounds = [bounds_map[k] for k in tune_keys]
+
+    def objective(x):
+        adj = dict(tune_init)
+        for i, k in enumerate(tune_keys):
+            adj[k] = x[i]
+        try:
+            pred = np.array([predict_one(adj, m) for m in lab_data])
+        except Exception:
+            return 1e9
+        bad = ~np.isfinite(pred)
+        if np.any(bad):
+            pred = np.where(bad, y_obs * 10.0, pred)
+        return float(np.sum(((pred - y_obs) / scales) ** 2))
+
+    res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
+                    options={"maxiter": max_iter, "ftol": tol, "gtol": tol})
+    adj_final = dict(tune_init)
+    for i, k in enumerate(tune_keys):
+        adj_final[k] = res.x[i]
+    pred_final = np.array([predict_one(adj_final, m) for m in lab_data])
+
+    return {
+        "tuned":             adj_final,
+        "tuned_keys":        tune_keys,
+        "predicted_initial": pred_init,
+        "predicted_final":   pred_final,
+        "observed":          y_obs,
+        "rms_initial": float(np.sqrt(np.mean(((pred_init - y_obs) / scales) ** 2))),
+        "rms_final":   float(np.sqrt(np.mean(((pred_final - y_obs) / scales) ** 2))),
+        "success":     bool(res.success),
+    }
+
+
+# ============================================================
+# Tuned correlation wrappers — apply tuning factors transparently
+# ============================================================
+class TunedOilCorrelations:
+    """Wraps an OilCorrelations instance and applies tuning adjustments.
+
+    The wrapper exposes the same interface as OilCorrelations (bubble_point,
+    solution_gor, formation_volume_factor, viscosity, oil_compressibility)
+    but applies Pb_shift / Rs_factor / Bo_factor / mu_factor so downstream
+    code (property plots, experiments, ECLIPSE export) can use a tuned
+    fluid without any special-casing.
+    """
+    def __init__(self, base_corr, tuned_adjustments):
+        self._base = base_corr
+        self._adj = dict(tuned_adjustments or {})
+        # Expose common attributes
+        self.api = base_corr.api
+        self.gamma_o = base_corr.gamma_o
+        self.gamma_g = base_corr.gamma_g
+        self.T = base_corr.T
+        self.T_R = base_corr.T_R
+
+    @property
+    def Pb_shift(self):
+        return self._adj.get("Pb_shift", 0.0)
+
+    @property
+    def Rs_factor(self):
+        return self._adj.get("Rs_factor", 1.0)
+
+    @property
+    def Bo_factor(self):
+        return self._adj.get("Bo_factor", 1.0)
+
+    @property
+    def mu_factor(self):
+        return self._adj.get("mu_factor", 1.0)
+
+    def bubble_point(self, Rsi):
+        return self._base.bubble_point(Rsi) + self.Pb_shift
+
+    def solution_gor(self, P):
+        return self._base.solution_gor(P) * self.Rs_factor
+
+    def formation_volume_factor(self, P, Rs, saturated=True, Pb=None):
+        # Rs passed in may already be tuned; un-scale before passing to base
+        Rs_base = Rs / self.Rs_factor if self.Rs_factor else Rs
+        return self._base.formation_volume_factor(
+            P, Rs_base, saturated=saturated, Pb=Pb) * self.Bo_factor
+
+    def viscosity(self, P, Rs, Pb, saturated=True):
+        Rs_base = Rs / self.Rs_factor if self.Rs_factor else Rs
+        return self._base.viscosity(
+            P, Rs_base, Pb, saturated=saturated) * self.mu_factor
+
+    def oil_compressibility(self, P, Rs):
+        Rs_base = Rs / self.Rs_factor if self.Rs_factor else Rs
+        return self._base.oil_compressibility(P, Rs_base)
+
+
+class TunedWetGasCorrelations:
+    """Wraps a WetGasCorrelations instance with tuning adjustments
+    (Pdew_shift / Rv_factor / Z_factor)."""
+    def __init__(self, base_corr, tuned_adjustments):
+        self._base = base_corr
+        self._adj = dict(tuned_adjustments or {})
+        self.gamma_g = getattr(base_corr, "gamma_g", None)
+        self.gamma_g_res = getattr(base_corr, "gamma_g_res", None)
+        self.T = base_corr.T
+        self.T_R = base_corr.T_R
+        # Rv_max scales with the Rv tuning factor
+        _rvmax = getattr(base_corr, "Rv_max", None)
+        if _rvmax is not None:
+            self.Rv_max = _rvmax * self._adj.get("Rv_factor", 1.0)
+        # Apply Pdew shift directly to a stored attribute
+        self.Pdew = getattr(base_corr, "Pdew", None)
+        if self.Pdew is not None:
+            self.Pdew = self.Pdew + self._adj.get("Pdew_shift", 0.0)
+
+    @property
+    def Z_factor_mult(self):
+        return self._adj.get("Z_factor", 1.0)
+
+    @property
+    def Rv_factor(self):
+        return self._adj.get("Rv_factor", 1.0)
+
+    def z_factor(self, P):
+        return self._base.z_factor(P) * self.Z_factor_mult
+
+    def formation_volume_factor(self, P, Z=None):
+        if Z is None:
+            Z = self.z_factor(P)
+        # Bg scales with Z, so recompute via base with the tuned Z
+        return self._base.formation_volume_factor(P, Z)
+
+    def rv(self, P):
+        return self._base.rv(P) * self.Rv_factor
+
+    def viscosity(self, P, Z=None):
+        if Z is None:
+            Z = self.z_factor(P)
+        return self._base.viscosity(P, Z)
+
+
+class TunedGasCorrelations:
+    """Wraps a GasCorrelations (dry gas) instance with Z_factor / mu_factor."""
+    def __init__(self, base_corr, tuned_adjustments):
+        self._base = base_corr
+        self._adj = dict(tuned_adjustments or {})
+        self.gamma_g = base_corr.gamma_g
+        self.T = base_corr.T
+        self.T_R = base_corr.T_R
+
+    @property
+    def Z_factor_mult(self):
+        return self._adj.get("Z_factor", 1.0)
+
+    @property
+    def mu_factor(self):
+        return self._adj.get("mu_factor", 1.0)
+
+    def z_factor(self, P):
+        return self._base.z_factor(P) * self.Z_factor_mult
+
+    def formation_volume_factor(self, P, Z=None):
+        if Z is None:
+            Z = self.z_factor(P)
+        return self._base.formation_volume_factor(P, Z)
+
+    def viscosity(self, P, Z=None):
+        if Z is None:
+            Z = self.z_factor(P)
+        return self._base.viscosity(P, Z) * self.mu_factor

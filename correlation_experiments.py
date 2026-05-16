@@ -327,3 +327,113 @@ def flash_drygas(gas_corr, P_initial):
         "Bg_initial_rb_per_scf": Bg_i,
         "expansion_scf_per_rb": expansion,
     }
+
+
+# ============================================================
+# DLE (Differential Liberation Experiment) for black oil
+# ============================================================
+def dle_blackoil(oil_corr, Rsi, Pb, pressures):
+    """
+    Differential liberation: stepwise pressure depletion below Pb.
+    At each step the liberated gas is REMOVED (vs CCE where it stays).
+    Reports Rs, Bo, Bg-of-liberated-gas, oil density.
+
+    Above Pb behaves like single-phase under-saturated oil.
+
+    Returns list of rows with P, Rs, Bo, Bg, rho_oil, mu_oil.
+    """
+    Pb_b = Pb
+    rows = []
+    for P in sorted(pressures, reverse=True):
+        if P >= Pb_b:
+            Rs = Rsi
+            Bo = oil_corr.formation_volume_factor(P, Rsi, saturated=False, Pb=Pb_b)
+            mu = oil_corr.viscosity(P, Rsi, Pb_b, saturated=False)
+        else:
+            Rs = oil_corr.solution_gor(P)
+            Bo = oil_corr.formation_volume_factor(P, Rs, saturated=True)
+            mu = oil_corr.viscosity(P, Rs, Pb_b, saturated=True)
+        # Oil density estimate from Bo and Rs (standard McCain-style approx)
+        try:
+            rho_sc = 141.5 / (131.5 + oil_corr.api) * 62.428
+            rho = (rho_sc + Rs * oil_corr.gamma_g * 0.0764 / 5.615) / Bo if Bo > 0 else rho_sc
+        except Exception:
+            rho = np.nan
+        rows.append({"P": P, "Rs": Rs, "Bo": Bo, "mu_o": mu, "rho_oil": rho,
+                      "phase": "L" if P >= Pb_b else "LV"})
+    return sorted(rows, key=lambda r: r["P"])
+
+
+# ============================================================
+# Multi-stage separator for dry gas (just expansion/compression chain)
+# ============================================================
+def multistage_separator_drygas(gas_corr, P_initial, stages):
+    """
+    Multi-stage flash for a dry gas. A dry gas has no condensate dropout
+    (CGR = 0), so each stage just expands the gas to its (P, T). We report
+    the expansion factor at each stage and the cumulative expansion to
+    stock tank.
+
+    stages: list of (P_psia, T_F) tuples, HP -> ST.
+
+    Returns dict with per-stage data and totals.
+    """
+    Z_i = gas_corr.z_factor(P_initial)
+    Bg_i = gas_corr.formation_volume_factor(P_initial, Z_i)
+    rows = []
+    for i, (P_s, T_s) in enumerate(stages):
+        Zs = gas_corr.z_factor(P_s)
+        Bgs = gas_corr.formation_volume_factor(P_s, Zs)
+        # Expansion from reservoir to this stage
+        expansion = Bg_i / Bgs if Bgs > 0 else np.nan
+        rho_gas = (0.0764 * gas_corr.gamma_g * P_s / (Zs * 14.7) *
+                    (520.0 / (T_s + 460.0)))  # lb/ft3 at stage
+        rows.append({
+            "stage": i + 1, "P": P_s, "T_F": T_s,
+            "Z": Zs, "Bg": Bgs,
+            "expansion_from_res": expansion,
+            "rho_gas": rho_gas,
+        })
+    return {
+        "stage_results": rows,
+        "Z_initial": Z_i,
+        "Bg_initial": Bg_i,
+    }
+
+
+# ============================================================
+# DLE / DDL (effectively same data) for dry gas
+# ============================================================
+def dle_drygas(gas_corr, pressures):
+    """
+    For a dry gas, DLE is just the P/Z and density vs P table.
+    No condensate dropout. Useful for material-balance checks.
+    """
+    rows = []
+    for P in sorted(pressures, reverse=True):
+        Z = gas_corr.z_factor(P)
+        Bg = gas_corr.formation_volume_factor(P, Z)
+        rho_gas = (0.0764 * gas_corr.gamma_g * P / (Z * 14.7) *
+                    (520.0 / (gas_corr.T + 460.0)))
+        rows.append({"P": P, "Z": Z, "Bg": Bg * 1000.0,
+                      "P_over_Z": P / Z, "rho_gas": rho_gas})
+    return sorted(rows, key=lambda r: r["P"])
+
+
+# ============================================================
+# DLE for wet gas
+# ============================================================
+def dle_wetgas(wet_corr, Pdew, pressures):
+    """
+    For a wet gas, DLE traces Z, Bg, Rv (condensate yield) as P depletes
+    below the dew point. Above Pdew, single-phase gas.
+    """
+    rows = []
+    for P in sorted(pressures, reverse=True):
+        Z = wet_corr.z_factor(P)
+        Bg = wet_corr.formation_volume_factor(P, Z)
+        Rv = wet_corr.rv(P)
+        phase = "V" if P >= Pdew else "LV"
+        rows.append({"P": P, "Z": Z, "Bg": Bg * 1000.0, "Rv": Rv,
+                      "phase": phase})
+    return sorted(rows, key=lambda r: r["P"])

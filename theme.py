@@ -96,10 +96,27 @@ section[data-testid="stSidebar"] {
     border-right: 1px solid #DDD;
 }
 
-/* Tables - subtle borders */
+/* Tables - subtle borders, smaller font for readability */
 [data-testid="stDataFrame"] {
     border: 1px solid #DDD;
     border-radius: 4px;
+    font-size: 0.8rem !important;
+}
+[data-testid="stDataFrame"] div[role="gridcell"],
+[data-testid="stDataFrame"] div[role="columnheader"] {
+    font-size: 0.78rem !important;
+    padding: 2px 6px !important;
+}
+[data-testid="stDataFrame"] th {
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+}
+[data-testid="stTable"] {
+    font-size: 0.8rem !important;
+}
+[data-testid="stTable"] th, [data-testid="stTable"] td {
+    font-size: 0.78rem !important;
+    padding: 4px 8px !important;
 }
 
 /* Success / info / warning boxes */

@@ -80,3 +80,106 @@ def to_user_rho(rho_field, units):
 def to_user_Cw(Cw_field, units):
     # 1/psi -> 1/bar:  multiply by 14.5038
     return Cw_field * PSIA_PER_BAR if units == "SI" else Cw_field
+
+def to_field_Cw(Cw_user, units):
+    """Reverse: Cw from 1/bar (SI) to 1/psi (field)."""
+    return Cw_user / PSIA_PER_BAR if units == "SI" else Cw_user
+
+
+def to_field_rho(rho_user, units):
+    """Reverse: kg/m3 -> lb/ft3."""
+    return kgm3_to_lbft3(rho_user) if units == "SI" else rho_user
+
+
+def to_field_Bg(Bg_user, units):
+    """Reverse: rm3/Sm3 (SI) -> rb/Mscf (field)."""
+    return Bg_user * 5.6146 if units == "SI" else Bg_user
+
+
+def to_field_Rv(Rv_user, units):
+    """Reverse: Sm3/Sm3 (SI) -> STB/Mscf (field)."""
+    return Rv_user * 5.6146 if units == "SI" else Rv_user
+
+
+def to_user_Rv(Rv_field_STBMscf, units):
+    """Field STB/Mscf -> SI Sm3/Sm3."""
+    return Rv_field_STBMscf / 5.6146 if units == "SI" else Rv_field_STBMscf
+
+
+# ----------------------------------------------------------------
+# ΔT conversion (temperature delta, not absolute T)
+# ----------------------------------------------------------------
+def to_field_deltaT(dT_user, units):
+    """Convert a temperature DIFFERENCE from user to field units.
+    Uses the scale factor 9/5 only — NO 32° offset."""
+    return dT_user / F_TO_C_SCALE if units == "SI" else dT_user
+
+def to_user_deltaT(dT_field, units):
+    return dT_field * F_TO_C_SCALE if units == "SI" else dT_field
+
+
+# ----------------------------------------------------------------
+# Robust lab-measurement conversion for tuning workflows
+# ----------------------------------------------------------------
+# Each lab measurement has 'type', 'P' (display units, except for Pb/Pdew),
+# and 'value' (display units appropriate to the type).
+#
+# These two helpers do the conversions consistently across all branches.
+# ----------------------------------------------------------------
+
+def lab_to_field(lab_list, units):
+    """Convert a list of display-unit lab measurements to FIELD units.
+
+    Supported types:
+        - 'Pb', 'Pdew': value is pressure (psia/bara), P is ignored
+        - 'Rs':         value is Rs (scf/STB or Sm3/Sm3), P is pressure
+        - 'Rv':         value is Rv (STB/Mscf or Sm3/Sm3), P is pressure
+        - 'Bo', 'Bg':   value is dimensionless ratio (same in both systems)
+        - 'mu_o', 'mu_g': value is viscosity in cP (same in both systems)
+        - 'Z':          dimensionless
+    """
+    out = []
+    for m in lab_list:
+        t = m.get("type", "")
+        fm = {"type": t, "weight": m.get("weight", 1.0)}
+        v = float(m.get("value", 0.0))
+        P = float(m.get("P", 0.0))
+        if t in ("Pb", "Pdew"):
+            fm["P"] = 0.0
+            fm["value"] = to_field_P(v, units)
+        elif t == "Rs":
+            fm["P"] = to_field_P(P, units)
+            fm["value"] = to_field_Rs(v, units)
+        elif t == "Rv":
+            # Note: Field Rv unit is STB/Mscf, SI is Sm3/Sm3
+            fm["P"] = to_field_P(P, units)
+            fm["value"] = to_field_Rv(v, units)
+        elif t in ("Bo", "Bg", "Z", "mu_o", "mu_g"):
+            # Dimensionless or cP - same in both systems
+            fm["P"] = to_field_P(P, units)
+            fm["value"] = v
+        else:
+            # Unknown type - pass through with P conversion
+            fm["P"] = to_field_P(P, units)
+            fm["value"] = v
+        out.append(fm)
+    return out
+
+
+def field_pred_to_user(pred_array, lab_list, units):
+    """Convert predictions from FIELD units back to display units.
+    Uses the lab_list types to know which conversion to apply to each prediction.
+    """
+    import numpy as np
+    out = []
+    for val, m in zip(pred_array, lab_list):
+        t = m.get("type", "")
+        if t in ("Pb", "Pdew"):
+            out.append(to_user_P(val, units))
+        elif t == "Rs":
+            out.append(to_user_Rs(val, units))
+        elif t == "Rv":
+            out.append(to_user_Rv(val, units))
+        else:
+            out.append(val)
+    return np.array(out)
