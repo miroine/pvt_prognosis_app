@@ -140,6 +140,12 @@ with st.sidebar:
                           "📚 Documentation"])
 
     st.markdown("### Reservoir Conditions")
+    # A preset's "Load" button runs inside a branch — after this sidebar
+    # widget is already instantiated — so it cannot write res_T_w directly.
+    # Instead it stashes a value in `_pending_T`, which we consume HERE,
+    # before the widget is created, so the new value takes effect.
+    if "_pending_T" in st.session_state:
+        st.session_state["res_T_w"] = st.session_state.pop("_pending_T")
     if unit_system == "Field":
         T_user = st.number_input(f"Temperature ({L['T']})",
                                   min_value=60.0, max_value=400.0,
@@ -456,7 +462,7 @@ if fluid == "Oil (Black Oil)":
                 st.session_state["oil_rsi_w"] = U.to_user_Rs(
                     preset["Rsi"], unit_system)
             if "T_F" in preset:
-                st.session_state["res_T_w"] = U.to_user_T(
+                st.session_state["_pending_T"] = U.to_user_T(
                     preset["T_F"], unit_system)
         render_preset_loader(
             "oil",
@@ -1548,7 +1554,7 @@ elif fluid == "Dry Gas":
 
         def _apply_dg_preset(preset):
             if "T_F" in preset:
-                st.session_state["res_T_w"] = U.to_user_T(
+                st.session_state["_pending_T"] = U.to_user_T(
                     preset["T_F"], unit_system)
         render_preset_loader(
             "dry_gas",
@@ -2211,7 +2217,7 @@ elif fluid == "Wet Gas / Condensate":
 
         def _apply_wg_preset(preset):
             if "T_F" in preset:
-                st.session_state["res_T_w"] = U.to_user_T(
+                st.session_state["_pending_T"] = U.to_user_T(
                     preset["T_F"], unit_system)
             if "cgr" in preset:
                 st.session_state["wg_cgr_w"] = U.to_user_cgr(
@@ -3164,7 +3170,7 @@ elif fluid == "Compositional (EOS)":
         if "fluid_kind" in preset:
             st.session_state["comp_fluidkind_w"] = preset["fluid_kind"]
         if "T_F" in preset:
-            st.session_state["res_T_w"] = U.to_user_T(
+            st.session_state["_pending_T"] = U.to_user_T(
                 preset["T_F"], unit_system)
     render_preset_loader("compositional", key_map={},
                           extra_apply=_apply_comp_preset)
