@@ -107,6 +107,24 @@ def to_user_Rv(Rv_field_STBMscf, units):
 
 
 # ----------------------------------------------------------------
+# CGR (condensate-gas ratio) conversion
+# ----------------------------------------------------------------
+# The app's internal model (WetGasCorrelations) requires CGR strictly in
+# STB/MMscf. The SI display unit is Sm3/MSm3. The conversion uses the same
+# 5.6146 factor the rest of the GOR-family conversions use, so CGR scales
+# consistently with Rs and Rv. Centralizing it here means the factor is
+# defined in exactly one place.
+def to_field_cgr(cgr_user, units):
+    """CGR from the display unit to the internal field unit (STB/MMscf)."""
+    return cgr_user * 5.6146 if units == "SI" else cgr_user
+
+
+def to_user_cgr(cgr_field, units):
+    """CGR from the internal field unit (STB/MMscf) to the display unit."""
+    return cgr_field / 5.6146 if units == "SI" else cgr_field
+
+
+# ----------------------------------------------------------------
 # ΔT conversion (temperature delta, not absolute T)
 # ----------------------------------------------------------------
 def to_field_deltaT(dT_user, units):

@@ -33,6 +33,9 @@ st.markdown(TH.CUSTOM_CSS, unsafe_allow_html=True)
 
 # Mascot header (inline SVG, no external dependency)
 from mascot import header_with_mascot
+from documentation import render_help, render_full_reference
+import validators as VAL
+from presets import get_presets
 st.markdown(
     header_with_mascot(
         "PVT Studio",
@@ -133,17 +136,22 @@ with st.sidebar:
                          ["Oil (Black Oil)", "Dry Gas", "Wet Gas / Condensate",
                           "Water", "Compositional (EOS)",
                           "❄️ Hydrate Likelihood",
-                          "🪨 Rock Compressibility"])
+                          "🪨 Rock Compressibility",
+                          "📚 Documentation"])
 
     st.markdown("### Reservoir Conditions")
     if unit_system == "Field":
         T_user = st.number_input(f"Temperature ({L['T']})",
-                                  value=200.0, min_value=60.0, max_value=400.0)
+                                  min_value=60.0, max_value=400.0,
+                                  value=st.session_state.get("res_T_w", 200.0),
+                                  key="res_T_w")
         P_res_user = st.number_input(f"Pressure ({L['P']})",
                                       value=3500.0, min_value=14.7, max_value=15000.0)
     else:
         T_user = st.number_input(f"Temperature ({L['T']})",
-                                  value=93.0, min_value=15.0, max_value=200.0)
+                                  min_value=15.0, max_value=200.0,
+                                  value=st.session_state.get("res_T_w", 93.0),
+                                  key="res_T_w")
         P_res_user = st.number_input(f"Pressure ({L['P']})",
                                       value=240.0, min_value=1.0, max_value=1000.0)
     T_res = U.to_field_T(T_user, unit_system)
@@ -270,8 +278,76 @@ pressures = np.linspace(P_min, P_max, n_points)
 # ================================================================
 # Shared utilities: fluid registry + per-branch Tools panel
 # ================================================================
-if "fluid_registry" not in st.session_state:
-    st.session_state["fluid_registry"] = {}
+# Centralized session-state initialization. Initializing every key here —
+# rather than lazily inside each branch's expander — means a value read in
+# one branch is never missing just because another branch's expander has
+# not been opened this run. Streamlit reruns top-to-bottom, so anything
+# not in session_state is lost; this block is the single source of truth
+# for what persists.
+_SESSION_DEFAULTS = {
+    "fluid_registry":   {},
+    "oil_tune_result":  None,
+    "dg_tune_result":   None,
+    "wg_tune_result":   None,
+    "comp_tune_result": None,
+}
+for _k, _v in _SESSION_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+def fluid_fingerprint(**params):
+    """Build a stable fingerprint of the fluid parameters a tuning run was
+    performed against. Used to detect when a stored tuning result no longer
+    matches the current inputs (the user changed an input after tuning)."""
+    return tuple(sorted((k, round(float(v), 6))
+                         for k, v in params.items() if v is not None))
+
+
+def tuning_is_stale(tune_result, current_fp):
+    """True when a stored tuning result was tuned against different inputs
+    than are currently entered."""
+    if not tune_result:
+        return False
+    stored = tune_result.get("fluid_fp")
+    if stored is None:
+        return False
+    return tuple(stored) != tuple(current_fp)
+
+
+def render_preset_loader(branch_key, key_map, extra_apply=None):
+    """Render an 'example fluid' preset selector + Load button.
+
+    branch_key : 'oil' / 'dry_gas' / 'wet_gas' / 'water' / 'compositional'
+    key_map    : dict mapping a preset field name -> the session_state
+                 widget key it should populate.
+    extra_apply: optional callable(preset_dict) for fields that need
+                 custom handling (e.g. a composition dict).
+
+    The selected preset's values are written into session_state before the
+    widgets are instantiated, so the widgets pick them up on the rerun.
+    """
+    presets = get_presets(branch_key)
+    if not presets:
+        return
+    with st.expander("⭐ Load an example fluid", expanded=False):
+        st.caption(
+            "New to the app? Load a representative fluid to see a complete "
+            "worked result, then modify the inputs to match your case.")
+        names = list(presets.keys())
+        choice = st.selectbox("Example fluid", names,
+                               key=f"{branch_key}_preset_choice")
+        note = presets[choice].get("_note", "")
+        if note:
+            st.info(note)
+        if st.button(f"Load '{choice}'", key=f"{branch_key}_preset_load"):
+            preset = presets[choice]
+            for field, sk in key_map.items():
+                if field in preset:
+                    st.session_state[sk] = preset[field]
+            if extra_apply is not None:
+                extra_apply(preset)
+            st.rerun()
 
 
 def render_tools_section(branch_name, fluid_type, units, parameters,
@@ -372,21 +448,56 @@ if fluid == "Oil (Black Oil)":
     col_in, col_out = st.columns([1, 2])
     with col_in:
         st.markdown("### Oil Properties")
-        api = st.number_input("Oil API gravity", value=35.0, min_value=10.0, max_value=60.0)
-        gas_sg = st.number_input("Gas SG (air=1)", value=0.75, min_value=0.55, max_value=1.5)
-        if unit_system == "Field":
-            Rsi_user = st.number_input(f"Solution GOR at Pb ({L['Rs']})", value=600.0, min_value=0.0)
-            Pb_user  = st.number_input(f"Bubble point ({L['P']}, 0=calc)", value=0.0, min_value=0.0)
-        else:
-            Rsi_user = st.number_input(f"Solution GOR at Pb ({L['Rs']})", value=107.0, min_value=0.0)
-            Pb_user  = st.number_input(f"Bubble point ({L['P']}, 0=calc)", value=0.0, min_value=0.0)
+
+        # ---- Example fluid presets ----
+        def _apply_oil_preset(preset):
+            # Rsi presets are in field units; convert to the display unit.
+            if "Rsi" in preset:
+                st.session_state["oil_rsi_w"] = U.to_user_Rs(
+                    preset["Rsi"], unit_system)
+            if "T_F" in preset:
+                st.session_state["res_T_w"] = U.to_user_T(
+                    preset["T_F"], unit_system)
+        render_preset_loader(
+            "oil",
+            key_map={"api": "oil_api_w", "gas_sg": "oil_sg_w",
+                      "rs_corr": "oil_rs_corr", "bo_corr": "oil_bo_corr",
+                      "mu_corr": "oil_mu_corr"},
+            extra_apply=_apply_oil_preset)
+
+        api = st.number_input("Oil API gravity", min_value=10.0,
+                               max_value=60.0,
+                               value=st.session_state.get("oil_api_w", 35.0),
+                               key="oil_api_w")
+        gas_sg = st.number_input("Gas SG (air=1)", min_value=0.55,
+                                  max_value=1.5,
+                                  value=st.session_state.get("oil_sg_w", 0.75),
+                                  key="oil_sg_w")
+        _rsi_default = 600.0 if unit_system == "Field" else 107.0
+        Rsi_user = st.number_input(
+            f"Solution GOR at Pb ({L['Rs']})", min_value=0.0,
+            value=st.session_state.get("oil_rsi_w", _rsi_default),
+            key="oil_rsi_w")
+        Pb_user = st.number_input(f"Bubble point ({L['P']}, 0=calc)",
+                                   value=0.0, min_value=0.0)
         Rsi = U.to_field_Rs(Rsi_user, unit_system)
         Pb_input = U.to_field_P(Pb_user, unit_system) if Pb_user > 0 else 0.0
 
         st.markdown("### Correlations")
-        rs_corr = st.selectbox("Rs / Pb", ["Standing", "Vasquez-Beggs", "Glaso", "Lasater"])
-        bo_corr = st.selectbox("Bo", ["Standing", "Vasquez-Beggs", "Glaso"])
-        mu_corr = st.selectbox("Dead-oil viscosity", ["Beggs-Robinson", "Beal", "Glaso"])
+        rs_corr = st.selectbox("Rs / Pb",
+                                ["Standing", "Vasquez-Beggs", "Glaso", "Lasater"],
+                                key="oil_rs_corr")
+        bo_corr = st.selectbox("Bo", ["Standing", "Vasquez-Beggs", "Glaso"],
+                                key="oil_bo_corr")
+        mu_corr = st.selectbox("Dead-oil viscosity",
+                                ["Beggs-Robinson", "Beal", "Glaso"],
+                                key="oil_mu_corr")
+
+    # ---- Input validation ----
+    _oil_val = VAL.check_oil_inputs(api=api, gas_sg=gas_sg, T_F=T_res,
+                                     Rsi=Rsi, rs_corr=rs_corr,
+                                     p_min=P_min, p_max=P_max)
+    VAL.render_messages(_oil_val, stop_on_error=True)
 
     oil = OilCorrelations(api=api, gas_sg=gas_sg, T=T_res,
                           rs_corr=rs_corr, bo_corr=bo_corr, mu_corr=mu_corr)
@@ -414,11 +525,18 @@ if fluid == "Oil (Black Oil)":
     oil_tuned_rows = None
     oil_tuned_Pb = None
     _otr = st.session_state.get("oil_tune_result")
+    _oil_fp = fluid_fingerprint(api=api, gas_sg=gas_sg, T=T_res, Rsi=Rsi)
     if _otr and _otr.get("tuned"):
-        from correlation_tuning import TunedOilCorrelations
-        oil_tuned_corr = TunedOilCorrelations(oil, _otr["tuned"])
-        oil_tuned_Pb = oil_tuned_corr.bubble_point(Rsi)
-        oil_tuned_rows = _build_oil_rows(oil_tuned_corr, oil_tuned_Pb)
+        if tuning_is_stale(_otr, _oil_fp):
+            st.warning(
+                "⚠️ The saved tuning was performed against different fluid "
+                "inputs than are currently entered. The tuned overlay is "
+                "hidden until you re-tune or restore the original inputs.")
+        else:
+            from correlation_tuning import TunedOilCorrelations
+            oil_tuned_corr = TunedOilCorrelations(oil, _otr["tuned"])
+            oil_tuned_Pb = oil_tuned_corr.bubble_point(Rsi)
+            oil_tuned_rows = _build_oil_rows(oil_tuned_corr, oil_tuned_Pb)
 
 
     df = pd.DataFrame([{
@@ -453,10 +571,12 @@ if fluid == "Oil (Black Oil)":
                                     title="Oil FVF", overlay_df=df_tuned)
         with c3: line_chart_plotly(df, pcol, f"μo ({L['mu']})",
                                     title="Oil Viscosity", overlay_df=df_tuned)
+        render_help("oil")
 
     # -------- Monte Carlo uncertainty --------
     st.markdown("---")
     with st.expander("🎲 Monte Carlo uncertainty analysis"):
+        render_help("montecarlo")
         st.markdown(
             "Sample input parameters from normal distributions, run the chosen "
             "correlation at each draw, and view the distribution of resulting "
@@ -627,62 +747,63 @@ if fluid == "Oil (Black Oil)":
                 if base_v is None or (isinstance(base_v, float) and np.isnan(base_v)):
                     st.info(f"Could not compute a base value for {output_name}.")
                     return
-                tor_df = pd.DataFrame([{
-                    "Parameter": param,
-                    "Low":   unit_converter(lo),
-                    "High":  unit_converter(hi),
-                    "Range": abs(unit_converter(hi) - unit_converter(lo)),
-                } for param, lo, hi, rng in tor["rows"]])
+
+                base_disp = unit_converter(base_v)
+                # Sort by impact: smallest range first so the biggest bar is
+                # at the TOP of the horizontal chart (tornado convention).
+                sorted_rows = sorted(tor["rows"], key=lambda r: r[3])
+                params  = [r[0] for r in sorted_rows]
+                lo_disp = [unit_converter(r[1]) for r in sorted_rows]
+                hi_disp = [unit_converter(r[2]) for r in sorted_rows]
+
+                tor_df = pd.DataFrame({
+                    "Parameter": params,
+                    "Low":   lo_disp,
+                    "High":  hi_disp,
+                    "Range": [abs(h - l) for h, l in zip(hi_disp, lo_disp)],
+                })
                 styled_dataframe(tor_df, height=180)
 
-                # Build proper tornado: for each parameter draw a horizontal
-                # bar that extends from min(lo, hi) to max(lo, hi), colored
-                # by whether the +σ direction increased or decreased the output.
-                base_disp = unit_converter(base_v)
+                # Standard tornado: two bar traces (one for the low side, one
+                # for the high side). Each bar is drawn as an offset from the
+                # base value via the `base` array, so a single trace carries
+                # all parameters. barmode='overlay' lets the two sides share
+                # the same y-categories without shrinking the bars.
                 fig = go.Figure()
-                # Sort by range so biggest impact is on top
-                sorted_rows = sorted(tor["rows"], key=lambda r: r[3])
-                for param, lo, hi, rng in sorted_rows:
-                    lo_disp = unit_converter(lo)
-                    hi_disp = unit_converter(hi)
-                    # Always draw two bars per parameter: one extending toward
-                    # the LOW side, one extending toward the HIGH side.
-                    fig.add_trace(go.Bar(
-                        y=[param], x=[lo_disp - base_disp],
-                        base=[base_disp], orientation="h",
-                        name="−1σ", marker_color=TH.DARK_NAVY,
-                        showlegend=(param == sorted_rows[0][0]),
-                        legendgroup="lo",
-                        hovertemplate=f"{param} −1σ<br>"
-                                       f"{output_name}=%{{x:.3f}}<extra></extra>"))
-                    fig.add_trace(go.Bar(
-                        y=[param], x=[hi_disp - base_disp],
-                        base=[base_disp], orientation="h",
-                        name="+1σ", marker_color=TH.TORCH_RED,
-                        showlegend=(param == sorted_rows[0][0]),
-                        legendgroup="hi",
-                        hovertemplate=f"{param} +1σ<br>"
-                                       f"{output_name}=%{{x:.3f}}<extra></extra>"))
-                fig.add_vline(x=base_disp, line_dash="dash", line_color="black",
-                               annotation_text=f"base = {base_disp:.2f}")
-                # Set x-range to clearly show the spread
-                all_vals = [unit_converter(v) for row in tor["rows"]
-                             for v in (row[1], row[2])] + [base_disp]
-                if all_vals:
-                    span = max(all_vals) - min(all_vals)
-                    pad = span * 0.1 if span > 0 else max(abs(base_disp) * 0.05, 1.0)
-                    x_min = min(all_vals) - pad
-                    x_max = max(all_vals) + pad
-                else:
-                    x_min, x_max = None, None
-                fig.update_layout(**TH.plotly_layout(
+                fig.add_trace(go.Bar(
+                    y=params,
+                    x=[l - base_disp for l in lo_disp],
+                    base=[base_disp] * len(params),
+                    orientation="h", name="−1σ",
+                    marker_color=TH.DARK_NAVY,
+                    hovertemplate="%{y} −1σ<br>" + output_name +
+                                  "=%{base:.3f}%{x:+.3f}<extra></extra>"))
+                fig.add_trace(go.Bar(
+                    y=params,
+                    x=[h - base_disp for h in hi_disp],
+                    base=[base_disp] * len(params),
+                    orientation="h", name="+1σ",
+                    marker_color=TH.TORCH_RED,
+                    hovertemplate="%{y} +1σ<br>" + output_name +
+                                  "=%{base:.3f}%{x:+.3f}<extra></extra>"))
+                fig.add_vline(x=base_disp, line_dash="dash",
+                               line_color="black",
+                               annotation_text=f"base = {base_disp:.1f}",
+                               annotation_position="top")
+
+                # Explicit x-range with padding so the bars are clearly visible
+                all_vals = lo_disp + hi_disp + [base_disp]
+                span = max(all_vals) - min(all_vals)
+                pad = span * 0.15 if span > 1e-9 else max(abs(base_disp) * 0.1, 1.0)
+                layout = TH.plotly_layout(
                     title=f"Tornado — {output_name} sensitivity (±1σ)",
-                    xtitle=f"{output_name} ({unit_label})", ytitle="Parameter",
-                    height=320, showlegend=True),
-                    barmode="overlay",
-                    bargap=0.3)
-                if x_min is not None:
-                    fig.update_xaxes(range=[x_min, x_max])
+                    xtitle=f"{output_name} ({unit_label})",
+                    ytitle="Parameter", height=320, showlegend=True)
+                layout["barmode"] = "overlay"
+                layout["bargap"] = 0.35
+                fig.update_layout(**layout)
+                fig.update_xaxes(range=[min(all_vals) - pad,
+                                         max(all_vals) + pad])
                 st.plotly_chart(fig, use_container_width=True)
 
             tcol1, tcol2 = st.columns(2)
@@ -737,6 +858,7 @@ if fluid == "Oil (Black Oil)":
 
     # -------- Lab experiments for correlation oil --------
     with st.expander("🧪 Lab experiments — CCE / CVD / Flash / Separator"):
+        render_help("experiments")
         st.markdown(
             "Black-oil lab experiment approximations using the chosen "
             "correlations. CCE and CVD trace the depletion behavior; "
@@ -872,6 +994,7 @@ if fluid == "Oil (Black Oil)":
 
     # -------- Correlation tuning with experimental data --------
     with st.expander("🎯 Tune correlation with experimental data"):
+        render_help("tuning")
         st.markdown(
             "Provide laboratory measurements (Pb, Rs at P, Bo at P, viscosity at P) "
             "and the app will fit a small set of correction factors "
@@ -991,12 +1114,18 @@ if fluid == "Oil (Black Oil)":
                     "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr}
             lab_field = U.lab_to_field(st.session_state["oil_lab_data"],
                                           unit_system)
-            with st.spinner("Tuning..."):
-                tune_res = tune_correlation_oil(
-                    OilCorrelations, base, lab_field,
-                    tune=tuple(tune_choices),
-                    max_iter=int(oil_max_iter),
-                    tol=10 ** (-oil_tol_exp))
+            _prog = st.progress(0.0, text="Tuning oil correlation...")
+
+            def _oil_prog(frac, msg):
+                _prog.progress(frac, text=f"Tuning oil correlation — {msg}")
+
+            tune_res = tune_correlation_oil(
+                OilCorrelations, base, lab_field,
+                tune=tuple(tune_choices),
+                max_iter=int(oil_max_iter),
+                tol=10 ** (-oil_tol_exp),
+                progress_callback=_oil_prog)
+            _prog.empty()
             tune_res["observed_user"] = U.field_pred_to_user(
                 tune_res["observed"], st.session_state["oil_lab_data"],
                 unit_system)
@@ -1007,6 +1136,8 @@ if fluid == "Oil (Black Oil)":
                 tune_res["predicted_final"], st.session_state["oil_lab_data"],
                 unit_system)
             tune_res["lab_snapshot"] = list(st.session_state["oil_lab_data"])
+            tune_res["fluid_fp"] = fluid_fingerprint(
+                api=api, gas_sg=gas_sg, T=T_res, Rsi=Rsi)
             st.session_state["oil_tune_result"] = tune_res
             st.rerun()
 
@@ -1123,7 +1254,25 @@ if fluid == "Oil (Black Oil)":
                      "manually enter these values to use them.")
 
 
+    # -------- Tools (save/export) --------
+    render_tools_section(
+        branch_name="oil", fluid_type="oil",
+        units=unit_system,
+        parameters={
+            "api": api, "gas_sg": gas_sg, "T_F": T_res, "Rsi_scfSTB": Rsi,
+            "P_res_psia": P_res,
+            "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr,
+        },
+        outputs_summary=[
+            f"Pb = {Pb:.1f} psia",
+            f"Bo @ Pb = {oil.formation_volume_factor(Pb, Rsi, saturated=True):.4f}",
+        ],
+        results_table_df=df,
+        tuning=st.session_state.get("oil_tune_result"))
+
     # ======== ECLIPSE EXPORT (last section) ========
+    if enable_eclipse_export:
+        render_help("eclipse")
     # ECLIPSE export
     df_field = pd.DataFrame([{
         "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
@@ -1137,15 +1286,26 @@ if fluid == "Oil (Black Oil)":
         st.markdown("---")
         st.markdown(f"### ECLIPSE Export ({eclipse_unit_choice} units)")
 
-        # Offer tuned-fluid export when a tuning result exists
-        export_tuned = False
+        # ---- Choose which fluid to export ----
+        # Options: current (untuned), tuned (if available), or any saved
+        # oil fluid from the registry.
+        export_opts = ["Current (untuned)"]
         if oil_tuned_rows is not None:
-            export_tuned = st.checkbox(
-                "🎯 Export the TUNED fluid (apply tuning to PVTO)",
-                value=True,
-                help="When checked, the PVTO table is built from the tuned "
-                     "correlation (Pb shift / Bo / Rs / μ factors applied).")
-        if export_tuned and oil_tuned_rows is not None:
+            export_opts.append("Tuned")
+        saved_oil = {nm: rec for nm, rec in
+                      st.session_state.get("fluid_registry", {}).items()
+                      if rec.get("fluid_type") == "oil"}
+        for nm in saved_oil:
+            export_opts.append(f"Saved: {nm}")
+        export_choice = st.selectbox(
+            "Fluid to export", export_opts, key="oil_export_choice",
+            help="Generate the ECLIPSE deck from the current fluid, the "
+                 "tuned fluid, or any oil fluid you saved to the registry.")
+
+        export_tuned = (export_choice == "Tuned")
+        _export_label = export_choice
+
+        if export_choice == "Tuned" and oil_tuned_rows is not None:
             df_field = pd.DataFrame([{
                 "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
                 "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
@@ -1155,6 +1315,39 @@ if fluid == "Oil (Black Oil)":
             st.caption(f"PVTO built from the **tuned** fluid "
                         f"(Pb = {U.to_user_P(oil_tuned_Pb, unit_system):.1f} "
                         f"{L['P']}).")
+        elif export_choice.startswith("Saved: "):
+            rec = saved_oil[export_choice[len("Saved: "):]]
+            p = rec.get("parameters", {})
+            try:
+                s_api = float(p.get("api", api))
+                s_sg = float(p.get("gas_sg", gas_sg))
+                s_T = float(p.get("T_F", T_res))
+                s_Rsi = float(p.get("Rsi_scfSTB", p.get("Rsi", Rsi)))
+                s_oil = OilCorrelations(
+                    api=s_api, gas_sg=s_sg, T=s_T,
+                    rs_corr=p.get("rs_corr", rs_corr),
+                    bo_corr=p.get("bo_corr", bo_corr),
+                    mu_corr=p.get("mu_corr", mu_corr))
+                # Apply saved tuning if the record carries it
+                s_tuning = rec.get("tuning") or {}
+                if s_tuning.get("tuned"):
+                    from correlation_tuning import TunedOilCorrelations
+                    s_oil = TunedOilCorrelations(s_oil, s_tuning["tuned"])
+                s_Pb = s_oil.bubble_point(s_Rsi)
+                s_rows = _build_oil_rows(s_oil, s_Pb)
+                df_field = pd.DataFrame([{
+                    "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
+                    "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
+                } for r in s_rows])
+                pvto_text = build_pvto(df_field, s_Pb, s_oil, s_Rsi, P_max)
+                density_text = build_density(api=s_api, gas_sg=s_sg)
+                st.caption(f"PVTO built from saved fluid "
+                            f"**{export_choice[len('Saved: '):]}** "
+                            f"(API={s_api:.1f}, Pb="
+                            f"{U.to_user_P(s_Pb, unit_system):.0f} {L['P']}).")
+            except Exception as e:
+                st.error(f"Could not rebuild saved fluid: {e}")
+        # else: 'Current (untuned)' — pvto_text/density_text already set above
 
         if include_water:
             c_sal, c_corr = st.columns(2)
@@ -1173,7 +1366,14 @@ if fluid == "Oil (Black Oil)":
         st.code(pvto_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
         deck = build_full_deck(pvto=pvto_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
-        _suffix = "_TUNED" if export_tuned else ""
+        if export_choice == "Tuned":
+            _suffix = "_TUNED"
+        elif export_choice.startswith("Saved: "):
+            _safe = "".join(c if c.isalnum() else "_"
+                             for c in export_choice[len("Saved: "):])
+            _suffix = f"_{_safe}"
+        else:
+            _suffix = ""
         st.download_button("Download PVT deck (.INC)", deck,
                             file_name=f"PVT_BLACKOIL{_suffix}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
@@ -1222,22 +1422,121 @@ if fluid == "Oil (Black Oil)":
                     mime="text/plain", type="primary",
                     key="dl_oil_pvdg")
 
-    # -------- Tools (save/export) --------
-    render_tools_section(
-        branch_name="oil", fluid_type="oil",
-        units=unit_system,
-        parameters={
-            "api": api, "gas_sg": gas_sg, "T_F": T_res, "Rsi_scfSTB": Rsi,
-            "P_res_psia": P_res,
-            "rs_corr": rs_corr, "bo_corr": bo_corr, "mu_corr": mu_corr,
-        },
-        outputs_summary=[
-            f"Pb = {Pb:.1f} psia",
-            f"Bo @ Pb = {oil.formation_volume_factor(Pb, Rsi, saturated=True):.4f}",
-        ],
-        results_table_df=df,
-        tuning=st.session_state.get("oil_tune_result"))
+    # -------- Multi-region PVT (PVTNUM > 1) --------
+    if enable_eclipse_export:
+        with st.expander("🗂️ Multi-region PVT (PVTNUM > 1)"):
+            st.markdown(
+                "Build a multi-region black-oil deck for layered reservoirs "
+                "where each PVT region has its own fluid. Define each region's "
+                "correlation inputs below; the regions are stacked into a "
+                "single PVTO/DENSITY include file with PVTNUM ordering."
+            )
+            from multi_region import build_multi_region_deck
 
+            saved_oil_mr = {nm: rec for nm, rec in
+                             st.session_state.get("fluid_registry", {}).items()
+                             if rec.get("fluid_type") == "oil"}
+
+            n_reg_oil = st.number_input(
+                "Number of regions", value=2, min_value=1, max_value=8,
+                key="oil_mr_nreg")
+
+            oil_region_specs = []
+            for i in range(int(n_reg_oil)):
+                with st.expander(f"Region {i+1}", expanded=(i == 0)):
+                    src_opts = ["Current fluid"]
+                    if oil_tuned_rows is not None:
+                        src_opts.append("Tuned fluid")
+                    src_opts += [f"Saved: {nm}" for nm in saved_oil_mr]
+                    src = st.selectbox("Source", src_opts,
+                                        key=f"oil_mr_src_{i}")
+                    # Per-region overrides (used only for 'Current fluid')
+                    if src == "Current fluid":
+                        rc = st.columns(4)
+                        r_api = rc[0].number_input(
+                            "API", value=float(api), key=f"oil_mr_api_{i}")
+                        r_sg = rc[1].number_input(
+                            "Gas SG", value=float(gas_sg),
+                            key=f"oil_mr_sg_{i}")
+                        r_Rsi = rc[2].number_input(
+                            f"Rsi ({L['Rs']})",
+                            value=float(U.to_user_Rs(Rsi, unit_system)),
+                            key=f"oil_mr_rsi_{i}")
+                        r_T = rc[3].number_input(
+                            f"T ({L['T']})",
+                            value=float(U.to_user_T(T_res, unit_system)),
+                            key=f"oil_mr_T_{i}")
+                        oil_region_specs.append({
+                            "source": src, "api": r_api, "gas_sg": r_sg,
+                            "Rsi": U.to_field_Rs(r_Rsi, unit_system),
+                            "T": U.to_field_T(r_T, unit_system)})
+                    else:
+                        st.caption(f"Region {i+1} uses **{src}** as defined.")
+                        oil_region_specs.append({"source": src})
+
+            if st.button("Build multi-region deck", type="primary",
+                          key="oil_mr_build"):
+                regions_data = []
+                ok = True
+                for i, spec in enumerate(oil_region_specs):
+                    try:
+                        if spec["source"] == "Current fluid":
+                            r_oil = OilCorrelations(
+                                api=spec["api"], gas_sg=spec["gas_sg"],
+                                T=spec["T"], rs_corr=rs_corr,
+                                bo_corr=bo_corr, mu_corr=mu_corr)
+                            r_Rsi = spec["Rsi"]
+                        elif spec["source"] == "Tuned fluid":
+                            r_oil = oil_tuned_corr
+                            r_Rsi = Rsi
+                        else:  # Saved
+                            rec = saved_oil_mr[spec["source"][len("Saved: "):]]
+                            p = rec.get("parameters", {})
+                            r_oil = OilCorrelations(
+                                api=float(p.get("api", api)),
+                                gas_sg=float(p.get("gas_sg", gas_sg)),
+                                T=float(p.get("T_F", T_res)),
+                                rs_corr=p.get("rs_corr", rs_corr),
+                                bo_corr=p.get("bo_corr", bo_corr),
+                                mu_corr=p.get("mu_corr", mu_corr))
+                            r_Rsi = float(p.get("Rsi_scfSTB",
+                                                 p.get("Rsi", Rsi)))
+                        r_Pb = r_oil.bubble_point(r_Rsi)
+                        r_rows = _build_oil_rows(r_oil, r_Pb)
+                        r_df = pd.DataFrame([{
+                            "P (psia)": r["P_field"],
+                            "Rs (scf/STB)": r["Rs_field"],
+                            "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
+                        } for r in r_rows])
+                        r_pvto = build_pvto(r_df, r_Pb, r_oil, r_Rsi, P_max)
+                        # Per-region surface densities
+                        r_api_val = (spec.get("api", api)
+                                      if spec["source"] == "Current fluid"
+                                      else r_oil.api)
+                        rho_o = 141.5 / (131.5 + r_api_val) * 62.428
+                        regions_data.append({
+                            "kind": "oil", "pvt_text": r_pvto,
+                            "density": (rho_o, 62.428 * 1.02,
+                                         0.0764 * (spec.get("gas_sg", gas_sg)
+                                                    if spec["source"] ==
+                                                    "Current fluid"
+                                                    else gas_sg)),
+                        })
+                    except Exception as e:
+                        st.error(f"Region {i+1} failed: {e}")
+                        ok = False
+                        break
+                if ok and regions_data:
+                    deck = build_multi_region_deck(regions_data)
+                    if eclipse_unit_choice == "METRIC":
+                        st.info("Multi-region deck is generated in FIELD units. "
+                                 "Convert externally if METRIC is required.")
+                    st.code(deck, language="text")
+                    st.download_button(
+                        "Download multi-region deck (.INC)", deck,
+                        file_name="PVT_BLACKOIL_MULTIREGION.INC",
+                        mime="text/plain", type="primary",
+                        key="oil_mr_dl")
 
 # ================================================================
 # DRY GAS
@@ -1246,16 +1545,52 @@ elif fluid == "Dry Gas":
     col_in, col_out = st.columns([1, 2])
     with col_in:
         st.markdown("### Gas Properties")
-        gas_sg = st.number_input("Gas SG (air=1)", value=0.70, min_value=0.55, max_value=1.5)
-        N2 = st.number_input("N2 mol fraction", value=0.0, min_value=0.0, max_value=0.3)
-        CO2 = st.number_input("CO2 mol fraction", value=0.0, min_value=0.0, max_value=0.5)
-        H2S = st.number_input("H2S mol fraction", value=0.0, min_value=0.0, max_value=0.3)
+
+        def _apply_dg_preset(preset):
+            if "T_F" in preset:
+                st.session_state["res_T_w"] = U.to_user_T(
+                    preset["T_F"], unit_system)
+        render_preset_loader(
+            "dry_gas",
+            key_map={"gas_sg": "dg_sg_w", "N2": "dg_n2_w",
+                      "CO2": "dg_co2_w", "H2S": "dg_h2s_w",
+                      "z_corr": "dg_z_corr", "mu_corr": "dg_mu_corr"},
+            extra_apply=_apply_dg_preset)
+
+        gas_sg = st.number_input("Gas SG (air=1)", min_value=0.55,
+                                  max_value=1.5,
+                                  value=st.session_state.get("dg_sg_w", 0.70),
+                                  key="dg_sg_w")
+        N2 = st.number_input("N2 mol fraction", min_value=0.0, max_value=0.3,
+                              value=st.session_state.get("dg_n2_w", 0.0),
+                              key="dg_n2_w")
+        CO2 = st.number_input("CO2 mol fraction", min_value=0.0, max_value=0.5,
+                               value=st.session_state.get("dg_co2_w", 0.0),
+                               key="dg_co2_w")
+        H2S = st.number_input("H2S mol fraction", min_value=0.0, max_value=0.3,
+                               value=st.session_state.get("dg_h2s_w", 0.0),
+                               key="dg_h2s_w")
         st.markdown("### Correlations")
-        z_corr = st.selectbox("Z-factor", ["Hall-Yarborough", "Dranchuk-Abou-Kassem"])
-        mug_corr = st.selectbox("Gas viscosity", ["Lee-Gonzalez-Eakin", "Carr-Kobayashi-Burrows"])
+        z_corr = st.selectbox("Z-factor",
+                               ["Hall-Yarborough", "Dranchuk-Abou-Kassem"],
+                               key="dg_z_corr")
+        mug_corr = st.selectbox("Gas viscosity",
+                                 ["Lee-Gonzalez-Eakin", "Carr-Kobayashi-Burrows"],
+                                 key="dg_mu_corr")
+
+    # ---- Input validation ----
+    _dg_val = VAL.check_gas_inputs(gas_sg=gas_sg, T_F=T_res,
+                                    p_min=P_min, p_max=P_max,
+                                    N2=N2, CO2=CO2, H2S=H2S)
+    VAL.render_messages(_dg_val, stop_on_error=True)
 
     gas = GasCorrelations(gas_sg=gas_sg, T=T_res, N2=N2, CO2=CO2, H2S=H2S,
                            z_corr=z_corr, mu_corr=mug_corr)
+    # Soft Z-factor validity-envelope check
+    _dg_zval = VAL.check_z_validity(getattr(gas, "Tpc", None),
+                                     getattr(gas, "Ppc", None),
+                                     T_res + 460.0, P_min, P_max, z_corr)
+    VAL.render_messages(_dg_zval, stop_on_error=False)
 
     def _build_dg_rows(gas_corr):
         """Compute the Z-Bg-mu property table for a given gas correlation."""
@@ -1276,10 +1611,17 @@ elif fluid == "Dry Gas":
     dg_tuned_corr = None
     dg_tuned_rows = None
     _dgtr = st.session_state.get("dg_tune_result")
+    _dg_fp = fluid_fingerprint(gas_sg=gas_sg, T=T_res, N2=N2, CO2=CO2, H2S=H2S)
     if _dgtr and _dgtr.get("tuned"):
-        from correlation_tuning import TunedGasCorrelations
-        dg_tuned_corr = TunedGasCorrelations(gas, _dgtr["tuned"])
-        dg_tuned_rows = _build_dg_rows(dg_tuned_corr)
+        if tuning_is_stale(_dgtr, _dg_fp):
+            st.warning(
+                "⚠️ The saved dry-gas tuning was performed against "
+                "different inputs than are currently entered. The tuned "
+                "overlay is hidden until you re-tune.")
+        else:
+            from correlation_tuning import TunedGasCorrelations
+            dg_tuned_corr = TunedGasCorrelations(gas, _dgtr["tuned"])
+            dg_tuned_rows = _build_dg_rows(dg_tuned_corr)
 
     df_field = pd.DataFrame([{
         "P (psia)": r["P_field"], "Z": r["Z"],
@@ -1312,9 +1654,11 @@ elif fluid == "Dry Gas":
                                     title="Gas FVF", overlay_df=df_tuned)
         with c3: line_chart_plotly(df, pcol, f"μg ({L['mu']})",
                                     title="Gas Viscosity", overlay_df=df_tuned)
+        render_help("gas")
 
     # -------- Lab experiments for dry gas --------
     with st.expander("🧪 Lab experiments — CCE / CVD / DLE / Flash / Multi-stage"):
+        render_help("experiments")
         st.markdown(
             "Dry-gas lab experiment approximations. A dry gas has no liquid "
             "dropout, so CCE is the gas-expansion curve; CVD gives the "
@@ -1468,6 +1812,7 @@ elif fluid == "Dry Gas":
 
     # -------- Dry gas tuning --------
     with st.expander("🎯 Tune correlation with experimental data"):
+        render_help("tuning")
         st.markdown(
             "Provide lab measurements (Z-factor, Bg, μg at various P) and "
             "fit a Z scale factor and viscosity factor to match your data."
@@ -1561,13 +1906,21 @@ elif fluid == "Dry Gas":
                        "H2S": H2S, "z_corr": z_corr, "mu_corr": mug_corr}
             lab_field = U.lab_to_field(st.session_state["dg_lab_data"],
                                           unit_system)
-            with st.spinner("Tuning dry-gas correlation..."):
-                dg_tune_res = tune_drygas(
-                    GasCorrelations, dg_base, lab_field,
-                    tune=tuple(dg_tune_choices),
-                    max_iter=int(dg_max_iter),
-                    tol=10 ** (-dg_tol_exp))
+            _prog = st.progress(0.0, text="Tuning dry-gas correlation...")
+
+            def _dg_prog(frac, msg):
+                _prog.progress(frac, text=f"Tuning dry-gas correlation — {msg}")
+
+            dg_tune_res = tune_drygas(
+                GasCorrelations, dg_base, lab_field,
+                tune=tuple(dg_tune_choices),
+                max_iter=int(dg_max_iter),
+                tol=10 ** (-dg_tol_exp),
+                progress_callback=_dg_prog)
+            _prog.empty()
             dg_tune_res["lab_snapshot"] = list(st.session_state["dg_lab_data"])
+            dg_tune_res["fluid_fp"] = fluid_fingerprint(
+                gas_sg=gas_sg, T=T_res, N2=N2, CO2=CO2, H2S=H2S)
             st.session_state["dg_tune_result"] = dg_tune_res
             st.rerun()
 
@@ -1608,6 +1961,7 @@ elif fluid == "Dry Gas":
 
     # -------- Monte Carlo for dry gas --------
     with st.expander("🎲 Monte Carlo uncertainty"):
+        render_help("montecarlo")
         st.markdown("Sample gas SG, T (and optionally H2S, CO2) and view "
                      "distributions of Z, Bg, μg at the reservoir P.")
         mcc = st.columns(3)
@@ -1658,7 +2012,18 @@ elif fluid == "Dry Gas":
                     height=300, showlegend=False))
                 st.plotly_chart(fig, use_container_width=True)
 
+    render_tools_section(
+        branch_name="dry_gas", fluid_type="dry_gas",
+        units=unit_system,
+        parameters={"gas_sg": gas_sg, "T_F": T_res, "P_res_psia": P_res,
+                    "z_corr": z_corr, "mu_corr_g": mug_corr,
+                    "H2S": H2S, "CO2": CO2, "N2": N2},
+        outputs_summary=[f"Z at P_res = {gas.z_factor(P_res):.4f}"],
+        results_table_df=df)
+
     # ======== ECLIPSE EXPORT (last section) ========
+    if enable_eclipse_export:
+        render_help("eclipse")
     pvdg_text = build_pvdg(df_field)
     density_text = build_density(api=35.0, gas_sg=gas_sg)
     pvtw_text = ""
@@ -1667,21 +2032,56 @@ elif fluid == "Dry Gas":
         st.markdown("---")
         st.markdown(f"### ECLIPSE Export \u2014 PVDG ({eclipse_unit_choice} units)")
 
-        # Tuned-fluid export option
-        export_tuned_dg = False
+        # ---- Choose which fluid to export ----
+        dg_export_opts = ["Current (untuned)"]
         if dg_tuned_rows is not None:
-            export_tuned_dg = st.checkbox(
-                "\U0001F3AF Export the TUNED fluid (apply tuning to PVDG)",
-                value=True, key="dg_export_tuned",
-                help="When checked, PVDG is built from the tuned gas "
-                     "correlation (Z / viscosity factors applied).")
-        if export_tuned_dg and dg_tuned_rows is not None:
+            dg_export_opts.append("Tuned")
+        saved_dg = {nm: rec for nm, rec in
+                     st.session_state.get("fluid_registry", {}).items()
+                     if rec.get("fluid_type") == "dry_gas"}
+        for nm in saved_dg:
+            dg_export_opts.append(f"Saved: {nm}")
+        dg_export_choice = st.selectbox(
+            "Fluid to export", dg_export_opts, key="dg_export_choice",
+            help="Generate the deck from the current, tuned, or a saved "
+                 "dry-gas fluid.")
+
+        if dg_export_choice == "Tuned" and dg_tuned_rows is not None:
             df_field_dg = pd.DataFrame([{
                 "P (psia)": r["P_field"], "Z": r["Z"],
                 "Bg (rb/scf)": r["Bg_rbscf"], "\u03bcg (cp)": r["mu"]}
                 for r in dg_tuned_rows])
             pvdg_text = build_pvdg(df_field_dg)
             st.caption("PVDG built from the **tuned** gas correlation.")
+        elif dg_export_choice.startswith("Saved: "):
+            rec = saved_dg[dg_export_choice[len("Saved: "):]]
+            p = rec.get("parameters", {})
+            try:
+                s_sg = float(p.get("gas_sg", gas_sg))
+                s_T = float(p.get("T_F", T_res))
+                s_gas = GasCorrelations(
+                    gas_sg=s_sg, T=s_T,
+                    N2=float(p.get("N2", 0.0)),
+                    CO2=float(p.get("CO2", 0.0)),
+                    H2S=float(p.get("H2S", 0.0)),
+                    z_corr=p.get("z_corr", z_corr),
+                    mu_corr=p.get("mu_corr_g", mug_corr))
+                s_tuning = rec.get("tuning") or {}
+                if s_tuning.get("tuned"):
+                    from correlation_tuning import TunedGasCorrelations
+                    s_gas = TunedGasCorrelations(s_gas, s_tuning["tuned"])
+                s_rows = _build_dg_rows(s_gas)
+                df_field_dg = pd.DataFrame([{
+                    "P (psia)": r["P_field"], "Z": r["Z"],
+                    "Bg (rb/scf)": r["Bg_rbscf"], "\u03bcg (cp)": r["mu"]}
+                    for r in s_rows])
+                pvdg_text = build_pvdg(df_field_dg)
+                density_text = build_density(api=35.0, gas_sg=s_sg)
+                st.caption(f"PVDG built from saved fluid "
+                            f"**{dg_export_choice[len('Saved: '):]}** "
+                            f"(SG={s_sg:.3f}).")
+            except Exception as e:
+                st.error(f"Could not rebuild saved fluid: {e}")
 
         if include_water:
             c_sal, c_corr = st.columns(2)
@@ -1699,20 +2099,107 @@ elif fluid == "Dry Gas":
         st.code(pvdg_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
         deck = build_full_deck(pvdg=pvdg_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
-        _sfx = "_TUNED" if export_tuned_dg else ""
+        if dg_export_choice == "Tuned":
+            _sfx = "_TUNED"
+        elif dg_export_choice.startswith("Saved: "):
+            _sfx = "_" + "".join(c if c.isalnum() else "_"
+                                  for c in dg_export_choice[len("Saved: "):])
+        else:
+            _sfx = ""
         st.download_button("Download PVT deck (.INC)", deck,
                             file_name=f"PVT_DRYGAS{_sfx}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
 
-    render_tools_section(
-        branch_name="dry_gas", fluid_type="dry_gas",
-        units=unit_system,
-        parameters={"gas_sg": gas_sg, "T_F": T_res, "P_res_psia": P_res,
-                    "z_corr": z_corr, "mu_corr_g": mug_corr,
-                    "H2S": H2S, "CO2": CO2, "N2": N2},
-        outputs_summary=[f"Z at P_res = {gas.z_factor(P_res):.4f}"],
-        results_table_df=df)
+    # -------- Multi-region PVT (PVTNUM > 1) --------
+    if enable_eclipse_export:
+        with st.expander("🗂️ Multi-region PVT (PVTNUM > 1)"):
+            st.markdown(
+                "Build a multi-region dry-gas deck (PVTNUM > 1). Each region "
+                "is defined by its own gas correlation inputs; the regions "
+                "are stacked into a single PVDG/DENSITY include file."
+            )
+            from multi_region import build_multi_region_deck
 
+            saved_dg_mr = {nm: rec for nm, rec in
+                            st.session_state.get("fluid_registry", {}).items()
+                            if rec.get("fluid_type") == "dry_gas"}
+
+            n_reg_dg = st.number_input(
+                "Number of regions", value=2, min_value=1, max_value=8,
+                key="dg_mr_nreg")
+
+            dg_region_specs = []
+            for i in range(int(n_reg_dg)):
+                with st.expander(f"Region {i+1}", expanded=(i == 0)):
+                    src_opts = ["Current fluid"]
+                    if dg_tuned_rows is not None:
+                        src_opts.append("Tuned fluid")
+                    src_opts += [f"Saved: {nm}" for nm in saved_dg_mr]
+                    src = st.selectbox("Source", src_opts,
+                                        key=f"dg_mr_src_{i}")
+                    if src == "Current fluid":
+                        rc = st.columns(2)
+                        r_sg = rc[0].number_input(
+                            "Gas SG", value=float(gas_sg),
+                            key=f"dg_mr_sg_{i}")
+                        r_T = rc[1].number_input(
+                            f"T ({L['T']})",
+                            value=float(U.to_user_T(T_res, unit_system)),
+                            key=f"dg_mr_T_{i}")
+                        dg_region_specs.append({
+                            "source": src, "gas_sg": r_sg,
+                            "T": U.to_field_T(r_T, unit_system)})
+                    else:
+                        st.caption(f"Region {i+1} uses **{src}**.")
+                        dg_region_specs.append({"source": src})
+
+            if st.button("Build multi-region deck", type="primary",
+                          key="dg_mr_build"):
+                regions_data = []
+                ok = True
+                for i, spec in enumerate(dg_region_specs):
+                    try:
+                        if spec["source"] == "Current fluid":
+                            r_gas = GasCorrelations(
+                                gas_sg=spec["gas_sg"], T=spec["T"],
+                                N2=N2, CO2=CO2, H2S=H2S,
+                                z_corr=z_corr, mu_corr=mug_corr)
+                        elif spec["source"] == "Tuned fluid":
+                            r_gas = dg_tuned_corr
+                        else:
+                            rec = saved_dg_mr[spec["source"][len("Saved: "):]]
+                            p = rec.get("parameters", {})
+                            r_gas = GasCorrelations(
+                                gas_sg=float(p.get("gas_sg", gas_sg)),
+                                T=float(p.get("T_F", T_res)),
+                                N2=float(p.get("N2", 0.0)),
+                                CO2=float(p.get("CO2", 0.0)),
+                                H2S=float(p.get("H2S", 0.0)),
+                                z_corr=p.get("z_corr", z_corr),
+                                mu_corr=p.get("mu_corr_g", mug_corr))
+                        r_rows = _build_dg_rows(r_gas)
+                        r_df = pd.DataFrame([{
+                            "P (psia)": r["P_field"], "Z": r["Z"],
+                            "Bg (rb/scf)": r["Bg_rbscf"], "μg (cp)": r["mu"],
+                        } for r in r_rows])
+                        r_pvdg = build_pvdg(r_df)
+                        regions_data.append({
+                            "kind": "gas-dry", "pvt_text": r_pvdg,
+                            "density": (53.0, 62.428 * 1.02,
+                                         0.0764 * r_gas.gamma_g),
+                        })
+                    except Exception as e:
+                        st.error(f"Region {i+1} failed: {e}")
+                        ok = False
+                        break
+                if ok and regions_data:
+                    deck = build_multi_region_deck(regions_data)
+                    st.code(deck, language="text")
+                    st.download_button(
+                        "Download multi-region deck (.INC)", deck,
+                        file_name="PVT_DRYGAS_MULTIREGION.INC",
+                        mime="text/plain", type="primary",
+                        key="dg_mr_dl")
 
 # ================================================================
 # WET GAS / CONDENSATE
@@ -1721,15 +2208,45 @@ elif fluid == "Wet Gas / Condensate":
     col_in, col_out = st.columns([1, 2])
     with col_in:
         st.markdown("### Wet Gas Properties")
-        gas_sg = st.number_input("Separator gas SG", value=0.72, min_value=0.55, max_value=1.5)
-        api_cond = st.number_input("Condensate API", value=55.0, min_value=40.0, max_value=80.0)
-        if unit_system == "Field":
-            cgr_user = st.number_input("CGR (STB/MMscf)", value=80.0, min_value=1.0, max_value=300.0)
-            Pdew_user = st.number_input(f"Dew point ({L['P']})", value=4500.0, min_value=500.0)
-        else:
-            cgr_user = st.number_input("CGR (Sm³/MSm³)", value=14.2, min_value=0.1, max_value=60.0)
-            Pdew_user = st.number_input(f"Dew point ({L['P']})", value=310.0, min_value=30.0)
-        cgr = cgr_user * 5.6146 if unit_system == "SI" else cgr_user
+
+        def _apply_wg_preset(preset):
+            if "T_F" in preset:
+                st.session_state["res_T_w"] = U.to_user_T(
+                    preset["T_F"], unit_system)
+            if "cgr" in preset:
+                st.session_state["wg_cgr_w"] = U.to_user_cgr(
+                    preset["cgr"], unit_system)
+            if "Pdew" in preset:
+                st.session_state["wg_pdew_w"] = U.to_user_P(
+                    preset["Pdew"], unit_system)
+        render_preset_loader(
+            "wet_gas",
+            key_map={"gas_sg": "wg_sg_w", "api_cond": "wg_api_w",
+                      "z_corr": "wg_z", "mu_corr": "wg_mu",
+                      "rv_corr": "wg_rv"},
+            extra_apply=_apply_wg_preset)
+
+        gas_sg = st.number_input("Separator gas SG", min_value=0.55,
+                                  max_value=1.5,
+                                  value=st.session_state.get("wg_sg_w", 0.72),
+                                  key="wg_sg_w")
+        api_cond = st.number_input("Condensate API", min_value=40.0,
+                                    max_value=80.0,
+                                    value=st.session_state.get("wg_api_w", 55.0),
+                                    key="wg_api_w")
+        _cgr_default = 80.0 if unit_system == "Field" else 14.2
+        _cgr_label = ("CGR (STB/MMscf)" if unit_system == "Field"
+                       else "CGR (Sm³/MSm³)")
+        cgr_user = st.number_input(
+            _cgr_label, min_value=0.1, max_value=300.0,
+            value=st.session_state.get("wg_cgr_w", _cgr_default),
+            key="wg_cgr_w")
+        _pdew_default = 4500.0 if unit_system == "Field" else 310.0
+        Pdew_user = st.number_input(
+            f"Dew point ({L['P']})", min_value=30.0,
+            value=st.session_state.get("wg_pdew_w", _pdew_default),
+            key="wg_pdew_w")
+        cgr = U.to_field_cgr(cgr_user, unit_system)
         Pdew = U.to_field_P(Pdew_user, unit_system)
         N2 = st.number_input("N2", value=0.0, min_value=0.0, max_value=0.3, key="wg_n2")
         CO2 = st.number_input("CO2", value=0.0, min_value=0.0, max_value=0.5, key="wg_co2")
@@ -1737,7 +2254,13 @@ elif fluid == "Wet Gas / Condensate":
         st.markdown("### Correlations")
         z_corr = st.selectbox("Z-factor", ["Hall-Yarborough", "Dranchuk-Abou-Kassem"], key="wg_z")
         mug_corr = st.selectbox("Gas viscosity", ["Lee-Gonzalez-Eakin", "Carr-Kobayashi-Burrows"], key="wg_mu")
-        rv_corr = st.selectbox("Rv vs P model", ["Linear-Pdew", "Constant"])
+        rv_corr = st.selectbox("Rv vs P model", ["Linear-Pdew", "Constant"], key="wg_rv")
+
+    # ---- Input validation ----
+    _wg_val = VAL.check_wetgas_inputs(gas_sg=gas_sg, api_cond=api_cond,
+                                       cgr=cgr, T_F=T_res, Pdew=Pdew,
+                                       p_min=P_min, p_max=P_max)
+    VAL.render_messages(_wg_val, stop_on_error=True)
 
     wet = WetGasCorrelations(gas_sg=gas_sg, api_cond=api_cond,
                               cgr_stb_per_mmscf=cgr, T=T_res, N2=N2, CO2=CO2, H2S=H2S,
@@ -1763,10 +2286,18 @@ elif fluid == "Wet Gas / Condensate":
     wg_tuned_corr = None
     wg_tuned_rows = None
     _wgtr = st.session_state.get("wg_tune_result")
+    _wg_fp = fluid_fingerprint(gas_sg=gas_sg, api_cond=api_cond, cgr=cgr,
+                                T=T_res, Pdew=Pdew)
     if _wgtr and _wgtr.get("tuned"):
-        from correlation_tuning import TunedWetGasCorrelations
-        wg_tuned_corr = TunedWetGasCorrelations(wet, _wgtr["tuned"])
-        wg_tuned_rows = _build_wg_rows(wg_tuned_corr)
+        if tuning_is_stale(_wgtr, _wg_fp):
+            st.warning(
+                "⚠️ The saved wet-gas tuning was performed against "
+                "different inputs than are currently entered. The tuned "
+                "overlay is hidden until you re-tune.")
+        else:
+            from correlation_tuning import TunedWetGasCorrelations
+            wg_tuned_corr = TunedWetGasCorrelations(wet, _wgtr["tuned"])
+            wg_tuned_rows = _build_wg_rows(wg_tuned_corr)
 
     df = pd.DataFrame([{
         f"P ({L['P']})":   U.to_user_P(r["P_field"], unit_system),
@@ -1797,9 +2328,11 @@ elif fluid == "Wet Gas / Condensate":
                                     overlay_df=df_tuned)
         with c2: line_chart_plotly(df, pcol, ["Z", f"μg ({L['mu']})"],
                                     title="Z and Viscosity", overlay_df=df_tuned)
+        render_help("wetgas")
 
     # -------- Wet gas tuning with experimental data --------
     with st.expander("🎯 Tune correlation with experimental data"):
+        render_help("tuning")
         st.markdown(
             "Provide lab measurements (dew point, Z-factor, Rv, Bg at various P) "
             "and fit a small set of correction factors (Pdew shift, Rv factor, "
@@ -1915,12 +2448,18 @@ elif fluid == "Wet Gas / Condensate":
                        "rv_corr": rv_corr, "Pdew": Pdew}
             lab_field = U.lab_to_field(st.session_state["wg_lab_data"],
                                           unit_system)
-            with st.spinner("Tuning wet-gas correlation..."):
-                wg_tune_res = tune_wetgas(
-                    WetGasCorrelations, wg_base, lab_field,
-                    tune=tuple(wg_tune_choices),
-                    max_iter=int(wg_max_iter),
-                    tol=10 ** (-wg_tol_exp))
+            _prog = st.progress(0.0, text="Tuning wet-gas correlation...")
+
+            def _wg_prog(frac, msg):
+                _prog.progress(frac, text=f"Tuning wet-gas correlation — {msg}")
+
+            wg_tune_res = tune_wetgas(
+                WetGasCorrelations, wg_base, lab_field,
+                tune=tuple(wg_tune_choices),
+                max_iter=int(wg_max_iter),
+                tol=10 ** (-wg_tol_exp),
+                progress_callback=_wg_prog)
+            _prog.empty()
             wg_tune_res["observed_user"] = U.field_pred_to_user(
                 wg_tune_res["observed"], st.session_state["wg_lab_data"],
                 unit_system)
@@ -1931,6 +2470,9 @@ elif fluid == "Wet Gas / Condensate":
                 wg_tune_res["predicted_final"], st.session_state["wg_lab_data"],
                 unit_system)
             wg_tune_res["lab_snapshot"] = list(st.session_state["wg_lab_data"])
+            wg_tune_res["fluid_fp"] = fluid_fingerprint(
+                gas_sg=gas_sg, api_cond=api_cond, cgr=cgr, T=T_res,
+                Pdew=Pdew)
             st.session_state["wg_tune_result"] = wg_tune_res
             st.rerun()
 
@@ -2013,6 +2555,7 @@ elif fluid == "Wet Gas / Condensate":
 
     # -------- Lab experiments for wet gas --------
     with st.expander("🧪 Lab experiments — CCE / CVD / DLE / Flash"):
+        render_help("experiments")
         st.markdown(
             "Wet-gas lab experiment approximations. CVD traces the condensate "
             "dropout as the gas depletes below the dew point."
@@ -2130,6 +2673,7 @@ elif fluid == "Wet Gas / Condensate":
 
     # -------- Monte Carlo for wet gas --------
     with st.expander("🎲 Monte Carlo uncertainty"):
+        render_help("montecarlo")
         st.markdown("Sample SG and CGR; view distribution of Z, Bg, Rv at P_res.")
         mcc = st.columns(3)
         with mcc[0]:
@@ -2141,8 +2685,7 @@ elif fluid == "Wet Gas / Condensate":
                 f"σ(CGR) [{'STB/MMscf' if unit_system == 'Field' else 'Sm³/MSm³'}]",
                 value=10.0 if unit_system == "Field" else 1.8,
                 min_value=0.0, key="wg_mc_cgr")
-            mc_sd_cgr = (mc_sd_cgr_disp * 5.6146 if unit_system == "SI"
-                          else mc_sd_cgr_disp)
+            mc_sd_cgr = U.to_field_cgr(mc_sd_cgr_disp, unit_system)
         with mcc[2]:
             mc_n = st.slider("Samples", 100, 2000, 500, step=100, key="wg_mc_n")
         if st.button("Run Monte Carlo", key="wg_mc_run"):
@@ -2263,7 +2806,17 @@ elif fluid == "Wet Gas / Condensate":
                         barmode="overlay")
                     st.plotly_chart(fig, use_container_width=True)
 
+    render_tools_section(
+        branch_name="wet_gas", fluid_type="wet_gas",
+        units=unit_system,
+        parameters={"gas_sg": gas_sg, "api_cond": api_cond, "cgr": cgr,
+                    "T_F": T_res, "P_res_psia": P_res, "Pdew_psia": Pdew},
+        outputs_summary=[f"Pdew = {Pdew:.0f} psia", f"Z at P_res = {wet.z_factor(P_res):.4f}"],
+        results_table_df=df)
+
     # ======== ECLIPSE EXPORT (last section) ========
+    if enable_eclipse_export:
+        render_help("eclipse")
     pvtg_text = build_pvtg(pressures, wet)
     density_text = build_density(api=api_cond, gas_sg=gas_sg)
     pvtw_text = ""
@@ -2272,17 +2825,51 @@ elif fluid == "Wet Gas / Condensate":
         st.markdown("---")
         st.markdown(f"### ECLIPSE Export \u2014 PVTG ({eclipse_unit_choice} units)")
 
-        # Tuned-fluid export option
-        export_tuned_wg = False
+        # ---- Choose which fluid to export ----
+        wg_export_opts = ["Current (untuned)"]
         if wg_tuned_corr is not None:
-            export_tuned_wg = st.checkbox(
-                "\U0001F3AF Export the TUNED fluid (apply tuning to PVTG)",
-                value=True, key="wg_export_tuned",
-                help="When checked, PVTG is built from the tuned wet-gas "
-                     "correlation (Pdew shift / Rv / Z factors applied).")
-        if export_tuned_wg and wg_tuned_corr is not None:
+            wg_export_opts.append("Tuned")
+        saved_wg = {nm: rec for nm, rec in
+                     st.session_state.get("fluid_registry", {}).items()
+                     if rec.get("fluid_type") == "wet_gas"}
+        for nm in saved_wg:
+            wg_export_opts.append(f"Saved: {nm}")
+        wg_export_choice = st.selectbox(
+            "Fluid to export", wg_export_opts, key="wg_export_choice",
+            help="Generate the deck from the current, tuned, or a saved "
+                 "wet-gas fluid.")
+
+        if wg_export_choice == "Tuned" and wg_tuned_corr is not None:
             pvtg_text = build_pvtg(pressures, wg_tuned_corr)
             st.caption("PVTG built from the **tuned** wet-gas correlation.")
+        elif wg_export_choice.startswith("Saved: "):
+            rec = saved_wg[wg_export_choice[len("Saved: "):]]
+            p = rec.get("parameters", {})
+            try:
+                s_wet = WetGasCorrelations(
+                    gas_sg=float(p.get("gas_sg", gas_sg)),
+                    api_cond=float(p.get("api_cond", api_cond)),
+                    cgr_stb_per_mmscf=float(p.get("cgr", cgr)),
+                    T=float(p.get("T_F", T_res)),
+                    N2=float(p.get("N2", 0.0)),
+                    CO2=float(p.get("CO2", 0.0)),
+                    H2S=float(p.get("H2S", 0.0)),
+                    z_corr=p.get("z_corr", z_corr),
+                    mu_corr=p.get("mu_corr_g", mug_corr),
+                    rv_corr=p.get("rv_corr", rv_corr),
+                    Pdew=float(p.get("Pdew_psia", Pdew)))
+                s_tuning = rec.get("tuning") or {}
+                if s_tuning.get("tuned"):
+                    from correlation_tuning import TunedWetGasCorrelations
+                    s_wet = TunedWetGasCorrelations(s_wet, s_tuning["tuned"])
+                pvtg_text = build_pvtg(pressures, s_wet)
+                density_text = build_density(
+                    api=float(p.get("api_cond", api_cond)),
+                    gas_sg=float(p.get("gas_sg", gas_sg)))
+                st.caption(f"PVTG built from saved fluid "
+                            f"**{wg_export_choice[len('Saved: '):]}**.")
+            except Exception as e:
+                st.error(f"Could not rebuild saved fluid: {e}")
 
         if include_water:
             c_sal, c_corr = st.columns(2)
@@ -2300,7 +2887,13 @@ elif fluid == "Wet Gas / Condensate":
         st.code(pvtg_show + ("\n" + pvtw_show if pvtw_show else ""), language="text")
         deck = build_full_deck(pvtg=pvtg_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
-        _sfx = "_TUNED" if export_tuned_wg else ""
+        if wg_export_choice == "Tuned":
+            _sfx = "_TUNED"
+        elif wg_export_choice.startswith("Saved: "):
+            _sfx = "_" + "".join(c if c.isalnum() else "_"
+                                  for c in wg_export_choice[len("Saved: "):])
+        else:
+            _sfx = ""
         st.download_button("Download PVT deck (.INC)", deck,
                             file_name=f"PVT_WETGAS{_sfx}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
@@ -2360,14 +2953,105 @@ elif fluid == "Wet Gas / Condensate":
                     mime="text/plain", type="primary",
                     key="dl_wg_pvto")
 
+    # -------- Multi-region PVT (PVTNUM > 1) --------
+    if enable_eclipse_export:
+        with st.expander("🗂️ Multi-region PVT (PVTNUM > 1)"):
+            st.markdown(
+                "Build a multi-region wet-gas deck (PVTNUM > 1). Each region "
+                "is defined by its own wet-gas correlation inputs; the regions "
+                "are stacked into a single PVTG/DENSITY include file."
+            )
+            from multi_region import build_multi_region_deck
 
-    render_tools_section(
-        branch_name="wet_gas", fluid_type="wet_gas",
-        units=unit_system,
-        parameters={"gas_sg": gas_sg, "api_cond": api_cond, "cgr": cgr,
-                    "T_F": T_res, "P_res_psia": P_res, "Pdew_psia": Pdew},
-        outputs_summary=[f"Pdew = {Pdew:.0f} psia", f"Z at P_res = {wet.z_factor(P_res):.4f}"],
-        results_table_df=df)
+            saved_wg_mr = {nm: rec for nm, rec in
+                            st.session_state.get("fluid_registry", {}).items()
+                            if rec.get("fluid_type") == "wet_gas"}
+
+            n_reg_wg = st.number_input(
+                "Number of regions", value=2, min_value=1, max_value=8,
+                key="wg_mr_nreg")
+
+            wg_region_specs = []
+            for i in range(int(n_reg_wg)):
+                with st.expander(f"Region {i+1}", expanded=(i == 0)):
+                    src_opts = ["Current fluid"]
+                    if wg_tuned_corr is not None:
+                        src_opts.append("Tuned fluid")
+                    src_opts += [f"Saved: {nm}" for nm in saved_wg_mr]
+                    src = st.selectbox("Source", src_opts,
+                                        key=f"wg_mr_src_{i}")
+                    if src == "Current fluid":
+                        rc = st.columns(4)
+                        r_sg = rc[0].number_input(
+                            "Gas SG", value=float(gas_sg),
+                            key=f"wg_mr_sg_{i}")
+                        r_cgr = rc[1].number_input(
+                            "CGR (STB/MMscf)", value=float(cgr),
+                            key=f"wg_mr_cgr_{i}")
+                        r_api = rc[2].number_input(
+                            "Cond. API", value=float(api_cond),
+                            key=f"wg_mr_api_{i}")
+                        r_pdew = rc[3].number_input(
+                            f"Pdew ({L['P']})",
+                            value=float(U.to_user_P(Pdew, unit_system)),
+                            key=f"wg_mr_pdew_{i}")
+                        wg_region_specs.append({
+                            "source": src, "gas_sg": r_sg, "cgr": r_cgr,
+                            "api_cond": r_api,
+                            "Pdew": U.to_field_P(r_pdew, unit_system)})
+                    else:
+                        st.caption(f"Region {i+1} uses **{src}**.")
+                        wg_region_specs.append({"source": src})
+
+            if st.button("Build multi-region deck", type="primary",
+                          key="wg_mr_build"):
+                regions_data = []
+                ok = True
+                for i, spec in enumerate(wg_region_specs):
+                    try:
+                        if spec["source"] == "Current fluid":
+                            r_wet = WetGasCorrelations(
+                                gas_sg=spec["gas_sg"], api_cond=spec["api_cond"],
+                                cgr_stb_per_mmscf=spec["cgr"], T=T_res,
+                                N2=N2, CO2=CO2, H2S=H2S,
+                                z_corr=z_corr, mu_corr=mug_corr,
+                                rv_corr=rv_corr, Pdew=spec["Pdew"])
+                        elif spec["source"] == "Tuned fluid":
+                            r_wet = wg_tuned_corr
+                        else:
+                            rec = saved_wg_mr[spec["source"][len("Saved: "):]]
+                            p = rec.get("parameters", {})
+                            r_wet = WetGasCorrelations(
+                                gas_sg=float(p.get("gas_sg", gas_sg)),
+                                api_cond=float(p.get("api_cond", api_cond)),
+                                cgr_stb_per_mmscf=float(p.get("cgr", cgr)),
+                                T=float(p.get("T_F", T_res)),
+                                N2=float(p.get("N2", 0.0)),
+                                CO2=float(p.get("CO2", 0.0)),
+                                H2S=float(p.get("H2S", 0.0)),
+                                z_corr=p.get("z_corr", z_corr),
+                                mu_corr=p.get("mu_corr_g", mug_corr),
+                                rv_corr=p.get("rv_corr", rv_corr),
+                                Pdew=float(p.get("Pdew_psia", Pdew)))
+                        r_pvtg = build_pvtg(pressures, r_wet)
+                        regions_data.append({
+                            "kind": "gas-wet", "pvt_text": r_pvtg,
+                            "density": (53.0, 62.428 * 1.02,
+                                         0.0764 * getattr(r_wet, "gamma_g",
+                                                            gas_sg)),
+                        })
+                    except Exception as e:
+                        st.error(f"Region {i+1} failed: {e}")
+                        ok = False
+                        break
+                if ok and regions_data:
+                    deck = build_multi_region_deck(regions_data)
+                    st.code(deck, language="text")
+                    st.download_button(
+                        "Download multi-region deck (.INC)", deck,
+                        file_name="PVT_WETGAS_MULTIREGION.INC",
+                        mime="text/plain", type="primary",
+                        key="wg_mr_dl")
 
 
 # ================================================================
@@ -2413,6 +3097,7 @@ elif fluid == "Water":
         with c1: line_chart_plotly(df, pcol, f"Bw ({L['Bo']})", title="Water FVF")
         with c2: line_chart_plotly(df, pcol, f"Cw ({L['Cw']})", title="Compressibility")
         with c3: line_chart_plotly(df, pcol, f"μw ({L['mu']})", title="Water Viscosity")
+        render_help("water")
 
     pvtw_text = build_pvtw_from_table(pressures, water, P_res)
     if enable_eclipse_export:
@@ -2459,6 +3144,31 @@ elif fluid == "Compositional (EOS)":
     if "comp_state" not in st.session_state:
         st.session_state["comp_state"] = dict(DEFAULT_COMP)
 
+    # ---- Example fluid presets ----
+    def _apply_comp_preset(preset):
+        comp = preset.get("composition", {})
+        if comp:
+            # Write into comp_state AND each component widget key so the
+            # number_inputs pick up the new composition on rerun.
+            new_state = {k: 0.0 for k in DEFAULT_COMP}
+            for k, v in comp.items():
+                if k in new_state:
+                    new_state[k] = v
+            st.session_state["comp_state"] = new_state
+            for k, v in new_state.items():
+                st.session_state[f"comp_input_{k}"] = float(v)
+        if "MW_c7" in preset:
+            st.session_state["comp_mwc7_w"] = preset["MW_c7"]
+        if "SG_c7" in preset:
+            st.session_state["comp_sgc7_w"] = preset["SG_c7"]
+        if "fluid_kind" in preset:
+            st.session_state["comp_fluidkind_w"] = preset["fluid_kind"]
+        if "T_F" in preset:
+            st.session_state["res_T_w"] = U.to_user_T(
+                preset["T_F"], unit_system)
+    render_preset_loader("compositional", key_map={},
+                          extra_apply=_apply_comp_preset)
+
     # ---- Composition input panel ----
     with st.expander("Composition input", expanded=True):
         cols_top = st.columns([1, 1, 1, 3])
@@ -2494,17 +3204,33 @@ elif fluid == "Compositional (EOS)":
 
         c_c7 = st.columns(3)
         with c_c7[0]:
-            MW_c7 = st.number_input("C7+ molecular weight", value=218.0,
-                                    min_value=80.0, max_value=400.0)
+            MW_c7 = st.number_input(
+                "C7+ molecular weight", min_value=80.0, max_value=400.0,
+                value=st.session_state.get("comp_mwc7_w", 218.0),
+                key="comp_mwc7_w")
         with c_c7[1]:
-            SG_c7 = st.number_input("C7+ specific gravity", value=0.852,
-                                    min_value=0.70, max_value=0.95)
+            SG_c7 = st.number_input(
+                "C7+ specific gravity", min_value=0.70, max_value=0.95,
+                value=st.session_state.get("comp_sgc7_w", 0.852),
+                key="comp_sgc7_w")
         with c_c7[2]:
+            _fk_opts = ["Oil (bubble point)",
+                        "Gas / Condensate (dew point)"]
+            _fk_cur = st.session_state.get("comp_fluidkind_w",
+                                            _fk_opts[0])
             comp_fluid_kind = st.selectbox(
-                "Reservoir-fluid type",
-                ["Oil (bubble point)", "Gas / Condensate (dew point)"])
+                "Reservoir-fluid type", _fk_opts,
+                index=_fk_opts.index(_fk_cur) if _fk_cur in _fk_opts else 0,
+                key="comp_fluidkind_w")
 
     comp_names = [k for k, v in comp_inputs.items() if v > 0]
+
+    # ---- Input validation ----
+    _comp_val = VAL.check_composition(comp_inputs)
+    _comp_val.merge(VAL.check_temperature(T_res))
+    _comp_val.merge(VAL.check_c7plus(MW_c7, SG_c7, "C7+" in comp_names))
+    VAL.render_messages(_comp_val, stop_on_error=True)
+
     z_raw = np.array([comp_inputs[k] for k in comp_names])
     if z_raw.sum() <= 0:
         st.error("All compositions are zero — enter at least one component.")
@@ -2517,8 +3243,18 @@ elif fluid == "Compositional (EOS)":
     # Tuned C7+ properties from a previous EOS tuning run (if any)
     c7_props_tuned = None
     _comp_tr = st.session_state.get("comp_tune_result")
+    _comp_fp = fluid_fingerprint(
+        **{f"z_{c}": v for c, v in zip(comp_names, z_arr)},
+        MW_c7=MW_c7, SG_c7=SG_c7, T=T_res)
     if _comp_tr and "tuned_c7_props" in _comp_tr:
-        c7_props_tuned = _comp_tr["tuned_c7_props"]
+        if tuning_is_stale(_comp_tr, _comp_fp):
+            st.warning(
+                "⚠️ The saved EOS tuning was performed against a different "
+                "composition or C7+ characterization than is currently "
+                "entered. Tuned overlays and exports are disabled until you "
+                "re-tune.")
+        else:
+            c7_props_tuned = _comp_tr["tuned_c7_props"]
 
     # ---- Saturation point + C7+ summary metrics ----
     kind = "bubble" if fluid_kind == "oil" else "dew"
@@ -2559,6 +3295,9 @@ elif fluid == "Compositional (EOS)":
         st.caption("🎯 This fluid is **tuned** — the Lab Experiments, Phase "
                     "Envelope and ECLIPSE Export tabs can show or use the "
                     "tuned EOS alongside the untuned one.")
+
+    render_help("eos")
+    render_help("c7plus")
 
     # ---- Tabbed analysis ----
     # Build tab list conditionally — ECLIPSE export only when enabled
@@ -3239,16 +3978,22 @@ elif fluid == "Compositional (EOS)":
                 st.error("Select at least one parameter to tune.")
             else:
                 meas_field = _comp_meas_to_field(st.session_state["tuning_meas"])
-                with st.spinner("Optimizing EOS parameters (this can take a minute)..."):
-                    try:
-                        tune_result = tune_eos(
-                            z_arr, comp_names, T_R, c7_props,
-                            meas_field, free_params=free_selected,
-                            max_iter=int(comp_max_iter),
-                            tol=10 ** (-comp_tol_exp))
-                    except Exception as e:
-                        st.error(f"Tuning failed: {e}")
-                        tune_result = None
+                _prog = st.progress(0.0, text="Optimizing EOS parameters...")
+
+                def _comp_prog(frac, msg):
+                    _prog.progress(frac, text=f"Optimizing EOS — {msg}")
+
+                try:
+                    tune_result = tune_eos(
+                        z_arr, comp_names, T_R, c7_props,
+                        meas_field, free_params=free_selected,
+                        max_iter=int(comp_max_iter),
+                        tol=10 ** (-comp_tol_exp),
+                        progress_callback=_comp_prog)
+                except Exception as e:
+                    st.error(f"Tuning failed: {e}")
+                    tune_result = None
+                _prog.empty()
 
                 if tune_result:
                     # Convert predictions to display units & store snapshot
@@ -3262,6 +4007,9 @@ elif fluid == "Compositional (EOS)":
                         st.session_state["tuning_meas"])
                     tune_result["meas_snapshot"] = list(
                         st.session_state["tuning_meas"])
+                    tune_result["fluid_fp"] = fluid_fingerprint(
+                        **{f"z_{c}": v for c, v in zip(comp_names, z_arr)},
+                        MW_c7=MW_c7, SG_c7=SG_c7, T=T_res)
                     st.session_state["comp_tune_result"] = tune_result
                     st.rerun()
 
@@ -3893,6 +4641,7 @@ elif fluid == "❄️ Hydrate Likelihood":
         "this tool is a fast screening for surface flowlines, subsea tiebacks, "
         "and choke / wellhead conditions."
     )
+    render_help("hydrate")
 
     col_h_in, col_h_out = st.columns([1, 2])
 
@@ -4356,6 +5105,7 @@ elif fluid == "🪨 Rock Compressibility":
         "significantly, so report ranges and pick based on lithology and "
         "consolidation."
     )
+    render_help("rock")
 
     col_r_in, col_r_out = st.columns([1, 2])
 
@@ -4380,13 +5130,15 @@ elif fluid == "🪨 Rock Compressibility":
                     "for the ECLIPSE ROCK keyword export.")
 
     with col_r_out:
+        # ---- Input validation (soft warnings) ----
+        VAL.render_messages(VAL.check_porosity(phi), stop_on_error=False)
         st.markdown("### All correlations at φ = {:.2f}".format(phi))
         cf_results = compute_all(phi)
 
         # Display as metric cards
         cols_m = st.columns(len(cf_results))
         for i, (name, cf) in enumerate(cf_results.items()):
-            cf_user = cf * (14.50377 if unit_system == "SI" else 1.0)
+            cf_user = U.to_user_Cw(cf, unit_system)
             with cols_m[i]:
                 st.metric(name, f"{cf_user:.3e} {L['Cw']}")
 
@@ -4396,7 +5148,7 @@ elif fluid == "🪨 Rock Compressibility":
         colors = ["#EB0037", "#00243D", "#9DBA00", "#3A6E96", "#C58B00"]
         for j, (name, fn) in enumerate(CORRELATIONS.items()):
             cf_arr = [fn(p) for p in phi_arr]
-            cf_arr_user = [c * (14.50377 if unit_system == "SI" else 1.0) for c in cf_arr]
+            cf_arr_user = [U.to_user_Cw(c, unit_system) for c in cf_arr]
             fig.add_trace(go.Scatter(
                 x=phi_arr * 100, y=cf_arr_user,
                 name=name, mode="lines",
@@ -4405,7 +5157,7 @@ elif fluid == "🪨 Rock Compressibility":
                               f"Cf=%{{y:.2e}}<extra></extra>"))
         # Mark the operating point
         for name, cf in cf_results.items():
-            cf_user_pt = cf * (14.50377 if unit_system == "SI" else 1.0)
+            cf_user_pt = U.to_user_Cw(cf, unit_system)
             fig.add_trace(go.Scatter(
                 x=[phi * 100], y=[cf_user_pt],
                 showlegend=False, mode="markers",
@@ -4422,8 +5174,10 @@ elif fluid == "🪨 Rock Compressibility":
         st.markdown(f"### ECLIPSE ROCK keyword ({eclipse_unit_choice})")
         chosen_cf = cf_results[chosen_corr]
         if eclipse_unit_choice == "METRIC":
-            Pref_bar = Pref_psia / 14.50377
-            Cf_per_bar = chosen_cf * 14.50377
+            # ECLIPSE METRIC is always bar-based, independent of the
+            # app's display unit system. Use the units primitives.
+            Pref_bar = U.psia_to_bar(Pref_psia)
+            Cf_per_bar = chosen_cf * U.PSIA_PER_BAR  # 1/psi -> 1/bar
             rock_text = rock_keyword_metric(Pref_bar, Cf_per_bar)
         else:
             rock_text = rock_keyword(Pref_psia, chosen_cf)
@@ -4522,6 +5276,13 @@ for consolidated limestone with $\varphi < 0.20$.
 - For very heterogeneous reservoirs, lab core measurements are essential.
 - ECLIPSE expects $C_f$ in $1/\text{psia}$ (FIELD) or $1/\text{bara}$ (METRIC).
 """)
+
+
+# ================================================================
+# DOCUMENTATION — full equation reference
+# ================================================================
+elif fluid == "📚 Documentation":
+    render_full_reference()
 
 
 # ----------------------------------------------------------------
