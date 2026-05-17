@@ -102,12 +102,22 @@ def styled_dataframe(df, height=380):
         st.dataframe(df, use_container_width=True, height=height)
 
 
-def render_eclipse_qc(df_field, kind, label="PVT table", pb=None):
+def render_eclipse_qc(df_field, kind, label="PVT table", pb=None,
+                       df_display=None, pvto_branches=None):
     """Render a monotonicity QC panel + a plot of the export table.
 
-    df_field : the field-unit property DataFrame about to be exported.
-    kind     : 'pvto', 'pvdg', or 'pvtg' — selects the QC ruleset.
-    pb       : bubble point (for PVTO, to split saturated/under-saturated).
+    df_field    : the field-unit property DataFrame (QC always runs on this,
+                  since the monotonicity rules are stated for field units).
+    kind        : 'pvto', 'pvdg', or 'pvtg' — selects the QC ruleset.
+    pb          : bubble point (for PVTO saturated/under-saturated split).
+    df_display  : the SAME table converted to the user's display units.
+                  If given, the plot uses this so the axes match the unit
+                  selector. Falls back to df_field if not supplied.
+    pvto_branches : optional list of dicts for a true PVTO plot — one entry
+                  per saturated Rs node:
+                  {"Rs": <display Rs>, "P": [...], "Bo": [...]}.
+                  When given, the PVTO plot shows a Bo-vs-P curve for each
+                  Rs (the real PVTO structure) instead of a single line.
     Returns the QC result dict so callers can block export on failure.
     """
     if kind == "pvto":
@@ -121,57 +131,136 @@ def render_eclipse_qc(df_field, kind, label="PVT table", pb=None):
     if qc["ok"]:
         st.success(f"✓ {label} is monotonic — ECLIPSE should accept it.")
     else:
-        st.error(f"⛔ {label} has monotonicity problems that will make "
-                 f"ECLIPSE reject the deck:")
-        for p in qc["problems"]:
-            st.markdown(f"- {p}")
-        st.caption("Fix: widen the pressure range, reduce the number of "
-                    "points, or check the input parameters — non-monotonic "
-                    "rows usually come from extrapolation artefacts.")
+        n = len(qc["problems"])
+        st.error(f"⛔ {label} has {n} monotonicity problem"
+                 f"{'s' if n != 1 else ''} that will make ECLIPSE reject "
+                 f"the deck.")
+        # The problem list can be long — keep it collapsed by default.
+        with st.expander(f"Show the {n} monotonicity issue"
+                          f"{'s' if n != 1 else ''}", expanded=False):
+            for p in qc["problems"]:
+                st.markdown(f"- {p}")
+            st.caption("These usually come from extrapolation artefacts. "
+                        "You can widen the pressure range, reduce the "
+                        "number of points, or use the auto-fix below.")
+        # ---- Auto-fix button ----
+        if st.button(f"🔧 Auto-fix the {label}",
+                      key=f"eqc_autofix_{kind}_{label}",
+                      help="Clamp each non-monotonic value to its "
+                           "neighbour so the table satisfies ECLIPSE's "
+                           "monotonicity rules. This is a minimal local "
+                           "repair — review the result before relying on "
+                           "it for simulation."):
+            if kind == "pvto":
+                _fixed, _chg = EQC.autofix_pvto_table(df_field, pb=pb)
+            elif kind == "pvdg":
+                _fixed, _chg = EQC.autofix_pvdg_table(df_field)
+            elif kind == "pvtg":
+                _fixed, _chg = EQC.autofix_pvtg_table(df_field)
+            else:
+                _fixed, _chg = EQC.autofix_pvto_table(df_field, pb=pb)
+            _recheck = (EQC.qc_pvto_table(_fixed, pb=pb) if kind == "pvto"
+                         else EQC.qc_pvdg_table(_fixed) if kind == "pvdg"
+                         else EQC.qc_pvtg_table(_fixed))
+            if _recheck["ok"]:
+                st.success(f"✓ Auto-fix applied — the {label} is now "
+                            f"monotonic.")
+            else:
+                st.warning("Auto-fix ran but some issues remain — the "
+                            "table may need manual review.")
+            if _chg:
+                with st.expander("What the auto-fix changed", expanded=True):
+                    for c in _chg:
+                        st.markdown(f"- {c}")
+            st.caption("Auto-fixed table (review before use):")
+            st.dataframe(_fixed, use_container_width=True, height=280)
+            st.info("Note: the auto-fix shows a corrected table here for "
+                     "review. To export it, adjust the input parameters so "
+                     "the generated table is naturally monotonic — the "
+                     "auto-fix is a diagnostic aid, not a silent override "
+                     "of the exported deck.")
 
-    # Plot the table columns the user will export
+    # Plot the table in the user's display units.
+    plot_df = df_display if df_display is not None else df_field
     with st.expander(f"📈 Plot the {label} that will be exported"):
-        num_cols = [c for c in df_field.columns
-                     if pd.api.types.is_numeric_dtype(df_field[c])]
-        x_default = num_cols[0] if num_cols else None
-        if x_default and len(num_cols) > 1:
-            ycols = st.multiselect(
-                "Columns to plot (vs pressure)",
-                [c for c in num_cols if c != x_default],
-                default=[c for c in num_cols if c != x_default][:1],
-                key=f"eqc_plot_{kind}_{label}")
-            if ycols:
-                line_chart_plotly(df_field, x_default, ycols,
-                                   title=f"{label} — export preview")
+        # A true PVTO table has one Bo (and viscosity) curve per saturated
+        # Rs node. When the caller supplies pvto_branches, draw that family.
+        if kind == "pvto" and pvto_branches:
+            metric = st.radio("Property", ["Bo", "Viscosity"],
+                               horizontal=True, key=f"eqc_pvto_metric_{label}")
+            fig = go.Figure()
+            for br in pvto_branches:
+                ydata = br["Bo"] if metric == "Bo" else br.get("mu", [])
+                if not len(ydata):
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=br["P"], y=ydata, mode="lines+markers",
+                    name=f"Rs = {br['Rs']:.4g}",
+                    line=dict(width=2)))
+            fig.update_layout(**TH.plotly_layout(
+                title=f"{label} — {metric} for each Rs branch",
+                xtitle=plot_df.columns[0],
+                ytitle=metric, height=420, showlegend=True))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Each curve is one saturated-Rs node. The point "
+                        "where a curve starts is the saturated state; the "
+                        "curve to higher pressure is its under-saturated "
+                        "(constant-Rs) extension.")
+        else:
+            num_cols = [c for c in plot_df.columns
+                         if pd.api.types.is_numeric_dtype(plot_df[c])]
+            x_default = num_cols[0] if num_cols else None
+            if x_default and len(num_cols) > 1:
+                ycols = st.multiselect(
+                    "Columns to plot (vs pressure)",
+                    [c for c in num_cols if c != x_default],
+                    default=[c for c in num_cols if c != x_default][:1],
+                    key=f"eqc_plot_{kind}_{label}")
+                if ycols:
+                    line_chart_plotly(plot_df, x_default, ycols,
+                                       title=f"{label} — export preview")
     return qc
 
 
 def render_depth_profile(fluid_kind, ref_value, ref_depth_default,
-                           value_label, value_unit, key_prefix):
+                           value_label, value_unit, key_prefix,
+                           depth_unit="ft"):
     """Render an Rs-vs-depth (oil) or Rv-vs-depth (gas) profile builder.
 
-    Produces an RSVD or RVVD keyword block from a linear compositional
-    gradient. Returns the keyword text (or None if not generated).
+    ref_value         : reference Rs/Rv value, already in DISPLAY units.
+    ref_depth_default : default reference depth, in DISPLAY depth units.
+    value_label       : column label, e.g. 'Rs (scf/STB)' or 'Rs (Sm³/Sm³)'.
+    value_unit        : short unit string for the gradient input.
+    depth_unit        : 'ft' (FIELD) or 'm' (METRIC) — shown on the inputs.
+
+    All values shown and entered are in display units; the generated
+    RSVD/RVVD keyword is written in those same units (ECLIPSE FIELD vs
+    METRIC), which is correct because the caller passes display-unit
+    values consistent with the active unit system.
     """
     st.markdown(f"##### {value_label} vs depth "
                  f"({'RSVD' if fluid_kind == 'oil' else 'RVVD'})")
     st.caption(
         "Build a compositional-gradient keyword: the dissolved-gas "
         "(or vaporized-oil) content varies linearly with depth. ECLIPSE "
-        "uses this to initialize a reservoir that is not uniformly mixed.")
+        "uses this to initialize a reservoir that is not uniformly mixed. "
+        f"Depths are in **{depth_unit}**, matching the current unit system.")
     dc = st.columns(4)
     with dc[0]:
-        d_ref = st.number_input("Reference depth", value=float(ref_depth_default),
+        d_ref = st.number_input(f"Reference depth ({depth_unit})",
+                                 value=float(ref_depth_default),
                                  key=f"{key_prefix}_dref")
     with dc[1]:
-        d_top = st.number_input("Top depth", value=float(ref_depth_default) - 200.0,
+        d_top = st.number_input(f"Top depth ({depth_unit})",
+                                 value=float(ref_depth_default) - 200.0,
                                  key=f"{key_prefix}_dtop")
     with dc[2]:
-        d_bot = st.number_input("Bottom depth", value=float(ref_depth_default) + 200.0,
+        d_bot = st.number_input(f"Bottom depth ({depth_unit})",
+                                 value=float(ref_depth_default) + 200.0,
                                  key=f"{key_prefix}_dbot")
     with dc[3]:
-        grad = st.number_input(f"Gradient ({value_unit}/depth)",
-                                value=-0.30, format="%.4f",
+        grad = st.number_input(f"Gradient ({value_unit}/{depth_unit})",
+                                value=-0.30, format="%.5f",
                                 key=f"{key_prefix}_grad",
                                 help="Negative means the value decreases "
                                      "downward (typical for Rs).")
@@ -182,9 +271,10 @@ def render_depth_profile(fluid_kind, ref_value, ref_depth_default,
     depths = list(np.linspace(d_top, d_bot, n_lvl))
     values = EQC.linear_depth_profile(ref_value, grad, d_ref, depths)
 
-    prof_df = pd.DataFrame({"Depth": depths, value_label: values})
+    prof_df = pd.DataFrame({f"Depth ({depth_unit})": depths,
+                             value_label: values})
     styled_dataframe(prof_df, height=240)
-    line_chart_plotly(prof_df, "Depth", value_label,
+    line_chart_plotly(prof_df, f"Depth ({depth_unit})", value_label,
                        title=f"{value_label} vs depth")
 
     if fluid_kind == "oil":
@@ -386,3 +476,56 @@ def tuning_is_stale(tune_result, current_fp):
     if stored is None:
         return False
     return tuple(stored) != tuple(current_fp)
+
+
+def lab_data_changed(tune_result, current_lab_data,
+                       snapshot_key="lab_snapshot"):
+    """True when the lab/measurement data has changed since the tuning
+    result was produced — i.e. the tuning is out of date and the user
+    should re-run it.
+
+    snapshot_key : which stored key holds the snapshot ('lab_snapshot' for
+                   the correlation tuners, 'meas_snapshot' for the EOS
+                   tuner).
+    """
+    if not tune_result:
+        return False
+    snap = tune_result.get(snapshot_key)
+    if snap is None:
+        return False
+    cur = list(current_lab_data or [])
+    if len(snap) != len(cur):
+        return True
+    def _norm(rows):
+        out = []
+        for r in rows:
+            if isinstance(r, dict):
+                out.append(tuple(sorted(
+                    (k, round(float(v), 6))
+                    for k, v in r.items()
+                    if isinstance(v, (int, float)))))
+            else:
+                try:
+                    out.append(tuple(round(float(x), 6) for x in r))
+                except Exception:
+                    out.append(tuple(r))
+        return out
+    return _norm(snap) != _norm(cur)
+
+
+def render_stale_tuning_banner(is_stale):
+    """Render an orange 'needs re-running' banner when a tuning result is
+    out of date relative to the current lab data. Returns is_stale so the
+    caller can also gate other UI on it."""
+    if is_stale:
+        st.markdown(
+            "<div style='background:#FFE7D6; border-left:4px solid "
+            "#EB6E1F; padding:0.6rem 0.9rem; border-radius:4px; "
+            "margin:0.4rem 0;'>"
+            "<b style='color:#B8500F;'>⚠️ Lab data has changed since the "
+            "last tuning run.</b><br>"
+            "<span style='color:#7A3A0A;'>The tuned result below no longer "
+            "matches the current measurements — re-run the tuning to "
+            "refresh it.</span></div>",
+            unsafe_allow_html=True)
+    return is_stale

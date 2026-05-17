@@ -170,7 +170,9 @@ def run_cce(z, comp_names, T_R, pressures, c7_props=None, P_sat=None):
             Y = np.nan
 
         rows.append({"P": P, "V_rel": V_rel, "L_dropout_pct": L_dropout,
-                     "Y_function": Y, "phase": r["phase"]})
+                     "Y_function": Y, "phase": r["phase"],
+                     "x": list(r.get("x", [])),
+                     "y": list(r.get("y", []))})
 
     return sorted(rows, key=lambda r: r["P"])
 
@@ -318,7 +320,8 @@ def run_dle(z, comp_names, T_R, pressures, c7_props=None, P_b=None):
             Bo = V_res / (feed_lbmol * V_o_sc) if V_o_sc > 0 else np.nan
             mu = lbc_viscosity(comp_names, feed, rho, T_R, c7_props)
             rows.append({"P": P, "phase": "L", "Rs": Rs, "Bo": Bo,
-                         "mu_o": mu, "rho_o": rho})
+                         "mu_o": mu, "rho_o": rho,
+                         "x": list(feed), "y": []})
         else:
             V = r["V"]; x = r["x"]; y = r["y"]
             n_L = feed_lbmol * (1 - V)
@@ -330,7 +333,8 @@ def run_dle(z, comp_names, T_R, pressures, c7_props=None, P_b=None):
             Bo = V_res / (n_L * V_o_sc_x) if V_o_sc_x > 0 else np.nan
             mu = lbc_viscosity(comp_names, x, rho, T_R, c7_props)
             rows.append({"P": P, "phase": "LV", "Rs": Rs, "Bo": Bo,
-                         "mu_o": mu, "rho_o": rho})
+                         "mu_o": mu, "rho_o": rho,
+                         "x": list(x), "y": list(y)})
 
             # Update: remove gas, keep liquid
             feed = x

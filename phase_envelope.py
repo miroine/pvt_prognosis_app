@@ -21,7 +21,8 @@ from eos_pr import flash, saturation_pressure
 
 
 def trace_envelope(z, comp_names, c7_props=None,
-                   T_min=None, T_max=None, n_points=30, P_max=15000.0):
+                   T_min=None, T_max=None, n_points=30, P_max=15000.0,
+                   progress_callback=None):
     """
     Trace the phase envelope.
 
@@ -30,6 +31,9 @@ def trace_envelope(z, comp_names, c7_props=None,
       - Low-T branch: search bubble side
       - High-T branch: search dew side
     They meet at the critical / cricondentherm region.
+
+    progress_callback : optional callable(fraction_done) in [0, 1], invoked
+        after each temperature point so the UI can show a progress bar.
 
     Returns:
         dict with keys:
@@ -68,6 +72,11 @@ def trace_envelope(z, comp_names, c7_props=None,
                 phase_at_sat.append(None)
         except Exception:
             phase_at_sat.append(None)
+        if progress_callback is not None:
+            try:
+                progress_callback((i + 1) / len(temperatures))
+            except Exception:
+                pass
 
     # Split into bubble and dew arrays
     T_bubble = []; P_bubble = []

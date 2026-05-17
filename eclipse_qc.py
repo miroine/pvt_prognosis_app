@@ -229,3 +229,176 @@ def _find_col(df, needles):
             if nd in cs:
                 return c
     return None
+
+
+# ----------------------------------------------------------------------
+# PVTO Rs-branch parser (for plotting the true PVTO structure)
+# ----------------------------------------------------------------------
+def parse_pvto_branches(pvto_text):
+    """Parse a generated PVTO keyword block into per-Rs branches.
+
+    A PVTO table is organized as a set of saturated Rs nodes; each node
+    may carry an under-saturated extension (rows with a blank Rs column).
+    Returns a list of branch dicts:
+        {"Rs": <float>, "P": [...], "Bo": [...], "mu": [...]}
+    one per saturated Rs node, each including its saturated point plus any
+    under-saturated rows. Units are whatever the deck is written in
+    (FIELD or METRIC) — the caller is responsible for labelling.
+    """
+    branches = []
+    current = None
+    for line in pvto_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("--"):
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", s):
+            continue  # the 'PVTO' keyword line
+        s_clean = s.rstrip("/").strip()
+        if not s_clean:
+            continue
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s_clean)
+        try:
+            vals = [float(n) for n in nums]
+        except ValueError:
+            continue
+        # Count leading whitespace to tell a saturated node (has Rs in the
+        # first column) from an under-saturated continuation row.
+        indent = len(line) - len(line.lstrip())
+        is_saturated_node = (len(vals) >= 4)
+        if is_saturated_node:
+            # New Rs node: Rs, Psat, Bo, mu
+            if current is not None:
+                branches.append(current)
+            current = {"Rs": vals[0], "P": [vals[1]],
+                        "Bo": [vals[2]], "mu": [vals[3]]}
+        elif current is not None and len(vals) >= 3:
+            # Under-saturated continuation: P, Bo, mu (same Rs)
+            current["P"].append(vals[0])
+            current["Bo"].append(vals[1])
+            current["mu"].append(vals[2])
+    if current is not None:
+        branches.append(current)
+    return branches
+
+
+# ----------------------------------------------------------------------
+# Auto-fix: enforce monotonicity on a PVT table
+# ----------------------------------------------------------------------
+def _enforce_monotonic(values, expect, tol=1e-12):
+    """Return a copy of `values` made monotonic in the expected direction.
+
+    Each value that would violate monotonicity is clamped to its
+    predecessor. This is a minimal, local repair — it never moves a value
+    further than necessary — and the caller should make clear to the user
+    that the table has been adjusted.
+    """
+    out = list(values)
+    for i in range(1, len(out)):
+        if out[i] is None or out[i - 1] is None:
+            continue
+        if expect == "increasing" and out[i] < out[i - 1] - tol:
+            out[i] = out[i - 1]
+        elif expect == "decreasing" and out[i] > out[i - 1] + tol:
+            out[i] = out[i - 1]
+    return out
+
+
+def autofix_pvto_table(df, pb=None):
+    """Repair a PVTO DataFrame so every column is monotonic in the
+    direction ECLIPSE expects, branch by branch (saturated /
+    under-saturated). Returns (fixed_df, list_of_changes)."""
+    fixed = df.copy()
+    changes = []
+    p_col  = _find_col(fixed, ["P (", "P_"])
+    rs_col = _find_col(fixed, ["Rs"])
+    bo_col = _find_col(fixed, ["Bo"])
+    mu_col = _find_col(fixed, ["μ", "mu"])
+    if p_col is None:
+        return fixed, changes
+
+    pvals = list(fixed[p_col])
+    # Pressure must increase across the whole table.
+    new_p = _enforce_monotonic(pvals, "increasing")
+    if new_p != pvals:
+        changes.append("Pressure column clamped to be non-decreasing.")
+        fixed[p_col] = new_p
+
+    # Saturated / under-saturated split.
+    split = len(fixed)
+    if pb is not None:
+        for i, p in enumerate(new_p):
+            if p > pb + 1e-6:
+                split = i
+                break
+    elif rs_col is not None:
+        rs = list(fixed[rs_col])
+        for i in range(1, len(rs)):
+            if rs[i] <= rs[i - 1] + 1e-9:
+                split = i
+                break
+
+    def _fix_segment(col, expect, lo, hi, name):
+        if col is None:
+            return
+        seg = list(fixed[col])[lo:hi]
+        new_seg = _enforce_monotonic(seg, expect)
+        if new_seg != seg:
+            changes.append(f"{name}: {sum(1 for a, b in zip(seg, new_seg) if a != b)} "
+                            f"row(s) adjusted.")
+            full = list(fixed[col])
+            full[lo:hi] = new_seg
+            fixed[col] = full
+
+    _fix_segment(rs_col, "increasing", 0, split, "Solution GOR (saturated)")
+    _fix_segment(bo_col, "increasing", 0, split, "Oil FVF (saturated)")
+    _fix_segment(mu_col, "decreasing", 0, split, "Oil viscosity (saturated)")
+    if split < len(fixed):
+        _fix_segment(bo_col, "decreasing", split, len(fixed),
+                      "Oil FVF (under-saturated)")
+        _fix_segment(mu_col, "increasing", split, len(fixed),
+                      "Oil viscosity (under-saturated)")
+    return fixed, changes
+
+
+def autofix_pvdg_table(df):
+    """Repair a PVDG DataFrame: P increasing, Bg decreasing, mu
+    increasing. Returns (fixed_df, list_of_changes)."""
+    fixed = df.copy()
+    changes = []
+    p_col  = _find_col(fixed, ["P (", "P_"])
+    bg_col = _find_col(fixed, ["Bg"])
+    mu_col = _find_col(fixed, ["μ", "mu"])
+    for col, expect, name in [(p_col, "increasing", "Pressure"),
+                               (bg_col, "decreasing", "Gas FVF (Bg)"),
+                               (mu_col, "increasing", "Gas viscosity")]:
+        if col is None:
+            continue
+        old = list(fixed[col])
+        new = _enforce_monotonic(old, expect)
+        if new != old:
+            changes.append(f"{name}: "
+                            f"{sum(1 for a, b in zip(old, new) if a != b)} "
+                            f"row(s) adjusted.")
+            fixed[col] = new
+    return fixed, changes
+
+
+def autofix_pvtg_table(df):
+    """Repair a PVTG DataFrame: P increasing, Bg decreasing.
+    Returns (fixed_df, list_of_changes)."""
+    fixed = df.copy()
+    changes = []
+    p_col  = _find_col(fixed, ["P (", "P_"])
+    bg_col = _find_col(fixed, ["Bg"])
+    for col, expect, name in [(p_col, "increasing", "Pressure"),
+                               (bg_col, "decreasing", "Gas FVF (Bg)")]:
+        if col is None:
+            continue
+        old = list(fixed[col])
+        new = _enforce_monotonic(old, expect)
+        if new != old:
+            changes.append(f"{name}: "
+                            f"{sum(1 for a, b in zip(old, new) if a != b)} "
+                            f"row(s) adjusted.")
+            fixed[col] = new
+    return fixed, changes

@@ -211,7 +211,8 @@ from ui_helpers import (line_chart_plotly, styled_dataframe,
                          render_eclipse_qc, render_depth_profile,
                          render_property_plots, render_input_correlation,
                          render_tornado_chart, fluid_fingerprint,
-                         tuning_is_stale)
+                         tuning_is_stale, lab_data_changed,
+                         render_stale_tuning_banner)
 
 
 pressures = np.linspace(P_min, P_max, n_points)
@@ -289,9 +290,13 @@ def render_saved_fluid_loader(branch_fluid_type, key_map, extra_apply=None,
     disabled — loading an oil into the gas branch would be meaningless.
     """
     registry = st.session_state.get("fluid_registry", {})
-    if not registry:
-        return
     with st.expander("📂 Load a saved fluid", expanded=False):
+        if not registry:
+            st.caption(
+                "No saved fluids yet. Use the **Save fluid** option in the "
+                "Tools section below to store a fluid — it will then be "
+                "available to reload here and in other branches.")
+            return
         st.caption(
             "Reload a fluid you saved earlier this session. Only fluids of "
             "a matching type can be loaded into this branch.")
@@ -1094,6 +1099,11 @@ if fluid == "Oil (Black Oil)":
             lab_snap = tune_res.get("lab_snapshot",
                                      st.session_state["oil_lab_data"])
 
+            # Orange banner if the lab data changed since this tuning ran.
+            render_stale_tuning_banner(
+                lab_data_changed(tune_res,
+                                  st.session_state.get("oil_lab_data")))
+
             m1, m2, m3 = st.columns(3)
             m1.metric("RMS initial", f"{tune_res['rms_initial']:.4f}")
             m2.metric("RMS final",   f"{tune_res['rms_final']:.4f}")
@@ -1331,7 +1341,11 @@ if fluid == "Oil (Black Oil)":
 
         # ---- Monotonicity QC + export-table plot ----
         st.markdown("#### Quality check")
-        render_eclipse_qc(df_field, "pvto", label="PVTO table", pb=Pb)
+        # Build a display-unit copy of the export table and the per-Rs
+        # PVTO branches so the plot matches the ECLIPSE unit selection.
+        _pvto_branches = EQC.parse_pvto_branches(pvto_show)
+        render_eclipse_qc(df_field, "pvto", label="PVTO table", pb=Pb,
+                           pvto_branches=_pvto_branches)
 
         deck = build_full_deck(pvto=pvto_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
@@ -1349,11 +1363,16 @@ if fluid == "Oil (Black Oil)":
 
         # ---- Rs vs depth (RSVD) ----
         st.markdown("---")
-        render_depth_profile("oil", ref_value=Rsi,
-                              ref_depth_default=8000.0,
-                              value_label="Rs (scf/STB)",
-                              value_unit="scf/STB",
-                              key_prefix="oil_rsvd")
+        _depth_unit = "ft" if unit_system == "Field" else "m"
+        _depth_default = 8000.0 if unit_system == "Field" else 2440.0
+        render_depth_profile(
+            "oil",
+            ref_value=U.to_user_Rs(Rsi, unit_system),
+            ref_depth_default=_depth_default,
+            value_label=f"Rs ({L['Rs']})",
+            value_unit=L['Rs'],
+            key_prefix="oil_rsvd",
+            depth_unit=_depth_unit)
 
     # -------- Optional companion PVDG for the dissolved gas --------
     if enable_eclipse_export:
@@ -1507,10 +1526,8 @@ if fluid == "Oil (Black Oil)":
                         ok = False
                         break
                 if ok and regions_data:
-                    deck = build_multi_region_deck(regions_data)
-                    if eclipse_unit_choice == "METRIC":
-                        st.info("Multi-region deck is generated in FIELD units. "
-                                 "Convert externally if METRIC is required.")
+                    deck = build_multi_region_deck(regions_data, units=eclipse_unit_choice)
+                    st.caption(f"Deck generated in **{eclipse_unit_choice}** units.")
                     st.code(deck, language="text")
                     st.download_button(
                         "Download multi-region deck (.INC)", deck,
@@ -1918,6 +1935,9 @@ elif fluid == "Dry Gas":
         if st.session_state.get("dg_tune_result"):
             dg_tr = st.session_state["dg_tune_result"]
             lab_snap = dg_tr.get("lab_snapshot", st.session_state["dg_lab_data"])
+            render_stale_tuning_banner(
+                lab_data_changed(dg_tr,
+                                  st.session_state.get("dg_lab_data")))
             mm1, mm2 = st.columns(2)
             mm1.metric("RMS initial", f"{dg_tr['rms_initial']:.4f}")
             mm2.metric("RMS final",   f"{dg_tr['rms_final']:.4f}")
@@ -1943,12 +1963,30 @@ elif fluid == "Dry Gas":
 
     # -------- Composition guess for dry gas --------
     with st.expander("🔬 Guess composition for EOS comparison"):
-        st.markdown(f"Synthesize a composition from gas SG = {gas_sg:.3f}.")
+        st.markdown(
+            "Synthesize a plausible gas composition as a starting point "
+            "for compositional (EOS) modeling.")
+        # Choose which fluid the guess is based on.
+        _dgc_opts = ["Current fluid"]
+        _saved_dg = {nm: rec for nm, rec in
+                      st.session_state.get("fluid_registry", {}).items()
+                      if rec.get("fluid_type") == "dry_gas"}
+        _dgc_opts += [f"Saved: {nm}" for nm in _saved_dg]
+        dgc_src = st.selectbox("Base the guess on", _dgc_opts,
+                                key="dg_gc_src")
+        if dgc_src == "Current fluid":
+            gc_sg = gas_sg
+        else:
+            _p = _saved_dg[dgc_src[len("Saved: "):]].get("parameters", {})
+            gc_sg = float(_p.get("gas_sg", gas_sg))
+        st.caption(f"Guess input: gas SG = {gc_sg:.3f}")
         if st.button("Generate composition guess", key="dg_guess"):
-            cg, MW_c7, SG_c7 = guess_gas_composition(gas_sg, is_wet=False)
+            cg, MW_c7, SG_c7 = guess_gas_composition(gc_sg, is_wet=False)
             cg_df = pd.DataFrame([{"Component": k, "Mole fraction": v}
                                    for k, v in cg.items() if v > 1e-5])
             styled_dataframe(cg_df, height=280)
+            st.info("Switch to **Compositional (EOS)** in the sidebar and "
+                     "enter these values to use them.")
 
     # -------- Monte Carlo for dry gas --------
     with st.expander("🎲 Monte Carlo uncertainty"):
@@ -2122,10 +2160,15 @@ elif fluid == "Dry Gas":
 
         # ---- Monotonicity QC ----
         st.markdown("#### Quality check")
-        _pvdg_rows = EQC.extract_numeric_rows(pvdg_text)
+        # Parse the deck as it will be exported (pvdg_show is already in
+        # the chosen ECLIPSE units), so the QC plot matches the selection.
+        _pvdg_rows = EQC.extract_numeric_rows(pvdg_show)
         if _pvdg_rows and len(_pvdg_rows[0]) >= 3:
-            _pvdg_df = pd.DataFrame(_pvdg_rows,
-                                     columns=["P (psia)", "Bg", "μg (cp)"][:len(_pvdg_rows[0])])
+            _p_lbl = "P (bara)" if eclipse_unit_choice == "METRIC" else "P (psia)"
+            _bg_lbl = "Bg (rm³/Sm³)" if eclipse_unit_choice == "METRIC" else "Bg (rb/Mscf)"
+            _pvdg_df = pd.DataFrame(
+                _pvdg_rows,
+                columns=[_p_lbl, _bg_lbl, "μg (cp)"][:len(_pvdg_rows[0])])
             render_eclipse_qc(_pvdg_df, "pvdg", label="PVDG table")
 
         deck = build_full_deck(pvdg=pvdg_show, pvtw=pvtw_show,
@@ -2226,7 +2269,7 @@ elif fluid == "Dry Gas":
                         ok = False
                         break
                 if ok and regions_data:
-                    deck = build_multi_region_deck(regions_data)
+                    deck = build_multi_region_deck(regions_data, units=eclipse_unit_choice)
                     st.code(deck, language="text")
                     st.download_button(
                         "Download multi-region deck (.INC)", deck,
@@ -2526,6 +2569,9 @@ elif fluid == "Wet Gas / Condensate":
         if st.session_state.get("wg_tune_result"):
             wg_tr = st.session_state["wg_tune_result"]
             lab_snap = wg_tr.get("lab_snapshot", st.session_state["wg_lab_data"])
+            render_stale_tuning_banner(
+                lab_data_changed(wg_tr,
+                                  st.session_state.get("wg_lab_data")))
             mm1, mm2, mm3 = st.columns(3)
             mm1.metric("RMS initial", f"{wg_tr['rms_initial']:.4f}")
             mm2.metric("RMS final",   f"{wg_tr['rms_final']:.4f}")
@@ -2916,10 +2962,11 @@ elif fluid == "Wet Gas / Condensate":
 
         # ---- Monotonicity QC ----
         st.markdown("#### Quality check")
-        _pvtg_rows = EQC.extract_numeric_rows(pvtg_text)
+        _pvtg_rows = EQC.extract_numeric_rows(pvtg_show)
         if _pvtg_rows:
             _ncol = len(_pvtg_rows[0])
-            _cols = ["P (psia)", "Rv", "Bg", "μg (cp)"][:_ncol]
+            _p_lbl = "P (bara)" if eclipse_unit_choice == "METRIC" else "P (psia)"
+            _cols = [_p_lbl, "Rv", "Bg", "μg (cp)"][:_ncol]
             _pvtg_df = pd.DataFrame(_pvtg_rows, columns=_cols)
             render_eclipse_qc(_pvtg_df, "pvtg", label="PVTG table")
 
@@ -2938,12 +2985,17 @@ elif fluid == "Wet Gas / Condensate":
 
         # ---- Rv vs depth (RVVD) ----
         st.markdown("---")
-        _rv_ref = wet.rv(P_res) * 1000.0   # STB/Mscf
-        render_depth_profile("gas", ref_value=_rv_ref,
-                              ref_depth_default=9000.0,
-                              value_label="Rv (STB/Mscf)",
-                              value_unit="STB/Mscf",
-                              key_prefix="wg_rvvd")
+        _rv_ref_field = wet.rv(P_res) * 1000.0   # STB/Mscf (field)
+        _depth_unit = "ft" if unit_system == "Field" else "m"
+        _depth_default = 9000.0 if unit_system == "Field" else 2740.0
+        render_depth_profile(
+            "gas",
+            ref_value=U.to_user_Rv(_rv_ref_field, unit_system),
+            ref_depth_default=_depth_default,
+            value_label=f"Rv ({L['Rv']})",
+            value_unit=L['Rv'],
+            key_prefix="wg_rvvd",
+            depth_unit=_depth_unit)
 
     # -------- Optional companion PVTO for the dropped-out condensate --------
     if enable_eclipse_export:
@@ -3096,7 +3148,7 @@ elif fluid == "Wet Gas / Condensate":
                         ok = False
                         break
                 if ok and regions_data:
-                    deck = build_multi_region_deck(regions_data)
+                    deck = build_multi_region_deck(regions_data, units=eclipse_unit_choice)
                     st.code(deck, language="text")
                     st.download_button(
                         "Download multi-region deck (.INC)", deck,
@@ -3242,6 +3294,65 @@ elif fluid == "Compositional (EOS)":
                                extra_apply=_apply_comp_saved,
                                key_prefix="comp_load")
 
+    # ---- Import a composition (paste CSV / text) ----
+    with st.expander("📋 Import a composition", expanded=False):
+        st.caption(
+            "Paste a composition as comma- or whitespace-separated "
+            "`Component, value` lines — for example from a lab report or "
+            "spreadsheet. Values may be mole fractions or mole percents "
+            "(they are renormalized). Component names must match the "
+            "library (N2, CO2, H2S, C1, C2, C3, iC4, nC4, iC5, nC5, C6, "
+            "C7+).")
+        _imp_txt = st.text_area(
+            "Composition data", height=160, key="comp_import_txt",
+            placeholder="C1, 0.62\nC2, 0.09\nC3, 0.05\n...\nC7+, 0.10")
+        if st.button("Import composition", key="comp_import_btn"):
+            import re as _re
+            parsed = {}
+            bad = []
+            for line in _imp_txt.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("--"):
+                    continue
+                parts = _re.split(r"[,;\t ]+", line)
+                if len(parts) < 2:
+                    continue
+                name = parts[0].strip()
+                try:
+                    val = float(parts[1])
+                except ValueError:
+                    bad.append(line)
+                    continue
+                # Match component name case-insensitively to the library
+                match = None
+                for cn in DEFAULT_COMP:
+                    if cn.lower() == name.lower():
+                        match = cn
+                        break
+                if match:
+                    parsed[match] = parsed.get(match, 0.0) + val
+                else:
+                    bad.append(f"{name} (unknown component)")
+            if not parsed:
+                st.error("No valid component lines found. Check the format "
+                          "and component names.")
+            else:
+                total = sum(parsed.values())
+                new_state = {k: 0.0 for k in DEFAULT_COMP}
+                for k, v in parsed.items():
+                    new_state[k] = v / total if total > 0 else 0.0
+                st.session_state["comp_state"] = new_state
+                for k, v in new_state.items():
+                    st.session_state[f"comp_input_{k}"] = float(v)
+                msg = (f"Imported {len(parsed)} components "
+                        f"(renormalized from Σ={total:.4g}).")
+                if bad:
+                    msg += f" Skipped: {', '.join(bad[:5])}"
+                    if len(bad) > 5:
+                        msg += f" (+{len(bad)-5} more)"
+                st.success(msg)
+                st.rerun()
+
     # ---- Composition input panel ----
     with st.expander("Composition input", expanded=True):
         cols_top = st.columns([1, 1, 1, 3])
@@ -3376,17 +3487,24 @@ elif fluid == "Compositional (EOS)":
     # Build tab list conditionally — ECLIPSE export only when enabled.
     # The EOS flash ("running") comes first, before the lab experiments,
     # so the core EOS calculation is the entry point of the workflow.
+    # Tab order: EOS Flash first (core run), then analysis tabs; Monte
+    # Carlo comes before Multi-Region, and Docs is always the last tab.
     tab_labels = ["⚡ EOS Flash", "🔵 Phase Envelope",
                   "📊 Lab Experiments", "🏭 Separator Train",
-                  "🎯 EOS Tuning", "🗂️ Multi-Region",
-                  "🎲 Monte Carlo", "📖 Docs"]
+                  "🎯 EOS Tuning", "🎲 Monte Carlo", "🗂️ Multi-Region"]
     if enable_eclipse_export:
         tab_labels.append("💾 ECLIPSE Export")
+    tab_labels.append("📖 Docs")
     _all_tabs = st.tabs(tab_labels)
     tab_flash, tab_env, tab_exp = _all_tabs[0], _all_tabs[1], _all_tabs[2]
-    tab_separator, tab_tuning, tab_multireg = _all_tabs[3], _all_tabs[4], _all_tabs[5]
-    tab_mc, tab_docs = _all_tabs[6], _all_tabs[7]
-    tab_export = _all_tabs[8] if enable_eclipse_export else None
+    tab_separator, tab_tuning = _all_tabs[3], _all_tabs[4]
+    tab_mc, tab_multireg = _all_tabs[5], _all_tabs[6]
+    if enable_eclipse_export:
+        tab_export = _all_tabs[7]
+        tab_docs = _all_tabs[8]
+    else:
+        tab_export = None
+        tab_docs = _all_tabs[7]
 
     # ============================================================
     # TAB — Lab experiments (3rd tab; EOS Flash is 1st)
@@ -3513,7 +3631,20 @@ elif fluid == "Compositional (EOS)":
                 except Exception:
                     df_tuned_exp = None
 
-            styled_dataframe(df)
+            # Table fluid selector — the plots show both untuned and tuned,
+            # but the data table can only show one; let the user choose.
+            if df_tuned_exp is not None:
+                tbl_choice = st.radio(
+                    "Data table shows", ["Untuned EOS", "Tuned EOS"],
+                    horizontal=True, key="comp_exp_tbl_choice")
+                if tbl_choice == "Tuned EOS":
+                    st.caption("Table: **tuned** EOS result.")
+                    styled_dataframe(df_tuned_exp)
+                else:
+                    st.caption("Table: **untuned** EOS result.")
+                    styled_dataframe(df)
+            else:
+                styled_dataframe(df)
             if df_tuned_exp is not None:
                 st.caption("Plots below: untuned EOS (solid) vs tuned EOS "
                             "(dashed red).")
@@ -3530,6 +3661,58 @@ elif fluid == "Compositional (EOS)":
                                        key_prefix="comp_bot_props",
                                        overlay_df=ov,
                                        default_props=others[:3])
+
+            # ---- Per-step composition viewer (CCE / DLE) ----
+            if experiment.startswith("CCE") or experiment.startswith("DLE"):
+                _has_comp = any(r.get("x") for r in experiment_rows)
+                if _has_comp:
+                    st.markdown("##### Composition at each depletion step")
+                    st.caption(
+                        "Pick a pressure step to see the phase compositions "
+                        "at that point. For CCE the liquid and vapor "
+                        "coexist; for DLE the liquid is the oil remaining "
+                        "after gas removal and the vapor is the liberated "
+                        "gas.")
+                    # Optional tuned/untuned source
+                    _comp_src_rows = experiment_rows
+                    if experiment_rows_tuned:
+                        _cs = st.radio(
+                            "Composition from", ["Untuned EOS", "Tuned EOS"],
+                            horizontal=True, key="comp_exp_stepcomp_src")
+                        if _cs == "Tuned EOS":
+                            _comp_src_rows = experiment_rows_tuned
+                    _step_labels = [
+                        f"P = {U.to_user_P(r['P'], unit_system):.0f} {L['P']}"
+                        f"  ({r['phase']})"
+                        for r in _comp_src_rows]
+                    _sel = st.selectbox("Depletion step", _step_labels,
+                                         key="comp_exp_stepcomp_sel")
+                    _row = _comp_src_rows[_step_labels.index(_sel)]
+                    _xv = _row.get("x", [])
+                    _yv = _row.get("y", [])
+                    cphase = st.columns(2)
+                    with cphase[0]:
+                        if _xv and sum(_xv) > 0:
+                            _xdf = pd.DataFrame({
+                                "Component": comp_names,
+                                "Liquid mol %": [v * 100 for v in _xv]})
+                            _xdf = _xdf[_xdf["Liquid mol %"] > 1e-4]
+                            st.markdown("**Liquid phase**")
+                            styled_dataframe(_xdf, height=300)
+                        else:
+                            st.caption("No liquid phase at this step.")
+                    with cphase[1]:
+                        if _yv and sum(_yv) > 0:
+                            _ydf = pd.DataFrame({
+                                "Component": comp_names,
+                                "Vapor mol %": [v * 100 for v in _yv]})
+                            _ydf = _ydf[_ydf["Vapor mol %"] > 1e-4]
+                            st.markdown("**Vapor phase**")
+                            styled_dataframe(_ydf, height=300)
+                        else:
+                            st.caption("No vapor phase at this step "
+                                        "(single-phase, or gas already "
+                                        "removed).")
 
     # ============================================================
     # TAB — Phase envelope
@@ -3600,10 +3783,16 @@ elif fluid == "Compositional (EOS)":
             T_min_R = U.to_field_T(Tmin_env, unit_system) + 460.0
             T_max_R = U.to_field_T(Tmax_env, unit_system) + 460.0
             try:
-                with st.spinner("Tracing envelope (this can take a minute)..."):
-                    env = trace_envelope(z_arr, comp_names, c7_props=c7_props,
-                                          T_min=T_min_R, T_max=T_max_R,
-                                          n_points=n_env, P_max=15000.0)
+                _env_prog = st.progress(0.0, text="Tracing phase envelope...")
+                def _env_cb(frac):
+                    _env_prog.progress(min(frac, 1.0),
+                                        text=f"Tracing phase envelope... "
+                                             f"{frac*100:.0f}%")
+                env = trace_envelope(z_arr, comp_names, c7_props=c7_props,
+                                      T_min=T_min_R, T_max=T_max_R,
+                                      n_points=n_env, P_max=15000.0,
+                                      progress_callback=_env_cb)
+                _env_prog.empty()
             except Exception as e:
                 st.error(f"Envelope failed: {e}")
                 env = None
@@ -3611,11 +3800,18 @@ elif fluid == "Compositional (EOS)":
             env_tuned = None
             if overlay_tuned_env and c7_props_tuned is not None:
                 try:
-                    with st.spinner("Tracing tuned envelope..."):
-                        env_tuned = trace_envelope(
-                            z_arr, comp_names, c7_props=c7_props_tuned,
-                            T_min=T_min_R, T_max=T_max_R,
-                            n_points=n_env, P_max=15000.0)
+                    _envt_prog = st.progress(
+                        0.0, text="Tracing tuned envelope...")
+                    def _envt_cb(frac):
+                        _envt_prog.progress(min(frac, 1.0),
+                                             text=f"Tracing tuned envelope... "
+                                                  f"{frac*100:.0f}%")
+                    env_tuned = trace_envelope(
+                        z_arr, comp_names, c7_props=c7_props_tuned,
+                        T_min=T_min_R, T_max=T_max_R,
+                        n_points=n_env, P_max=15000.0,
+                        progress_callback=_envt_cb)
+                    _envt_prog.empty()
                 except Exception:
                     env_tuned = None
 
@@ -3745,6 +3941,40 @@ elif fluid == "Compositional (EOS)":
         st.markdown("Run a single-stage isothermal flash at any (P, T). "
                     "Useful for quick checks without generating a full table.")
 
+        # ---- Fluid source: current composition or a saved fluid ----
+        _flash_saved = {nm: rec for nm, rec in
+                         st.session_state.get("fluid_registry", {}).items()
+                         if rec.get("fluid_type") == "compositional"}
+        _flash_src_opts = ["Current composition"]
+        _flash_src_opts += [f"Saved: {nm}" for nm in _flash_saved]
+        flash_src = st.selectbox(
+            "Fluid to flash", _flash_src_opts, key="flash_fluid_src",
+            help="Flash the composition entered above, or any "
+                 "compositional fluid you saved to the registry.")
+
+        # Resolve the composition to flash.
+        flash_z, flash_names, flash_c7 = z_arr, comp_names, c7_props
+        if flash_src.startswith("Saved: "):
+            _rec = _flash_saved[flash_src[len("Saved: "):]]
+            _p = _rec.get("parameters", {})
+            _comp = _p.get("composition", {})
+            if _comp:
+                _names = [k for k, v in _comp.items() if v and v > 0]
+                _zraw = np.array([_comp[k] for k in _names], dtype=float)
+                if _zraw.sum() > 0:
+                    flash_z = _zraw / _zraw.sum()
+                    flash_names = _names
+                    try:
+                        flash_c7 = (characterize_c7plus(
+                            MW_c7=float(_p.get("C7_MW", MW_c7)),
+                            SG_c7=float(_p.get("C7_SG", SG_c7)))
+                            if "C7+" in _names else None)
+                    except Exception:
+                        flash_c7 = c7_props
+                    st.caption(f"Flashing saved fluid "
+                                f"**{flash_src[len('Saved: '):]}** "
+                                f"({len(flash_names)} components).")
+
         c_flash = st.columns(3)
         with c_flash[0]:
             if unit_system == "Field":
@@ -3759,7 +3989,7 @@ elif fluid == "Compositional (EOS)":
                                                 value=P_res_user, key="flash_P")
         with c_flash[1]:
             run_flash_btn = st.button("Run flash", type="primary", use_container_width=True)
-            st.caption("Uses the composition above.")
+            st.caption("Uses the fluid selected above.")
         with c_flash[2]:
             st.caption(" ")
 
@@ -3771,7 +4001,8 @@ elif fluid == "Compositional (EOS)":
             from lbc import lbc_viscosity
 
             try:
-                r = flash(z_arr, comp_names, P_flash_field, T_flash_R, c7_props)
+                r = flash(flash_z, flash_names, P_flash_field, T_flash_R,
+                           flash_c7)
             except Exception as e:
                 st.error(f"Flash failed: {e}")
                 r = None
@@ -3791,10 +4022,10 @@ elif fluid == "Compositional (EOS)":
 
                 # Phase compositions table
                 comp_table_rows = []
-                for i, c in enumerate(comp_names):
+                for i, c in enumerate(flash_names):
                     comp_table_rows.append({
                         "Component": c,
-                        "z (feed)": z_arr[i],
+                        "z (feed)": flash_z[i],
                         "x (liquid)": r["x"][i] if r["phase"] != "V" else np.nan,
                         "y (vapor)": r["y"][i] if r["phase"] != "L" else np.nan,
                         "K = y/x":   r["K"][i] if r["phase"] == "LV" else np.nan,
@@ -3807,14 +4038,14 @@ elif fluid == "Compositional (EOS)":
                     use_container_width=True, height=420)
 
                 # Phase properties
-                MW_arr = np.array([get_props(c, c7_props)["MW"] for c in comp_names])
+                MW_arr = np.array([get_props(c, flash_c7)["MW"] for c in flash_names])
                 cols_prop = st.columns(2)
 
                 if r["phase"] != "V" and r["x"].sum() > 0 and np.isfinite(r["Z_L"]):
-                    rho_L = phase_density(comp_names, r["x"], r["Z_L"],
-                                            P_flash_field, T_flash_R, c7_props)
-                    mu_L = lbc_viscosity(comp_names, r["x"], rho_L,
-                                            T_flash_R, c7_props)
+                    rho_L = phase_density(flash_names, r["x"], r["Z_L"],
+                                            P_flash_field, T_flash_R, flash_c7)
+                    mu_L = lbc_viscosity(flash_names, r["x"], rho_L,
+                                            T_flash_R, flash_c7)
                     M_L = float(np.dot(r["x"], MW_arr))
                     with cols_prop[0]:
                         st.markdown("##### Liquid Phase")
@@ -3825,10 +4056,10 @@ elif fluid == "Compositional (EOS)":
                         cl[2].metric("MW", f"{M_L:.1f}")
 
                 if r["phase"] != "L" and r["y"].sum() > 0 and np.isfinite(r["Z_V"]):
-                    rho_V = phase_density(comp_names, r["y"], r["Z_V"],
-                                            P_flash_field, T_flash_R, c7_props)
-                    mu_V = lbc_viscosity(comp_names, r["y"], rho_V,
-                                            T_flash_R, c7_props)
+                    rho_V = phase_density(flash_names, r["y"], r["Z_V"],
+                                            P_flash_field, T_flash_R, flash_c7)
+                    mu_V = lbc_viscosity(flash_names, r["y"], rho_V,
+                                            T_flash_R, flash_c7)
                     M_V = float(np.dot(r["y"], MW_arr))
                     with cols_prop[1]:
                         st.markdown("##### Vapor Phase")
@@ -3840,7 +4071,7 @@ elif fluid == "Compositional (EOS)":
 
                 # Surface flash for STB/Mscf info
                 n_o, n_g, V_o, V_g, x_oil_sc, y_gas_sc = \
-                    standard_conditions_split(z_arr, comp_names, c7_props)
+                    standard_conditions_split(flash_z, flash_names, flash_c7)
                 if V_g > 0 and V_o > 0:
                     GOR = (V_g / V_o)   # scf/STB
                     st.info(f"**Surface flash of feed:** "
@@ -3886,22 +4117,68 @@ elif fluid == "Compositional (EOS)":
                                   U.to_field_T(Ts_user, unit_system)))
             st.session_state["sep_train"] = new_train
         with c_train[1]:
+            st.markdown("##### Stages")
+            _n_stages = len(st.session_state["sep_train"])
+            st.caption(f"Current train has **{_n_stages}** stage"
+                        f"{'s' if _n_stages != 1 else ''}.")
+            cb = st.columns(2)
+            with cb[0]:
+                if st.button("➕ Add stage", use_container_width=True,
+                              help="Append a stage. New stages are inserted "
+                                   "just before the stock-tank stage at a "
+                                   "pressure between the last two."):
+                    train = list(st.session_state["sep_train"])
+                    if len(train) >= 2:
+                        # Insert before the final (ST) stage at a midpoint P.
+                        p_prev = train[-2][0]
+                        p_last = train[-1][0]
+                        new_P = (p_prev + p_last) / 2.0
+                        new_T = (train[-2][1] + train[-1][1]) / 2.0
+                        train.insert(len(train) - 1, (new_P, new_T))
+                    else:
+                        # Only the ST stage exists — add a stage above it.
+                        p_last = train[-1][0] if train else 14.7
+                        train.insert(0, (max(p_last * 5, 100.0), 90.0))
+                    st.session_state["sep_train"] = train
+                    # Clear stale per-stage widget keys so inputs rebuild.
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("sepP_") or k.startswith("sepT_"):
+                            del st.session_state[k]
+                    st.rerun()
+            with cb[1]:
+                if st.button("➖ Remove last", use_container_width=True,
+                              disabled=_n_stages <= 1,
+                              help="Remove the stage just before the "
+                                   "stock-tank stage."):
+                    train = list(st.session_state["sep_train"])
+                    if len(train) > 1:
+                        # Remove the second-to-last stage, keep ST stage.
+                        train.pop(len(train) - 2)
+                    st.session_state["sep_train"] = train
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("sepP_") or k.startswith("sepT_"):
+                            del st.session_state[k]
+                    st.rerun()
+
             st.markdown("##### Presets")
             preset = st.selectbox(
                 "Load preset",
                 ["(keep current)", "3-stage (typical)", "2-stage (low-GOR)",
                  "1-stage (standard conditions only)"], key="sep_preset")
             if st.button("Apply preset", use_container_width=True):
+                _new = None
                 if preset == "3-stage (typical)":
-                    st.session_state["sep_train"] = [(800.0, 100.0),
-                                                     (100.0, 80.0),
-                                                     (14.7, 60.0)]
+                    _new = [(800.0, 100.0), (100.0, 80.0), (14.7, 60.0)]
                 elif preset == "2-stage (low-GOR)":
-                    st.session_state["sep_train"] = [(100.0, 80.0),
-                                                     (14.7, 60.0)]
+                    _new = [(100.0, 80.0), (14.7, 60.0)]
                 elif preset == "1-stage (standard conditions only)":
-                    st.session_state["sep_train"] = [(14.7, 60.0)]
-                st.rerun()
+                    _new = [(14.7, 60.0)]
+                if _new is not None:
+                    st.session_state["sep_train"] = _new
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("sepP_") or k.startswith("sepT_"):
+                            del st.session_state[k]
+                    st.rerun()
 
         if st.button("Run separator train", type="primary"):
             with st.spinner("Running multi-stage flash..."):
@@ -4204,6 +4481,11 @@ elif fluid == "Compositional (EOS)":
             meas_snap = tune_result.get("meas_snapshot",
                                          st.session_state["tuning_meas"])
 
+            render_stale_tuning_banner(
+                lab_data_changed(tune_result,
+                                  st.session_state.get("tuning_meas"),
+                                  snapshot_key="meas_snapshot"))
+
             cm = st.columns(3)
             cm[0].metric("Initial RMS", f"{tune_result['rms_initial']:.4f}")
             cm[1].metric("Final RMS",   f"{tune_result['rms_final']:.4f}")
@@ -4364,7 +4646,7 @@ elif fluid == "Compositional (EOS)":
                             "pvt_text": kw_text,
                             "density":  (rho_o_sc, rho_w_sc, rho_g_sc),
                         })
-                    deck = build_multi_region_deck(regions_data)
+                    deck = build_multi_region_deck(regions_data, units=eclipse_unit_choice)
                     st.code(deck, language="text")
                     st.download_button("Download multi-region deck (.INC)", deck,
                                         file_name="PVT_MULTIREGION.INC",
@@ -4887,34 +5169,68 @@ elif fluid == "❄️ Hydrate Likelihood":
 
         st.markdown("### Gas Properties")
 
-        # Option to load gas properties from a saved fluid
+        # Option to load gas properties from a saved fluid — including
+        # compositional fluids, whose gas SG is derived from the
+        # composition's molecular weight.
         gas_fluids = [
             (name, rec) for name, rec in
             st.session_state.get("fluid_registry", {}).items()
-            if rec.get("fluid_type") in ("dry_gas", "wet_gas", "oil")
+            if rec.get("fluid_type") in ("dry_gas", "wet_gas", "oil",
+                                          "compositional")
         ]
         fluid_source = st.selectbox(
             "Gas property source",
             ["Manual entry"] + [f"📁 {n}" for n, _ in gas_fluids],
-            help="Load gas SG (and H2S/CO2 if stored) from a fluid you saved "
-                 "in another branch's Tools section.")
+            help="Load gas SG (and H2S/CO2 if stored) from a fluid you "
+                 "saved in another branch — dry/wet gas, oil, or a "
+                 "compositional fluid.")
 
         loaded_sg = None; loaded_h2s = None; loaded_co2 = None
         if fluid_source != "Manual entry":
             sel_name = fluid_source.replace("📁 ", "")
             rec = dict(gas_fluids)[sel_name]
             params = rec.get("parameters", {})
-            loaded_sg = params.get("gas_sg")
-            loaded_h2s = params.get("H2S", 0.0)
-            loaded_co2 = params.get("CO2", 0.0)
-            st.caption(f"Loaded from **{sel_name}** ({summarize(rec)})")
+            if rec.get("fluid_type") == "compositional":
+                # Derive gas SG from the saved composition.
+                comp = params.get("composition", {})
+                try:
+                    from components import get_props, characterize_c7plus
+                    _c7 = None
+                    if comp.get("C7+", 0) > 0:
+                        _c7 = characterize_c7plus(
+                            MW_c7=float(params.get("C7_MW", 200.0)),
+                            SG_c7=float(params.get("C7_SG", 0.85)))
+                    tot = sum(v for v in comp.values() if v)
+                    mw_gas = 0.0
+                    for cn, frac in comp.items():
+                        if not frac or frac <= 0:
+                            continue
+                        mw_gas += (frac / tot) * get_props(cn, _c7)["MW"]
+                    loaded_sg = mw_gas / 28.9647   # SG = MW / MW_air
+                    loaded_h2s = comp.get("H2S", 0.0)
+                    loaded_co2 = comp.get("CO2", 0.0)
+                    st.caption(f"Loaded from compositional fluid "
+                                f"**{sel_name}** — gas SG = {loaded_sg:.3f} "
+                                f"derived from composition MW.")
+                except Exception as e:
+                    st.warning(f"Could not derive SG from composition: {e}")
+            else:
+                loaded_sg = params.get("gas_sg")
+                loaded_h2s = params.get("H2S", 0.0)
+                loaded_co2 = params.get("CO2", 0.0)
+                st.caption(f"Loaded from **{sel_name}** ({summarize(rec)})")
 
+        _sg_default = 0.65
+        if loaded_sg is not None:
+            _sg_default = float(min(max(loaded_sg, 0.55), 1.5))
         gas_sg_h = st.number_input(
             "Gas specific gravity (air = 1)",
-            value=float(loaded_sg) if loaded_sg is not None else 0.65,
-            min_value=0.55, max_value=1.0, step=0.01,
+            value=_sg_default,
+            min_value=0.55, max_value=1.5, step=0.01,
             help="Specific gravity of the gas phase. Heavier (richer) gas "
-                 "forms hydrates at lower P / higher T.")
+                 "forms hydrates at lower P / higher T. A value derived "
+                 "from a compositional oil may be high — check it is "
+                 "representative of the gas phase.")
         H2S_h = st.number_input(
             "H2S mol fraction",
             value=float(loaded_h2s) if loaded_h2s is not None else 0.0,
