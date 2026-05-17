@@ -83,6 +83,87 @@ def compute_all(phi):
     return {name: fn(phi) for name, fn in CORRELATIONS.items()}
 
 
+def recommend_correlation(rock_type, consolidation, depth_ft):
+    """Recommend a pore-volume-compressibility correlation.
+
+    The published correlations were each fit to a particular class of
+    rock; using one outside its intended lithology is a common source of
+    error. This returns the best-matching correlation name plus a short
+    rationale, given:
+
+      rock_type     : 'Sandstone', 'Limestone', 'Dolomite', 'Carbonate',
+                      'Chalk', or 'Unknown'
+      consolidation : 'Consolidated', 'Friable', or 'Unconsolidated'
+      depth_ft      : burial depth (used as a proxy for compaction state)
+
+    Returns a dict: {recommended, rationale, alternatives, cautions}.
+    """
+    rt = (rock_type or "").lower()
+    cons = (consolidation or "").lower()
+    cautions = []
+
+    # --- Lithology drives the primary choice ---
+    if "sand" in rt:
+        if "unconsol" in cons:
+            rec = "Hall (1953)"
+            why = ("Hall (1953) was developed across a broad porosity "
+                   "range and is the safer default for soft or "
+                   "unconsolidated sands, where Newman's consolidated-"
+                   "sandstone fit would under-predict compressibility.")
+        else:
+            rec = "Newman — Sandstone"
+            why = ("Newman's consolidated-sandstone correlation is fit "
+                   "directly to sandstone core data and is the standard "
+                   "choice for consolidated or friable sands.")
+        alts = ["Hall (1953)", "Horne polynomial"]
+    elif "lime" in rt or "chalk" in rt:
+        rec = "Newman — Limestone"
+        why = ("Newman's limestone correlation is fit to carbonate core "
+               "data; limestone and chalk compressibility differs "
+               "markedly from sandstone at the same porosity.")
+        alts = ["Carpenter-Spencer (carbonate)", "Hall (1953)"]
+        if "chalk" in rt:
+            cautions.append(
+                "Chalk can be highly compressible and prone to "
+                "compaction; core measurement is strongly advised — "
+                "correlations may significantly under-predict Cf.")
+    elif "dolo" in rt or "carbonate" in rt:
+        rec = "Carpenter-Spencer (carbonate)"
+        why = ("The Carpenter-Spencer carbonate correlation is intended "
+               "for dolomite and mixed carbonate lithologies.")
+        alts = ["Newman — Limestone", "Hall (1953)"]
+    else:
+        rec = "Hall (1953)"
+        why = ("With lithology unknown, Hall (1953) is the most general "
+               "correlation and a reasonable default — but identifying "
+               "the rock type would give a better estimate.")
+        alts = ["Newman — Sandstone", "Newman — Limestone"]
+        cautions.append("Rock type is unspecified — the recommendation "
+                         "is generic. Provide a lithology for a better "
+                         "match.")
+
+    # --- Depth / compaction caveats ---
+    if depth_ft is not None:
+        if depth_ft < 3000:
+            cautions.append(
+                f"Shallow burial ({depth_ft:.0f} ft): rock may be poorly "
+                "compacted, so true Cf can exceed correlation values.")
+        elif depth_ft > 12000:
+            cautions.append(
+                f"Deep burial ({depth_ft:.0f} ft): most correlations are "
+                "calibrated for moderate depths; at high net stress they "
+                "may over-predict Cf.")
+
+    if "unconsol" in cons:
+        cautions.append(
+            "Unconsolidated rock is highly stress-sensitive — a single "
+            "constant Cf is a rough approximation; consider a "
+            "pressure-dependent ROCKTAB table.")
+
+    return {"recommended": rec, "rationale": why,
+            "alternatives": alts, "cautions": cautions}
+
+
 def rock_keyword(Pref_psia, Cf_per_psi):
     """
     Build the ECLIPSE ROCK keyword.

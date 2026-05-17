@@ -20,6 +20,16 @@ By **Merouane Hamdani** · MIT License · Early-phase screening tool
   conversion families (pressure, T, GOR, Bg, Rv, Cw, density, CGR).
 - **Validation suite is now 51 checks** (was 38) — `python test_validation.py`.
 
+## Maintainability — ui_helpers.py
+
+The pure, self-contained Streamlit rendering helpers (`render_tornado_chart`,
+`render_property_plots`, `render_eclipse_qc`, `render_depth_profile`,
+`render_input_correlation`, `line_chart_plotly`, `styled_dataframe`, plus the
+tuning-staleness helpers) have been extracted into `ui_helpers.py`. These
+functions depend only on their arguments — no application global state — so
+they can be reasoned about and tested in isolation. `pvt_app.py` imports them
+by name, so all call sites are unchanged.
+
 ## How to run
 
 ```
