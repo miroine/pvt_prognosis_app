@@ -193,6 +193,48 @@ with st.sidebar:
         eclipse_unit_choice = "FIELD"   # default unused
     include_water = st.checkbox("Add PVTW to ECLIPSE export", value=True)
 
+    # ---- Project session save / load ----
+    st.markdown("---")
+    st.markdown("### 💾 Project session")
+    st.caption(
+        "Save the whole session — saved fluids, tuning results and "
+        "settings — to a file you can reload another day. The registry "
+        "otherwise lives only in this browser tab.")
+    from fluid_registry import export_session, import_session
+
+    _tuning_keys = ["oil_tune_result", "dg_tune_result", "wg_tune_result",
+                    "comp_tune_result"]
+    _tuning_now = {k: st.session_state.get(k) for k in _tuning_keys
+                   if st.session_state.get(k)}
+    _settings_now = {"unit_system": unit_system}
+    _proj_json = export_session(
+        st.session_state.get("fluid_registry", {}),
+        tuning_results=_tuning_now, settings=_settings_now)
+    st.download_button(
+        "⬇ Save project (.json)", _proj_json,
+        file_name="pvt_studio_project.json", mime="application/json",
+        use_container_width=True)
+
+    _proj_up = st.file_uploader("⬆ Load project (.json)", type=["json"],
+                                 key="proj_upload")
+    if _proj_up is not None:
+        if st.button("Load this project", use_container_width=True,
+                      key="proj_load_btn"):
+            try:
+                _res = import_session(_proj_up.getvalue().decode("utf-8"))
+            except Exception as e:
+                _res = {"ok": False, "message": f"Could not read file: {e}",
+                        "fluid_registry": {}}
+            if _res["ok"]:
+                st.session_state["fluid_registry"] = _res["fluid_registry"]
+                for _k, _v in (_res.get("tuning_results") or {}).items():
+                    st.session_state[_k] = _v
+                st.success(_res["message"] + " — "
+                            f"{len(_res['fluid_registry'])} fluid(s) loaded.")
+                st.rerun()
+            else:
+                st.error(_res["message"])
+
     # Footer
     st.markdown("---")
     st.markdown(
@@ -5141,7 +5183,14 @@ elif fluid == "❄️ Hydrate Likelihood":
                           inhibitor_concentration_hammerschmidt,
                           flowline_temperature_profile, flowline_hydrate_margin,
                           minimum_flow_no_hydrate,
-                          interpolate_ambient_from_survey)
+                          interpolate_ambient_from_survey,
+                          single_phase_pressure_drop,
+                          salinity_hydrate_shift,
+                          hydrate_temperature_with_salinity,
+                          inhibitor_injection_rate,
+                          hydrate_temperature_towler,
+                          hydrate_temperature_consensus,
+                          subcooling_risk)
     import plotly.graph_objects as go
 
     st.markdown("## Hydrate Formation Likelihood")
@@ -5248,6 +5297,16 @@ elif fluid == "❄️ Hydrate Likelihood":
             min_value=0.0, max_value=0.5, step=0.01, format="%.4f",
             help="CO2 modestly promotes hydrates: each 1% lowers P_hyd by ~1.5%.")
 
+        st.markdown("### Produced water")
+        salinity_h = st.number_input(
+            "Produced-water salinity (wt % NaCl-equivalent)",
+            value=0.0, min_value=0.0, max_value=25.0, step=1.0,
+            key="hyd_salinity",
+            help="Dissolved salt is a natural thermodynamic inhibitor — "
+                 "it lowers the hydrate-formation temperature. Leaving "
+                 "this at 0 is conservative (it will over-predict "
+                 "inhibitor demand for a salty stream).")
+
         st.markdown("### Safety Margin")
         margin_user = st.number_input(
             f"Warning margin ({L['P']})",
@@ -5255,7 +5314,9 @@ elif fluid == "❄️ Hydrate Likelihood":
             min_value=0.0,
             help="A point this far from the hydrate boundary is flagged "
                  "'marginal' rather than fully 'safe' or 'in-zone'.")
-        margin_psia = U.to_field_P(margin_user, unit_system) - U.to_field_P(0.0, unit_system) if unit_system == "SI" else margin_user
+        # Pressure is a pure scaling (no offset), so a margin (a delta)
+        # converts the same way as an absolute pressure.
+        margin_psia = U.to_field_P(margin_user, unit_system)
 
     # Run the assessment
     risk = assess_hydrate_risk(T_op_F, P_op_psia, gas_sg_h, H2S_h, CO2_h,
@@ -5291,6 +5352,52 @@ elif fluid == "❄️ Hydrate Likelihood":
 
         st.info(risk["message"])
 
+        # ---- Two-correlation consensus + subcooling ----
+        cons = hydrate_temperature_consensus(
+            P_op_psia, gas_sg_h, H2S_h, CO2_h, salinity_wt_pct=salinity_h)
+        if not np.isnan(cons["T_mean"]):
+            st.markdown("#### Hydrate temperature — correlation consensus")
+            cc = st.columns(3)
+            if not np.isnan(cons["T_makogon"]):
+                cc[0].metric("Makogon (1981)",
+                             f"{U.to_user_T(cons['T_makogon'], unit_system):.1f} {L['T']}")
+            if not np.isnan(cons["T_towler"]):
+                cc[1].metric("Towler & Mokhatab",
+                             f"{U.to_user_T(cons['T_towler'], unit_system):.1f} {L['T']}")
+            if not np.isnan(cons["spread_F"]):
+                cc[2].metric("Correlation spread",
+                             f"{U.to_user_deltaT(cons['spread_F'], unit_system):.1f}")
+            if not np.isnan(cons["spread_F"]) and cons["spread_F"] > 5.0:
+                st.caption("⚠️ The two correlations differ by more than "
+                            "5° — treat the hydrate temperature as "
+                            "uncertain and lean on the more conservative "
+                            "(higher) value.")
+            else:
+                st.caption("The two independent correlations agree "
+                            "closely — reasonable confidence in the "
+                            "hydrate temperature.")
+            if salinity_h > 0:
+                st.caption(f"Both values include a "
+                            f"{U.to_user_deltaT(salinity_hydrate_shift(salinity_h), unit_system):.1f}"
+                            f"° depression credited to "
+                            f"{salinity_h:.0f} wt% produced-water salinity.")
+
+            # Subcooling — the hydrate driving force
+            sc = subcooling_risk(T_op_F, cons["T_mean"])
+            if not np.isnan(sc["subcooling_F"]):
+                _sc_color = {"None": "#9DBA00", "Low": "#9DBA00",
+                              "Moderate": "#E0A800",
+                              "High": "#EB0037"}.get(sc["level"], "#888")
+                st.markdown(
+                    f"<div style='background:{_sc_color}22; "
+                    f"border-left:5px solid {_sc_color}; "
+                    f"padding:0.6rem 1rem; border-radius:4px;'>"
+                    f"<b style='color:{_sc_color};'>Subcooling: "
+                    f"{U.to_user_deltaT(sc['subcooling_F'], unit_system):.1f}"
+                    f"° &nbsp;—&nbsp; {sc['level']} driving force</b><br>"
+                    f"<span style='color:#333;'>{sc['message']}</span>"
+                    f"</div>", unsafe_allow_html=True)
+
         # Key metrics
         if not np.isnan(risk["P_hydrate"]):
             cm = st.columns(3)
@@ -5306,9 +5413,7 @@ elif fluid == "❄️ Hydrate Likelihood":
                          "operating pressure.")
             else:
                 cm[1].metric(f"T_hydrate", "—")
-            margin_p_user = U.to_user_P(risk["margin_psia"], unit_system) - \
-                            U.to_user_P(0, unit_system) if unit_system == "SI" \
-                            else risk["margin_psia"]
+            margin_p_user = U.to_user_P(risk["margin_psia"], unit_system)
             cm[2].metric(
                 f"P margin ({L['P']})",
                 f"{margin_p_user:+.0f}",
@@ -5501,44 +5606,104 @@ elif fluid == "❄️ Hydrate Likelihood":
     st.dataframe(pd.DataFrame(comp_rows), use_container_width=True,
                  hide_index=True)
 
+    # ---- Inhibitor injection RATE ----
+    st.markdown("---")
+    st.markdown("### Inhibitor injection rate")
+    st.markdown(
+        "The weight-percent above tells you the *concentration* needed in "
+        "the aqueous phase. What an operator actually meters is a "
+        "**volume rate** — this converts the required concentration to "
+        "gallons (or barrels) of inhibitor per day for a given "
+        "produced-water rate.")
+    irc = st.columns(3)
+    with irc[0]:
+        inj_shift_user = st.number_input(
+            f"Required hydrate-T depression ({L['T']})",
+            value=(15.0 if unit_system == "Field" else 15.0 * 5.0 / 9.0),
+            min_value=0.0, key="inj_shift",
+            help="How far the hydrate temperature must be pushed down — "
+                 "typically the subcooling plus a design margin.")
+        # A temperature DIFFERENCE converts without the 32° offset.
+        inj_shift_F = (inj_shift_user if unit_system == "Field"
+                        else inj_shift_user * 9.0 / 5.0)
+    with irc[1]:
+        inj_water_user = st.number_input(
+            f"Produced free-water rate ({'STB/d' if unit_system=='Field' else 'Sm³/d'})",
+            value=(500.0 if unit_system == "Field" else 79.5),
+            min_value=0.0, key="inj_water")
+        inj_water_bbl = (inj_water_user if unit_system == "Field"
+                          else inj_water_user / 0.158987)
+    with irc[2]:
+        inj_inhibitor = st.selectbox(
+            "Inhibitor", ["methanol", "MEG", "DEG", "TEG"],
+            key="inj_inhibitor")
+
+    inj = inhibitor_injection_rate(
+        inj_shift_F, inj_water_bbl, inhibitor=inj_inhibitor,
+        salinity_wt_pct=salinity_h)
+
+    if np.isnan(inj["rate_gal_day"]):
+        st.warning(f"⚠️ {inj['note']}")
+    elif inj["rate_gal_day"] == 0.0:
+        st.success(f"✓ {inj['note']}")
+    else:
+        im = st.columns(3)
+        im[0].metric("Inhibitor concentration",
+                     f"{inj['wt_pct_required']:.1f} wt%")
+        im[1].metric("Injection rate", f"{inj['rate_gal_day']:,.0f} gal/d")
+        im[2].metric("Injection rate", f"{inj['rate_bbl_day']:,.1f} bbl/d")
+        if salinity_h > 0:
+            st.caption(
+                f"Produced-water salinity ({salinity_h:.0f} wt%) already "
+                f"supplies part of the duty — the inhibitor only has to "
+                f"provide the remaining "
+                f"{U.to_user_deltaT(inj['net_shift_F'], unit_system):.1f}° "
+                f"of depression.")
+        st.caption(inj["note"])
+
     # ---- Notes ----
     st.markdown("---")
     with st.expander("📖 About the Makogon correlation and limitations"):
         st.markdown(r"""
-The Makogon hydrate equilibrium curve is:
+The Makogon (1981) hydrate equilibrium curve used here is:
+""")
+        st.latex(r"\log_{10}(P_{\text{MPa}}) = \beta + 0.0497\,(T + \kappa T^2) - 1")
+        st.markdown(r"""
+with $T$ in °C, and $\beta$ and $\kappa$ functions of gas gravity $g$:
+$\beta = 2.681 - 3.811\,g + 1.679\,g^2$ and
+$\kappa = -0.006 + 0.011\,g + 0.011\,g^2$.
 
-""")
-        st.latex(r"\log_{10}(P) = \beta + 0.0497 \cdot (T - T_0) + 0.00034 \cdot (T - T_0)^2")
-        st.markdown(r"""
-where $P$ is in MPa, $T$ in °C, $T_0$ = 273.15 K (0 °C), and
-""")
-        st.latex(r"\beta = 2.681 - 3.811 \cdot \gamma_g + 1.679 \cdot \gamma_g^2")
-        st.markdown(r"""
-with $\gamma_g$ the gas specific gravity (air = 1).
+A second correlation, **Towler & Mokhatab (2005)**, is evaluated
+alongside it as an independent cross-check; when the two disagree by
+more than a few degrees the hydrate temperature should be treated as
+uncertain.
 
 **Validity:**
-- Temperature: 32 °F (0 °C) to ~75 °F (24 °C)
+- Temperature: roughly 32 °F (0 °C) to ~75 °F (24 °C)
 - Gas SG: 0.55 to 1.0
-- Sweet natural gas (correction applied for moderate H2S, CO2)
+- Sweet natural gas (an empirical correction is applied for moderate
+  H2S and CO2)
 
 **Limitations:**
-- Single-component (methane-dominated) model — real multi-component
-  natural gas can deviate by 100–300 psia.
-- The sour-gas corrections here are empirical first-order; for systems with
-  > 15% H2S use a rigorous flash-based hydrate model (CSMHyd, PVTsim,
-  Multiflash, etc.).
-- Does not account for salt content of co-produced water (salt depresses
-  hydrate formation T by ~1–2 °F per 1 wt% NaCl).
-- The Hammerschmidt inhibitor equation is valid for ΔT < 40 °F. For deeper
-  suppression, use the Nielsen-Bucklin equation.
+- Gas-gravity correlations are screening tools — a real multi-component
+  natural gas can deviate by 100–300 psia from the curve.
+- The sour-gas corrections are empirical and first-order; for systems
+  with more than ~15% H2S use a rigorous flash-based hydrate model
+  (CSMHyd, PVTsim, Multiflash).
+- Produced-water salinity is now credited as a natural inhibitor via the
+  Hammerschmidt equation — but very high salinity (> 20 wt%) is outside
+  the model's reliable range.
+- The Hammerschmidt inhibitor equation is valid for moderate suppression
+  (ΔT below ~40 °F). For deeper suppression use the Nielsen-Bucklin
+  equation.
 
 **References:**
 - Makogon, Y.F. (1981). *Hydrates of Natural Gas*. PennWell.
+- Towler, B.F. & Mokhatab, S. (2005). Quickly estimate hydrate
+  formation conditions in natural gases. *Hydrocarbon Processing*.
 - Sloan, E.D. & Koh, C.A. (2007). *Clathrate Hydrates of Natural Gases*.
 - Hammerschmidt, E.G. (1934). *Formation of Gas Hydrates in Natural Gas
   Transmission Lines*. Ind. Eng. Chem.
-- Bahadori, A. & Vuthaluru, H.B. (2009). New correlation for hydrate
-  formation conditions. *J. Nat. Gas Sci. Eng.*
 """)
 
     # ---- Subsea shutdown / cooldown time ----
@@ -5551,6 +5716,27 @@ with $\gamma_g$ the gas specific gravity (air = 1).
         "response protocols (when to inject inhibitor, when to depressurize)."
     )
     from hydrate import cooldown_time_to_hydrate, cooldown_curve
+
+    # Offer to reuse the geometry entered in the Flowline Check below.
+    # The flowline widgets store their values in session_state, so once
+    # the user has filled that section in, those values are available
+    # here on the next rerun.
+    _fl_keys_ready = all(k in st.session_state
+                          for k in ("fl_id", "fl_wall", "fl_U", "fl_tin",
+                                     "fl_cp"))
+    use_fl_geom = False
+    if _fl_keys_ready:
+        use_fl_geom = st.checkbox(
+            "↪ Use the geometry & inlet conditions from the Flowline "
+            "Check below", value=False, key="cd_use_flowline",
+            help="Reuse the flowline ID, wall/insulation, U-value, inlet "
+                 "temperature and heat capacity entered in the Flowline "
+                 "Hydrate Check section, so the shut-in cooldown is "
+                 "consistent with the operating analysis.")
+        if use_fl_geom:
+            st.caption("Using the flowline section's geometry and inlet "
+                        "conditions — the inputs below are overridden.")
+
     cs1, cs2, cs3 = st.columns(3)
     with cs1:
         T_amb_user = st.number_input(f"Seabed/ambient T ({L['T']})",
@@ -5560,19 +5746,51 @@ with $\gamma_g$ the gas specific gravity (air = 1).
                                           value=T_op_user,
                                           help="Fluid T at the moment of shutdown.")
     with cs2:
-        U_pipe = st.number_input("U (BTU/hr/ft²/°F)", value=2.0, min_value=0.1, max_value=20.0,
-                                   help="Overall heat-transfer coefficient. "
-                                        "1-3 for well-insulated, 5-15 for bare pipe.")
-        D_pipe_in = st.number_input("Pipe OD (inches)", value=8.0, min_value=2.0, max_value=36.0,
-                                      help="Outer diameter of the flowline.")
+        _FLc = U.flowline_labels(unit_system)
+        _U_def_cd = U.to_user_Uvalue(2.0, unit_system)
+        U_pipe_user = st.number_input(
+            f"U ({_FLc['U']})", value=_U_def_cd,
+            min_value=U.to_user_Uvalue(0.1, unit_system),
+            max_value=U.to_user_Uvalue(20.0, unit_system),
+            help="Overall heat-transfer coefficient. ~1-3 BTU/(hr·ft²·°F) "
+                 "for well-insulated, 5-15 for bare pipe.")
+        U_pipe = U.to_field_Uvalue(U_pipe_user, unit_system)
+        _D_def_cd = U.to_user_diameter(8.0, unit_system)
+        D_pipe_user = st.number_input(
+            f"Pipe OD ({_FLc['D']})", value=_D_def_cd,
+            min_value=U.to_user_diameter(2.0, unit_system),
+            max_value=U.to_user_diameter(36.0, unit_system),
+            help="Outer diameter of the flowline.")
+        D_pipe_in = U.to_field_diameter(D_pipe_user, unit_system)
     with cs3:
-        rho_fluid = st.number_input("Fluid density (lb/ft³)", value=50.0,
-                                       min_value=20.0, max_value=100.0)
-        cp_fluid = st.number_input("Cp (BTU/lb/°F)", value=0.5,
-                                      min_value=0.1, max_value=1.5,
-                                      help="Specific heat: oil ≈ 0.5, water ≈ 1.0.")
+        _rho_def_cd = U.to_user_rho(50.0, unit_system)
+        rho_fluid_user = st.number_input(
+            f"Fluid density ({_FLc['rho']})", value=_rho_def_cd,
+            min_value=U.to_user_rho(20.0, unit_system),
+            max_value=U.to_user_rho(100.0, unit_system))
+        rho_fluid = U.to_field_rho(rho_fluid_user, unit_system)
+        _cp_def_cd = U.to_user_cp(0.5, unit_system)
+        cp_fluid_user = st.number_input(
+            f"Cp ({_FLc['cp']})", value=_cp_def_cd,
+            min_value=U.to_user_cp(0.1, unit_system),
+            max_value=U.to_user_cp(1.5, unit_system),
+            help="Specific heat: oil ≈ 0.5 BTU/(lb·°F) ≈ 2.1 kJ/(kg·K), "
+                 "water ≈ 1.0 ≈ 4.2.")
+        cp_fluid = U.to_field_cp(cp_fluid_user, unit_system)
     T_amb_F = U.to_field_T(T_amb_user, unit_system)
     T_op_init_F = U.to_field_T(T_op_init_user, unit_system)
+
+    # When linked, override the cooldown inputs with the flowline values.
+    if use_fl_geom:
+        _fl_id = float(st.session_state["fl_id"])
+        _fl_wall = float(st.session_state["fl_wall"])
+        D_pipe_in = _fl_id + 2.0 * _fl_wall          # OD in inches
+        U_pipe = float(st.session_state["fl_U"])     # BTU/(hr·ft²·°F)
+        cp_fluid = float(st.session_state["fl_cp"])
+        # Inlet temperature from the flowline section (stored in display
+        # units) becomes the shut-in starting temperature.
+        T_op_init_F = U.to_field_T(float(st.session_state["fl_tin"]),
+                                    unit_system)
 
     cd = cooldown_time_to_hydrate(
         T_op_F=T_op_init_F, P_op_psia=P_op_psia, T_ambient_F=T_amb_F,
@@ -5655,17 +5873,28 @@ with $\gamma_g$ the gas specific gravity (air = 1).
 
     fl_in, fl_out = st.columns([1, 2])
 
+    # Display unit labels for the flowline section.
+    FL = U.flowline_labels(unit_system)
+
     with fl_in:
         st.markdown("### Flowline geometry")
-        fl_ID_in = st.number_input(
-            "Inner diameter (inch)", value=10.0, min_value=1.0,
-            max_value=60.0, step=0.5, key="fl_id",
+        _id_default = U.to_user_diameter(10.0, unit_system)
+        fl_ID_user = st.number_input(
+            f"Inner diameter ({FL['D']})", value=_id_default,
+            min_value=U.to_user_diameter(1.0, unit_system),
+            max_value=U.to_user_diameter(60.0, unit_system),
+            key="fl_id",
             help="Pipe internal diameter — sets the flow area.")
-        fl_wall_in = st.number_input(
-            "Wall + insulation thickness (inch)", value=1.0,
-            min_value=0.0, max_value=12.0, step=0.25, key="fl_wall",
+        fl_ID_in = U.to_field_diameter(fl_ID_user, unit_system)
+        _wall_default = U.to_user_diameter(1.0, unit_system)
+        fl_wall_user = st.number_input(
+            f"Wall + insulation thickness ({FL['D']})", value=_wall_default,
+            min_value=0.0,
+            max_value=U.to_user_diameter(12.0, unit_system),
+            key="fl_wall",
             help="Added to the ID to get the outer diameter used for "
                  "the heat-transfer area.")
+        fl_wall_in = U.to_field_diameter(fl_wall_user, unit_system)
         fl_OD_ft = (fl_ID_in + 2.0 * fl_wall_in) / 12.0
 
         if unit_system == "Field":
@@ -5684,15 +5913,18 @@ with $\gamma_g$ the gas specific gravity (air = 1).
                               "Surface / above-ground", "Riser"],
             key="fl_config",
             help="Used only to suggest a typical U-value below.")
-        _U_suggest = {"Subsea tieback": 2.0, "Buried onshore": 0.5,
-                      "Surface / above-ground": 8.0, "Riser": 4.0}
-        fl_U = st.number_input(
-            "U-value, BTU/(hr·ft²·°F)",
-            value=_U_suggest[fl_config], min_value=0.05, step=0.25,
+        # Suggested U-values in FIELD units BTU/(hr.ft2.F).
+        _U_suggest_field = {"Subsea tieback": 2.0, "Buried onshore": 0.5,
+                             "Surface / above-ground": 8.0, "Riser": 4.0}
+        _U_def = U.to_user_Uvalue(_U_suggest_field[fl_config], unit_system)
+        fl_U_user = st.number_input(
+            f"U-value, {FL['U']}",
+            value=_U_def, min_value=U.to_user_Uvalue(0.05, unit_system),
             key="fl_U",
             help=f"Overall heat-transfer coefficient. Typical for "
-                 f"'{fl_config}': ~{_U_suggest[fl_config]}. Lower = "
+                 f"'{fl_config}': ~{_U_def:.2f} {FL['U']}. Lower = "
                  f"better insulated = warmer line.")
+        fl_U = U.to_field_Uvalue(fl_U_user, unit_system)
 
         st.markdown("### Fluid & operating conditions")
         fl_Tin_user = st.number_input(
@@ -5704,10 +5936,14 @@ with $\gamma_g$ the gas specific gravity (air = 1).
             value=U.to_user_P(1500.0, unit_system),
             min_value=U.to_user_P(50.0, unit_system), key="fl_pop")
         fl_Pop_psia = U.to_field_P(fl_Pop_user, unit_system)
-        fl_cp = st.number_input(
-            "Fluid heat capacity cₚ, BTU/(lb·°F)", value=0.55,
-            min_value=0.1, max_value=1.2, step=0.05, key="fl_cp",
-            help="~0.5–0.6 for typical hydrocarbon liquids, lower for gas.")
+        _cp_def = U.to_user_cp(0.55, unit_system)
+        fl_cp_user = st.number_input(
+            f"Fluid heat capacity cₚ, {FL['cp']}", value=_cp_def,
+            min_value=U.to_user_cp(0.1, unit_system),
+            max_value=U.to_user_cp(1.2, unit_system), key="fl_cp",
+            help="~0.5–0.6 BTU/(lb·°F) ≈ 2.1–2.5 kJ/(kg·K) for typical "
+                 "hydrocarbon liquids, lower for gas.")
+        fl_cp = U.to_field_cp(fl_cp_user, unit_system)
 
         st.markdown("### Ambient temperature")
         fl_amb_mode = st.radio(
@@ -5799,34 +6035,54 @@ with $\gamma_g$ the gas specific gravity (air = 1).
             elif mf["m_dot_min"] == 0.0:
                 st.success(f"✓ {mf['note']}")
             else:
-                _m = mf["m_dot_min"]
-                # Convert lb/hr to STB/d using a nominal oil density.
-                _rho = 53.0   # lb/ft3, nominal
-                _bbl_d = _m / _rho / 5.615 * 24.0
+                _m = mf["m_dot_min"]   # lb/hr (model's internal unit)
+                # Mass-rate display unit.
+                _LBHR_PER_KGHR = 2.2046226
+                if unit_system == "SI":
+                    _m_disp = _m / _LBHR_PER_KGHR
+                    _m_unit = "kg/hr"
+                else:
+                    _m_disp = _m
+                    _m_unit = "lb/hr"
+                # Volumetric equivalent at a nominal liquid density.
+                _rho_field = 53.0   # lb/ft3, nominal
+                _bbl_d = _m / _rho_field / 5.615 * 24.0   # STB/d
+                _q_disp = U.to_user_qliq(_bbl_d, unit_system)
+                _q_unit = "Sm³/d" if unit_system == "SI" else "STB/d"
+                _rho_nom_disp = U.to_user_rho(_rho_field, unit_system)
+                _rho_nom_unit = "kg/m³" if unit_system == "SI" else "lb/ft³"
                 cflm = st.columns(2)
                 cflm[0].metric("Minimum mass flow",
-                               f"{_m:,.0f} lb/hr")
-                cflm[1].metric("≈ Volumetric (nominal 53 lb/ft³)",
-                               f"{_bbl_d:,.0f} STB/d")
+                               f"{_m_disp:,.0f} {_m_unit}")
+                cflm[1].metric(f"≈ Volumetric (nominal "
+                               f"{_rho_nom_disp:.0f} {_rho_nom_unit})",
+                               f"{_q_disp:,.0f} {_q_unit}")
                 st.warning(
-                    f"⚠️ Below roughly **{_m:,.0f} lb/hr** the flowline "
-                    f"cools into the hydrate region. Operating above this "
-                    f"rate keeps the whole line warmer than the "
-                    f"hydrate-formation temperature.")
+                    f"⚠️ Below roughly **{_m_disp:,.0f} {_m_unit}** the "
+                    f"flowline cools into the hydrate region. Operating "
+                    f"above this rate keeps the whole line warmer than "
+                    f"the hydrate-formation temperature.")
                 st.caption(
-                    "The volumetric estimate uses a nominal liquid "
-                    "density of 53 lb/ft³ — adjust mentally for your "
-                    "actual fluid.")
+                    f"The volumetric estimate uses a nominal liquid "
+                    f"density of {_rho_nom_disp:.0f} {_rho_nom_unit} — "
+                    f"adjust mentally for your actual fluid.")
 
             # ---- Temperature profile at a chosen flow rate ----
             st.markdown("### Temperature profile along the line")
-            _default_rate = (mf["m_dot_min"] * 1.5
-                              if (mf["feasible"] and mf["m_dot_min"])
-                              else 5.0e5)
-            fl_rate = st.number_input(
-                "Mass flow rate to plot (lb/hr)",
-                value=float(f"{_default_rate:.0f}"),
-                min_value=1.0e2, step=1.0e4, key="fl_plot_rate")
+            _LBHR_PER_KGHR = 2.2046226
+            _default_rate_field = (mf["m_dot_min"] * 1.5
+                                    if (mf["feasible"] and mf["m_dot_min"])
+                                    else 5.0e5)
+            _mrate_unit = "kg/hr" if unit_system == "SI" else "lb/hr"
+            _default_rate_disp = (_default_rate_field / _LBHR_PER_KGHR
+                                   if unit_system == "SI"
+                                   else _default_rate_field)
+            fl_rate_user = st.number_input(
+                f"Mass flow rate to plot ({_mrate_unit})",
+                value=float(f"{_default_rate_disp:.0f}"),
+                min_value=1.0, step=1.0e4, key="fl_plot_rate")
+            fl_rate = (fl_rate_user * _LBHR_PER_KGHR
+                        if unit_system == "SI" else fl_rate_user)
             prof = flowline_temperature_profile(
                 stations, fl_Tin_F, fl_rate, fl_cp, fl_U, fl_OD_ft,
                 ambient_profile)
@@ -5866,22 +6122,197 @@ with $\gamma_g$ the gas specific gravity (air = 1).
             # Verdict for this rate
             if marg["safe"] is True:
                 st.success(
-                    f"✓ At {fl_rate:,.0f} lb/hr the line stays above the "
-                    f"hydrate temperature everywhere — minimum margin "
+                    f"✓ At {fl_rate_user:,.0f} {_mrate_unit} the line "
+                    f"stays above the hydrate temperature everywhere — "
+                    f"minimum margin "
                     f"{U.to_user_deltaT(marg['min_margin'], unit_system):.1f}"
-                    f" {L['T'][-2] if len(L['T'])>1 else '°'}.")
+                    f"°.")
             elif marg["safe"] is False:
                 _xm = (marg["min_station"] if unit_system == "Field"
                         else marg["min_station"] * 0.3048 / 1000.0)
                 st.error(
-                    f"⛔ At {fl_rate:,.0f} lb/hr the line enters the "
-                    f"hydrate region. Worst point is {_xm:,.0f} "
+                    f"⛔ At {fl_rate_user:,.0f} {_mrate_unit} the line "
+                    f"enters the hydrate region. Worst point is "
+                    f"{_xm:,.0f} "
                     f"{'ft' if unit_system=='Field' else 'km'} from the "
                     f"inlet, {abs(U.to_user_deltaT(marg['min_margin'], unit_system)):.1f}"
                     f"° inside the hydrate envelope.")
             else:
                 st.info("Hydrate temperature could not be evaluated at "
                          "this pressure (outside correlation range).")
+
+            # ============================================================
+            # PRESSURE LOSS  &  SLUG-FLOW SCREENING
+            # ============================================================
+            st.markdown("---")
+            st.markdown("### Pressure loss & slug-flow screening")
+            st.caption(
+                "Friction + elevation pressure loss along the line, and a "
+                "flow-regime / slugging assessment. Screening models — "
+                "Darcy-Weisbach friction with a Haaland friction factor, "
+                "homogeneous two-phase mixture, and a Froude-number flow-"
+                "pattern indicator. For design, use a Beggs-Brill or OLGA "
+                "calculation.")
+
+            fl_phase = st.radio(
+                "Flow type", ["Single-phase liquid", "Two-phase (gas + liquid)"],
+                horizontal=True, key="fl_phase_mode")
+
+            # Net elevation change over the whole line (outlet TVD - inlet).
+            if fl_amb_mode.startswith("From") and survey_ok:
+                _elev_change_ft = tvd_ft[-1] - tvd_ft[0]
+            else:
+                _elev_change_ft = 0.0
+            with st.expander("Pipe & fluid properties for pressure loss",
+                              expanded=True):
+                pc = st.columns(3)
+                with pc[0]:
+                    fl_rough = st.number_input(
+                        "Pipe roughness / diameter", value=0.0006,
+                        format="%.5f", key="fl_rough",
+                        help="Relative roughness (dimensionless) — "
+                             "~0.0006 for commercial steel, lower for "
+                             "coated pipe.")
+                    fl_elev = st.number_input(
+                        f"Net elevation change, outlet − inlet ({FL['L']})",
+                        value=(_elev_change_ft if unit_system == "Field"
+                                else _elev_change_ft / 3.280839895),
+                        key="fl_elev",
+                        help="Positive = outlet deeper than inlet "
+                             "(adds pressure). Auto-filled from the "
+                             "survey when one is provided.")
+                fl_elev_ft = U.to_field_length(fl_elev, unit_system)
+                with pc[1]:
+                    _rho_l_def = U.to_user_rho(53.0, unit_system)
+                    fl_rho_liq_user = st.number_input(
+                        f"Liquid density ({FL['rho']})", value=_rho_l_def,
+                        min_value=U.to_user_rho(20.0, unit_system),
+                        max_value=U.to_user_rho(80.0, unit_system),
+                        key="fl_rho_l")
+                    fl_rho_liq = U.to_field_rho(fl_rho_liq_user, unit_system)
+                    fl_mu_liq = st.number_input(
+                        "Liquid viscosity (cP)", value=2.0,
+                        min_value=0.1, max_value=1000.0, key="fl_mu_l",
+                        help="Centipoise — the same in both unit systems.")
+                with pc[2]:
+                    if fl_phase.startswith("Two"):
+                        _rho_g_def = U.to_user_rho(6.0, unit_system)
+                        fl_rho_gas_user = st.number_input(
+                            f"Gas density at line P,T ({FL['rho']})",
+                            value=_rho_g_def,
+                            min_value=U.to_user_rho(0.1, unit_system),
+                            max_value=U.to_user_rho(30.0, unit_system),
+                            key="fl_rho_g")
+                        fl_rho_gas = U.to_field_rho(fl_rho_gas_user,
+                                                     unit_system)
+                        fl_mu_gas = st.number_input(
+                            "Gas viscosity (cP)", value=0.018,
+                            min_value=0.005, max_value=0.1,
+                            format="%.4f", key="fl_mu_g")
+                        fl_Zg = st.number_input(
+                            "Gas Z-factor", value=0.90,
+                            min_value=0.3, max_value=1.3, key="fl_zg")
+
+                rc = st.columns(2)
+                with rc[0]:
+                    _qliq_def = U.to_user_qliq(15000.0, unit_system)
+                    fl_qliq_user = st.number_input(
+                        f"Liquid rate ({FL['qliq']})", value=_qliq_def,
+                        min_value=U.to_user_qliq(1.0, unit_system),
+                        key="fl_qliq")
+                    fl_qliq = U.to_field_qliq(fl_qliq_user, unit_system)
+                with rc[1]:
+                    if fl_phase.startswith("Two"):
+                        _qgas_def = U.to_user_qgas(6000.0, unit_system)
+                        fl_qgas_user = st.number_input(
+                            f"Gas rate ({FL['qgas']}, standard)",
+                            value=_qgas_def, min_value=0.0, key="fl_qgas")
+                        fl_qgas = U.to_field_qgas(fl_qgas_user, unit_system)
+                    fl_incl = st.number_input(
+                        "Pipe inclination from horizontal (deg)",
+                        value=0.0, min_value=-90.0, max_value=90.0,
+                        key="fl_incl",
+                        help="Positive = uphill. Uphill sections are "
+                             "much more slug-prone.")
+
+            # ---- Pressure-loss calculation ----
+            if fl_phase.startswith("Single"):
+                pl = single_phase_pressure_drop(
+                    fl_qliq, fl_rho_liq, fl_mu_liq, fl_ID_in, fl_len_ft,
+                    rel_roughness=fl_rough, elevation_change_ft=fl_elev_ft)
+            else:
+                from hydrate import (two_phase_pressure_drop,
+                                      slug_flow_assessment)
+                pl = two_phase_pressure_drop(
+                    fl_qliq, fl_qgas, fl_rho_liq, fl_rho_gas,
+                    fl_mu_liq, fl_mu_gas, fl_ID_in, fl_len_ft,
+                    P_op_psia=fl_Pop_psia, T_op_F=fl_Tin_F, Z_gas=fl_Zg,
+                    rel_roughness=fl_rough, elevation_change_ft=fl_elev_ft)
+
+            st.markdown("#### Pressure loss")
+            plm = st.columns(4)
+            plm[0].metric("Flow velocity",
+                          f"{U.to_user_length(pl['v_ft_s'], unit_system):.2f}"
+                          f" {FL['v']}")
+            plm[1].metric("Friction ΔP",
+                          f"{U.to_user_P(pl['dP_friction_psi'], unit_system):.1f} {L['P']}")
+            plm[2].metric("Elevation ΔP",
+                          f"{U.to_user_P(pl['dP_elevation_psi'], unit_system):.1f} {L['P']}")
+            plm[3].metric("Total ΔP",
+                          f"{U.to_user_P(pl['dP_total_psi'], unit_system):.1f} {L['P']}")
+            _re = pl["reynolds"]
+            st.caption(
+                f"Reynolds number ≈ {_re:,.0f} "
+                f"({'laminar' if _re < 2300 else 'turbulent'}), "
+                f"friction factor f ≈ {pl['friction_factor']:.4f}. "
+                + ("A negative total means the elevation drop more than "
+                   "offsets friction — the line gains pressure."
+                   if pl['dP_total_psi'] < 0 else
+                   "Positive total ΔP is pressure consumed between inlet "
+                   "and outlet."))
+            # 15 ft/s erosional-velocity rule of thumb (API RP 14E).
+            if pl["v_ft_s"] > 15.0:
+                _v_lim = U.to_user_length(15.0, unit_system)
+                st.warning(f"⚠️ Flow velocity exceeds ~{_v_lim:.1f} "
+                            f"{FL['v']} — erosion risk; check against the "
+                            f"erosional velocity limit (API RP 14E).")
+
+            # ---- Slug screening (two-phase only) ----
+            if fl_phase.startswith("Two"):
+                slug = slug_flow_assessment(
+                    fl_qliq, fl_qgas, fl_rho_liq, fl_rho_gas, fl_ID_in,
+                    P_op_psia=fl_Pop_psia, T_op_F=fl_Tin_F, Z_gas=fl_Zg,
+                    pipe_inclination_deg=fl_incl)
+                st.markdown("#### Slug-flow assessment")
+                scolor = {"Low": TH.PISTACHIO, "Moderate": "#E0A800",
+                           "High": TH.TORCH_RED}.get(slug["slug_risk"],
+                                                     "#888888")
+                sm = st.columns(4)
+                sm[0].metric("Flow regime", slug["regime"])
+                sm[1].metric("Superficial liquid v",
+                             f"{U.to_user_length(slug['v_sl_ft_s'], unit_system):.2f}"
+                             f" {FL['v']}")
+                sm[2].metric("Superficial gas v",
+                             f"{U.to_user_length(slug['v_sg_ft_s'], unit_system):.2f}"
+                             f" {FL['v']}")
+                sm[3].metric("Froude number", f"{slug['froude']:.2f}")
+                st.markdown(
+                    f"<div style='background:{scolor}22; border-left:5px "
+                    f"solid {scolor}; padding:0.7rem 1rem; "
+                    f"border-radius:4px;'>"
+                    f"<b style='color:{scolor}; font-size:1.05rem;'>Slug "
+                    f"risk: {slug['slug_risk']}</b><br>"
+                    f"<span style='color:#333;'>{slug['message']}</span>"
+                    f"</div>", unsafe_allow_html=True)
+                if slug["slug_length_est_D"] > 0:
+                    _sl_ft = slug["slug_length_est_D"] * fl_ID_in / 12.0
+                    _sl_disp = U.to_user_length(_sl_ft, unit_system)
+                    st.caption(
+                        f"Rough slug-length estimate: "
+                        f"~{slug['slug_length_est_D']:.0f} pipe diameters "
+                        f"(≈ {_sl_disp:.0f} {FL['L']}). Size the slug "
+                        f"catcher and separator surge capacity "
+                        f"accordingly.")
 
 
 # ================================================================
@@ -6315,11 +6746,13 @@ elif fluid == "🧊 Wax & Asphaltene Risk":
             _pb_u = U.to_user_P(asp_pb_field, unit_system)
             _pr_u = U.to_user_P(asp_pres_field, unit_system)
             _aop_u = U.to_user_P(aop_field, unit_system)
-            # Risk window band (AOP down to Pb)
+            # Risk window band (AOP down to Pb). Plotly's fillcolor does
+            # not accept 8-digit hex (#RRGGBBAA) — use rgba() for the
+            # semi-transparent torch-red band.
             fig.add_shape(type="rect", x0=0, x1=1,
                            y0=_pb_u, y1=_aop_u, xref="paper",
-                           fillcolor="#EB003722", line=dict(width=0),
-                           layer="below")
+                           fillcolor="rgba(235, 0, 55, 0.13)",
+                           line=dict(width=0), layer="below")
             for yval, lbl, col in [
                 (_pr_u, "Reservoir P", TH.DARK_NAVY),
                 (_aop_u, "Asphaltene onset P (est.)", "#EB6E1F"),
