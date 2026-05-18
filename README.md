@@ -2,6 +2,53 @@
 
 By **Merouane Hamdani** · MIT License · Early-phase screening tool
 
+A Streamlit application for petroleum-fluid PVT modeling: black-oil and
+gas correlations, Peng-Robinson EOS, lab-experiment simulation, tuning,
+ECLIPSE deck export, and flow-assurance screening.
+
+## Modes (sidebar selector)
+
+1. **Oil (Black Oil)** — correlations, tuning, Monte Carlo, ECLIPSE export
+2. **Dry Gas** — Z-factor / Bg / viscosity, tuning, multi-region
+3. **Wet Gas / Condensate** — recombination, Rv, dew point
+4. **Water** — brine properties, PVTW
+5. **Compositional (EOS)** — Peng-Robinson: flash, phase envelope, lab
+   experiments (CCE/CVD/DLE), separator train, EOS tuning, multi-region,
+   Monte Carlo, ECLIPSE export
+6. **Hydrate Likelihood** — Makogon screening, inhibitor, cooldown
+7. **Rock Compressibility** — correlations + recommendation by rock type
+8. **Wax & Asphaltene Risk** — WAT / cloud-point + asphaltene-onset
+   screening (CII, de Boer), cooldown to wax onset
+9. **Documentation** — full LaTeX equation reference
+
+## How to run
+
+```
+pip install -r requirements.txt
+streamlit run pvt_app.py
+```
+
+Validation suite (51 checks against published references):
+
+```
+python test_validation.py
+```
+
+## Module layout
+
+`pvt_app.py` is the Streamlit orchestrator. `ui_helpers.py` holds the pure
+rendering helpers. Physics is in dedicated modules: `correlations.py`,
+`eos_pr.py`, `experiments.py`, `phase_envelope.py`, `separator.py`,
+`hydrate.py`, `rock_comp.py`, `solids_risk.py`, `lbc.py`. Support:
+`units.py` (all unit conversions), `validators.py` (input validation),
+`presets.py` (16 example fluids), `eclipse_export.py` / `eclipse_qc.py`
+(deck generation + monotonicity QC), `documentation.py` (equation
+reference).
+
+---
+
+## Change history
+
 ## Latest round — robustness: validation, presets, unit audit
 
 - **Input validation** (`validators.py`) — hard guards reject physically

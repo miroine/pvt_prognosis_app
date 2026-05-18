@@ -352,3 +352,183 @@ def inhibitor_concentration_hammerschmidt(T_shift_F, inhibitor="methanol"):
     K_H = inhibitors[inhibitor]["K_H"]
     W = (T_shift_F * M * 100.0) / (K_H + T_shift_F * M)
     return W
+
+
+# ======================================================================
+# STEADY-STATE FLOWLINE HYDRATE CHECK
+# ======================================================================
+#
+# A producing flowline loses heat to its surroundings as the fluid travels
+# from inlet to outlet. For steady-state plug flow the bulk temperature
+# decays exponentially with distance:
+#
+#     T(x) = T_amb + (T_in - T_amb) * exp( -U * P_perim * x / (m_dot * cp) )
+#
+# where U is the overall heat-transfer coefficient, P_perim = pi * D_outer
+# is the heat-transfer perimeter, m_dot is the mass flow rate and cp the
+# fluid heat capacity. A pipeline that climbs (TVD change) also sees the
+# ambient temperature change with depth via a geothermal/sea gradient.
+#
+# The hydrate question: at the operating pressure the fluid must stay
+# ABOVE the hydrate-formation temperature everywhere along the line.
+# Because lower flow rate => longer residence time => more cooling, there
+# is a MINIMUM flow rate below which the outlet (or some midpoint) crosses
+# into the hydrate region. These functions find that minimum.
+#
+# This is a screening calculation: single-phase plug flow, constant U and
+# cp, no Joule-Thomson term, no transient/shut-in behaviour. It is meant
+# to size a turndown limit, not to replace a transient flow-assurance
+# (e.g. OLGA) study.
+
+import math as _math
+
+
+def flowline_temperature_profile(stations, T_in_F, m_dot_lbhr, cp,
+                                  U, D_outer_ft, ambient_profile):
+    """March the steady-state temperature along a flowline.
+
+    stations        : list of cumulative distances along the line (ft),
+                      increasing, starting at 0 (the inlet).
+    T_in_F          : inlet fluid temperature, deg F.
+    m_dot_lbhr      : mass flow rate, lb/hr.
+    cp              : fluid heat capacity, BTU/(lb.F).
+    U               : overall heat-transfer coefficient,
+                      BTU/(hr.ft^2.F).
+    D_outer_ft      : pipe outer diameter used for the heat-transfer
+                      area, ft.
+    ambient_profile : list of ambient temperatures (deg F), one per
+                      station — lets the ambient vary with TVD.
+
+    Returns a list of fluid temperatures (deg F), one per station.
+    Uses the exact exponential solution over each segment, with the
+    segment ambient taken as the mean of its two endpoints.
+    """
+    n = len(stations)
+    if n == 0:
+        return []
+    if m_dot_lbhr <= 0 or cp <= 0:
+        return [T_in_F] * n
+    perim = _math.pi * D_outer_ft           # ft of perimeter per ft length
+    T = [T_in_F]
+    for i in range(1, n):
+        dx = stations[i] - stations[i - 1]
+        T_amb_seg = 0.5 * (ambient_profile[i] + ambient_profile[i - 1])
+        # Exponential decay toward the segment ambient.
+        k = U * perim * dx / (m_dot_lbhr * cp)
+        T_next = T_amb_seg + (T[-1] - T_amb_seg) * _math.exp(-k)
+        T.append(T_next)
+    return T
+
+
+def flowline_hydrate_margin(stations, T_profile, P_op_psia, gas_sg,
+                             H2S_frac=0.0, CO2_frac=0.0):
+    """Compare a flowline temperature profile to the hydrate temperature.
+
+    Returns a dict:
+        T_hyd        : hydrate-formation temperature at P_op (deg F)
+        margins      : T_fluid - T_hyd at each station (deg F)
+        min_margin   : the worst (smallest) margin along the line
+        min_station  : distance at which the worst margin occurs (ft)
+        safe         : True if the whole line stays above the hydrate T
+    A negative margin means the fluid is inside the hydrate region.
+    """
+    T_hyd = hydrate_temperature_makogon(P_op_psia, gas_sg,
+                                         H2S_frac, CO2_frac)
+    if np.isnan(T_hyd):
+        return {"T_hyd": np.nan, "margins": [np.nan] * len(stations),
+                "min_margin": np.nan, "min_station": None, "safe": None}
+    margins = [t - T_hyd for t in T_profile]
+    i_min = int(np.argmin(margins))
+    return {"T_hyd": T_hyd, "margins": margins,
+            "min_margin": margins[i_min],
+            "min_station": stations[i_min],
+            "safe": margins[i_min] > 0.0}
+
+
+def minimum_flow_no_hydrate(stations, T_in_F, cp, U, D_outer_ft,
+                            ambient_profile, P_op_psia, gas_sg,
+                            H2S_frac=0.0, CO2_frac=0.0,
+                            m_lo=1.0e2, m_hi=1.0e8):
+    """Find the minimum mass flow rate (lb/hr) that keeps the whole
+    flowline above the hydrate-formation temperature.
+
+    Higher flow => warmer line, so the 'safe' condition is monotonic in
+    flow rate and a bisection on m_dot is well posed.
+
+    Returns a dict:
+        m_dot_min   : minimum safe mass flow rate (lb/hr), or None if even
+                      the highest tested rate is unsafe, or 0.0 if even a
+                      very low rate is already safe.
+        feasible    : True if a finite minimum was found.
+        note        : a short explanation.
+    The search brackets [m_lo, m_hi]; widen them via the arguments if a
+    line is extreme.
+    """
+    def _safe(m):
+        prof = flowline_temperature_profile(stations, T_in_F, m, cp,
+                                             U, D_outer_ft,
+                                             ambient_profile)
+        res = flowline_hydrate_margin(stations, prof, P_op_psia, gas_sg,
+                                       H2S_frac, CO2_frac)
+        return res["safe"]
+
+    hyd_T = hydrate_temperature_makogon(P_op_psia, gas_sg,
+                                         H2S_frac, CO2_frac)
+    if np.isnan(hyd_T):
+        return {"m_dot_min": None, "feasible": False,
+                "note": ("No hydrate temperature could be evaluated at "
+                         "this pressure — outside the correlation range.")}
+    # If the inlet itself is below the hydrate T the line can never be
+    # made safe by flowing faster.
+    if T_in_F <= hyd_T:
+        return {"m_dot_min": None, "feasible": False,
+                "note": ("The inlet temperature is already at or below "
+                         "the hydrate-formation temperature — no flow "
+                         "rate can keep this line out of the hydrate "
+                         "region. Inlet heating or inhibitor is needed.")}
+    if _safe(m_lo):
+        return {"m_dot_min": 0.0, "feasible": True,
+                "note": ("Even a very low flow rate stays above the "
+                         "hydrate temperature — the line is not "
+                         "turndown-limited by hydrates.")}
+    if not _safe(m_hi):
+        return {"m_dot_min": None, "feasible": False,
+                "note": ("Even a very high flow rate does not keep the "
+                         "line safe — check the U-value, length, or "
+                         "consider inhibitor / insulation.")}
+    # Bisection: find the lowest m_dot that is still safe.
+    for _ in range(60):
+        m_mid = _math.sqrt(m_lo * m_hi)   # geometric midpoint
+        if _safe(m_mid):
+            m_hi = m_mid
+        else:
+            m_lo = m_mid
+        if m_hi / m_lo < 1.0005:
+            break
+    return {"m_dot_min": m_hi, "feasible": True,
+            "note": ("Minimum flow rate to keep the whole line above the "
+                     "hydrate-formation temperature.")}
+
+
+def interpolate_ambient_from_survey(stations, survey_md, survey_tvd,
+                                     T_surface_F, geo_gradient_F_per_ft):
+    """Build an ambient-temperature profile from a pipeline survey.
+
+    survey_md   : measured depths / cumulative distances of survey points
+    survey_tvd  : true vertical depth at each survey point (ft, positive
+                  downward)
+    T_surface_F : ambient temperature at TVD = 0 (seabed mudline or
+                  surface)
+    geo_gradient_F_per_ft : geothermal / sea-temperature gradient with
+                  depth (deg F per ft of TVD)
+
+    Returns an ambient temperature for each entry in `stations` by linear
+    interpolation of TVD against measured depth, then applying the
+    gradient. This lets a climbing or descending line see a depth-varying
+    ambient.
+    """
+    amb = []
+    for s in stations:
+        tvd = float(np.interp(s, survey_md, survey_tvd))
+        amb.append(T_surface_F + geo_gradient_F_per_ft * tvd)
+    return amb

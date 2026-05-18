@@ -9,6 +9,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import copy
 
 from correlations import (OilCorrelations, GasCorrelations,
                           WaterCorrelations, WetGasCorrelations)
@@ -138,6 +139,7 @@ with st.sidebar:
                           "Water", "Compositional (EOS)",
                           "❄️ Hydrate Likelihood",
                           "🪨 Rock Compressibility",
+                          "🧊 Wax & Asphaltene Risk",
                           "📚 Documentation"])
 
     st.markdown("### Reservoir Conditions")
@@ -1087,7 +1089,7 @@ if fluid == "Oil (Black Oil)":
             tune_res["pred_final_user"] = U.field_pred_to_user(
                 tune_res["predicted_final"], st.session_state["oil_lab_data"],
                 unit_system)
-            tune_res["lab_snapshot"] = list(st.session_state["oil_lab_data"])
+            tune_res["lab_snapshot"] = copy.deepcopy(st.session_state["oil_lab_data"])
             tune_res["fluid_fp"] = fluid_fingerprint(
                 api=api, gas_sg=gas_sg, T=T_res, Rsi=Rsi)
             st.session_state["oil_tune_result"] = tune_res
@@ -1926,7 +1928,7 @@ elif fluid == "Dry Gas":
                 tol=10 ** (-dg_tol_exp),
                 progress_callback=_dg_prog)
             _prog.empty()
-            dg_tune_res["lab_snapshot"] = list(st.session_state["dg_lab_data"])
+            dg_tune_res["lab_snapshot"] = copy.deepcopy(st.session_state["dg_lab_data"])
             dg_tune_res["fluid_fp"] = fluid_fingerprint(
                 gas_sg=gas_sg, T=T_res, N2=N2, CO2=CO2, H2S=H2S)
             st.session_state["dg_tune_result"] = dg_tune_res
@@ -2559,7 +2561,7 @@ elif fluid == "Wet Gas / Condensate":
             wg_tune_res["pred_final_user"] = U.field_pred_to_user(
                 wg_tune_res["predicted_final"], st.session_state["wg_lab_data"],
                 unit_system)
-            wg_tune_res["lab_snapshot"] = list(st.session_state["wg_lab_data"])
+            wg_tune_res["lab_snapshot"] = copy.deepcopy(st.session_state["wg_lab_data"])
             wg_tune_res["fluid_fp"] = fluid_fingerprint(
                 gas_sg=gas_sg, api_cond=api_cond, cgr=cgr, T=T_res,
                 Pdew=Pdew)
@@ -4467,7 +4469,7 @@ elif fluid == "Compositional (EOS)":
                     tune_result["pred_final_user"] = _comp_pred_to_user(
                         tune_result["predicted_final"],
                         st.session_state["tuning_meas"])
-                    tune_result["meas_snapshot"] = list(
+                    tune_result["meas_snapshot"] = copy.deepcopy(
                         st.session_state["tuning_meas"])
                     tune_result["fluid_fp"] = fluid_fingerprint(
                         **{f"z_{c}": v for c, v in zip(comp_names, z_arr)},
@@ -5136,7 +5138,10 @@ elif fluid == "Compositional (EOS)":
 elif fluid == "❄️ Hydrate Likelihood":
     from hydrate import (hydrate_pressure_makogon, hydrate_temperature_makogon,
                           assess_hydrate_risk, hydrate_curve,
-                          inhibitor_concentration_hammerschmidt)
+                          inhibitor_concentration_hammerschmidt,
+                          flowline_temperature_profile, flowline_hydrate_margin,
+                          minimum_flow_no_hydrate,
+                          interpolate_ambient_from_survey)
     import plotly.graph_objects as go
 
     st.markdown("## Hydrate Formation Likelihood")
@@ -5630,6 +5635,254 @@ with $\gamma_g$ the gas specific gravity (air = 1).
     else:
         st.info(cd.get("message", "Cooldown analysis not applicable."))
 
+    # ================================================================
+    # FLOWLINE HYDRATE CHECK — steady-state thermal-hydraulic turndown
+    # ================================================================
+    st.markdown("---")
+    st.markdown("## 🛢️ Flowline Hydrate Check")
+    st.markdown(
+        "Check a producing flowline for hydrate risk along its length, and "
+        "find the **minimum flow rate** below which the line cools into the "
+        "hydrate region. As the fluid travels it loses heat to the "
+        "surroundings; a lower rate means a longer residence time and a "
+        "colder arrival — so there is a turndown limit set by hydrates.")
+    st.caption(
+        "Steady-state plug-flow model: T(x) decays exponentially toward "
+        "ambient with the group U·π·D·x/(ṁ·cₚ). Single-phase, constant U "
+        "and cₚ, no Joule-Thomson term — a screening calculation to size a "
+        "turndown limit, not a substitute for a transient (e.g. OLGA) "
+        "study.")
+
+    fl_in, fl_out = st.columns([1, 2])
+
+    with fl_in:
+        st.markdown("### Flowline geometry")
+        fl_ID_in = st.number_input(
+            "Inner diameter (inch)", value=10.0, min_value=1.0,
+            max_value=60.0, step=0.5, key="fl_id",
+            help="Pipe internal diameter — sets the flow area.")
+        fl_wall_in = st.number_input(
+            "Wall + insulation thickness (inch)", value=1.0,
+            min_value=0.0, max_value=12.0, step=0.25, key="fl_wall",
+            help="Added to the ID to get the outer diameter used for "
+                 "the heat-transfer area.")
+        fl_OD_ft = (fl_ID_in + 2.0 * fl_wall_in) / 12.0
+
+        if unit_system == "Field":
+            fl_len_user = st.number_input(
+                "Flowline length (ft)", value=32808.0, min_value=100.0,
+                step=1000.0, key="fl_len")
+            fl_len_ft = fl_len_user
+        else:
+            fl_len_user = st.number_input(
+                "Flowline length (km)", value=10.0, min_value=0.1,
+                step=1.0, key="fl_len")
+            fl_len_ft = fl_len_user * 3280.84
+
+        fl_config = st.selectbox(
+            "Configuration", ["Subsea tieback", "Buried onshore",
+                              "Surface / above-ground", "Riser"],
+            key="fl_config",
+            help="Used only to suggest a typical U-value below.")
+        _U_suggest = {"Subsea tieback": 2.0, "Buried onshore": 0.5,
+                      "Surface / above-ground": 8.0, "Riser": 4.0}
+        fl_U = st.number_input(
+            "U-value, BTU/(hr·ft²·°F)",
+            value=_U_suggest[fl_config], min_value=0.05, step=0.25,
+            key="fl_U",
+            help=f"Overall heat-transfer coefficient. Typical for "
+                 f"'{fl_config}': ~{_U_suggest[fl_config]}. Lower = "
+                 f"better insulated = warmer line.")
+
+        st.markdown("### Fluid & operating conditions")
+        fl_Tin_user = st.number_input(
+            f"Inlet temperature ({L['T']})",
+            value=U.to_user_T(160.0, unit_system), key="fl_tin")
+        fl_Tin_F = U.to_field_T(fl_Tin_user, unit_system)
+        fl_Pop_user = st.number_input(
+            f"Operating pressure ({L['P']})",
+            value=U.to_user_P(1500.0, unit_system),
+            min_value=U.to_user_P(50.0, unit_system), key="fl_pop")
+        fl_Pop_psia = U.to_field_P(fl_Pop_user, unit_system)
+        fl_cp = st.number_input(
+            "Fluid heat capacity cₚ, BTU/(lb·°F)", value=0.55,
+            min_value=0.1, max_value=1.2, step=0.05, key="fl_cp",
+            help="~0.5–0.6 for typical hydrocarbon liquids, lower for gas.")
+
+        st.markdown("### Ambient temperature")
+        fl_amb_mode = st.radio(
+            "Ambient along the line",
+            ["Constant", "From pipeline survey (x, TVD)"],
+            key="fl_amb_mode")
+
+    # ---- Build station + ambient arrays ----
+    n_st = 40
+    stations = list(np.linspace(0.0, fl_len_ft, n_st))
+
+    if fl_amb_mode == "Constant":
+        with fl_in:
+            fl_amb_user = st.number_input(
+                f"Ambient temperature ({L['T']})",
+                value=U.to_user_T(40.0, unit_system), key="fl_amb_const")
+        fl_amb_F = U.to_field_T(fl_amb_user, unit_system)
+        ambient_profile = [fl_amb_F] * n_st
+        survey_ok = True
+    else:
+        with fl_in:
+            st.caption(
+                "Paste the pipeline survey as `distance, TVD` lines "
+                "(one point per line). Distance is measured along the "
+                "line; TVD is depth below the surface/mudline. Units "
+                "follow the current system.")
+            _surv_txt = st.text_area(
+                "Survey points (distance, TVD)", height=130,
+                key="fl_survey",
+                placeholder=("0, 3000\n5, 2400\n10, 1800"
+                              if unit_system != "Field"
+                              else "0, 9800\n16000, 7900\n32808, 5900"))
+            fl_Tsurf_user = st.number_input(
+                f"Ambient at TVD = 0 ({L['T']})",
+                value=U.to_user_T(38.0, unit_system), key="fl_tsurf")
+            fl_grad = st.number_input(
+                f"Temperature gradient ({L['T']}-equiv per "
+                f"{'ft' if unit_system == 'Field' else 'm'} TVD)",
+                value=0.012 if unit_system == "Field" else 0.0394,
+                format="%.4f", key="fl_grad",
+                help="Geothermal / sea-temperature gradient with depth.")
+        # Parse the survey
+        survey_md, survey_tvd = [], []
+        for line in _surv_txt.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p for p in __import__("re").split(r"[,;\t ]+", line) if p]
+            if len(parts) < 2:
+                continue
+            try:
+                survey_md.append(float(parts[0]))
+                survey_tvd.append(float(parts[1]))
+            except ValueError:
+                continue
+        survey_ok = len(survey_md) >= 2
+        if survey_ok:
+            # Convert survey to field units (ft) for the model.
+            if unit_system == "Field":
+                md_ft = survey_md
+                tvd_ft = survey_tvd
+                Tsurf_F = U.to_field_T(fl_Tsurf_user, unit_system)
+                grad_F_ft = fl_grad
+            else:
+                md_ft = [d * 3280.84 for d in survey_md]   # km -> ft
+                tvd_ft = [d / 0.3048 for d in survey_tvd]   # m -> ft
+                Tsurf_F = U.to_field_T(fl_Tsurf_user, unit_system)
+                # gradient: user enters °C-equivalent per m; the model
+                # works in °F per ft. 1 °C/m = 1.8 °F / 3.2808 ft.
+                grad_F_ft = fl_grad * 1.8 / 3.2808
+            ambient_profile = interpolate_ambient_from_survey(
+                stations, md_ft, tvd_ft, Tsurf_F, grad_F_ft)
+        else:
+            ambient_profile = [U.to_field_T(40.0, unit_system)] * n_st
+
+    with fl_out:
+        if fl_amb_mode.startswith("From") and not survey_ok:
+            st.warning("Enter at least two valid survey points "
+                        "(distance, TVD) to run the survey-based check.")
+        else:
+            # Minimum flow rate to avoid hydrates.
+            mf = minimum_flow_no_hydrate(
+                stations, fl_Tin_F, fl_cp, fl_U, fl_OD_ft,
+                ambient_profile, fl_Pop_psia, gas_sg_h, H2S_h, CO2_h)
+
+            st.markdown("### Minimum flow without hydrate risk")
+            if not mf["feasible"]:
+                st.error(f"⛔ {mf['note']}")
+            elif mf["m_dot_min"] == 0.0:
+                st.success(f"✓ {mf['note']}")
+            else:
+                _m = mf["m_dot_min"]
+                # Convert lb/hr to STB/d using a nominal oil density.
+                _rho = 53.0   # lb/ft3, nominal
+                _bbl_d = _m / _rho / 5.615 * 24.0
+                cflm = st.columns(2)
+                cflm[0].metric("Minimum mass flow",
+                               f"{_m:,.0f} lb/hr")
+                cflm[1].metric("≈ Volumetric (nominal 53 lb/ft³)",
+                               f"{_bbl_d:,.0f} STB/d")
+                st.warning(
+                    f"⚠️ Below roughly **{_m:,.0f} lb/hr** the flowline "
+                    f"cools into the hydrate region. Operating above this "
+                    f"rate keeps the whole line warmer than the "
+                    f"hydrate-formation temperature.")
+                st.caption(
+                    "The volumetric estimate uses a nominal liquid "
+                    "density of 53 lb/ft³ — adjust mentally for your "
+                    "actual fluid.")
+
+            # ---- Temperature profile at a chosen flow rate ----
+            st.markdown("### Temperature profile along the line")
+            _default_rate = (mf["m_dot_min"] * 1.5
+                              if (mf["feasible"] and mf["m_dot_min"])
+                              else 5.0e5)
+            fl_rate = st.number_input(
+                "Mass flow rate to plot (lb/hr)",
+                value=float(f"{_default_rate:.0f}"),
+                min_value=1.0e2, step=1.0e4, key="fl_plot_rate")
+            prof = flowline_temperature_profile(
+                stations, fl_Tin_F, fl_rate, fl_cp, fl_U, fl_OD_ft,
+                ambient_profile)
+            marg = flowline_hydrate_margin(
+                stations, prof, fl_Pop_psia, gas_sg_h, H2S_h, CO2_h)
+
+            # Build the plot — fluid T, hydrate T, ambient
+            if unit_system == "Field":
+                x_plot = stations
+                x_lbl = "Distance along line (ft)"
+            else:
+                x_plot = [s * 0.3048 / 1000.0 for s in stations]
+                x_lbl = "Distance along line (km)"
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=x_plot,
+                y=[U.to_user_T(t, unit_system) for t in prof],
+                name="Fluid temperature", mode="lines",
+                line=dict(color=TH.TORCH_RED, width=3)))
+            fig.add_trace(go.Scatter(
+                x=x_plot,
+                y=[U.to_user_T(t, unit_system) for t in ambient_profile],
+                name="Ambient", mode="lines",
+                line=dict(color=TH.DARK_NAVY, width=2, dash="dot")))
+            if not np.isnan(marg["T_hyd"]):
+                fig.add_hline(
+                    y=U.to_user_T(marg["T_hyd"], unit_system),
+                    line_color="#1E88E5", line_width=2.5,
+                    annotation_text="Hydrate-formation T",
+                    annotation_position="right")
+            fig.update_layout(**TH.plotly_layout(
+                title="Flowline temperature vs hydrate-formation temperature",
+                xtitle=x_lbl, ytitle=f"Temperature ({L['T']})",
+                height=440))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Verdict for this rate
+            if marg["safe"] is True:
+                st.success(
+                    f"✓ At {fl_rate:,.0f} lb/hr the line stays above the "
+                    f"hydrate temperature everywhere — minimum margin "
+                    f"{U.to_user_deltaT(marg['min_margin'], unit_system):.1f}"
+                    f" {L['T'][-2] if len(L['T'])>1 else '°'}.")
+            elif marg["safe"] is False:
+                _xm = (marg["min_station"] if unit_system == "Field"
+                        else marg["min_station"] * 0.3048 / 1000.0)
+                st.error(
+                    f"⛔ At {fl_rate:,.0f} lb/hr the line enters the "
+                    f"hydrate region. Worst point is {_xm:,.0f} "
+                    f"{'ft' if unit_system=='Field' else 'km'} from the "
+                    f"inlet, {abs(U.to_user_deltaT(marg['min_margin'], unit_system)):.1f}"
+                    f"° inside the hydrate envelope.")
+            else:
+                st.info("Hydrate temperature could not be evaluated at "
+                         "this pressure (outside correlation range).")
+
 
 # ================================================================
 # ROCK COMPRESSIBILITY
@@ -5849,6 +6102,246 @@ for consolidated limestone with $\varphi < 0.20$.
 - For very heterogeneous reservoirs, lab core measurements are essential.
 - ECLIPSE expects $C_f$ in $1/\text{psia}$ (FIELD) or $1/\text{bara}$ (METRIC).
 """)
+
+
+# ================================================================
+# WAX & ASPHALTENE RISK
+# ================================================================
+elif fluid == "🧊 Wax & Asphaltene Risk":
+    import solids_risk as SR
+
+    st.markdown("## Wax & Asphaltene Deposition Risk")
+    st.markdown(
+        "Screening-level flow-assurance assessment for two solid-deposition "
+        "problems. **Wax** drops out below the Wax Appearance Temperature "
+        "(WAT) and is driven by the *cold* side of the flow path. "
+        "**Asphaltene** flocculation is driven by *pressure* and is usually "
+        "worst near the bubble point. These are index/correlation screening "
+        "tools — a positive result means a rigorous lab study (measured WAT, "
+        "asphaltene-onset titration, SARA assay) is warranted.")
+
+    tab_wax, tab_asph = st.tabs(["🧊 Wax", "🪨 Asphaltene"])
+
+    # ---------------- WAX ----------------
+    with tab_wax:
+        st.markdown("### Wax Appearance Temperature & deposition risk")
+        wc1, wc2 = st.columns([1, 2])
+        with wc1:
+            st.markdown("#### Inputs")
+            wax_api = st.number_input("Stock-tank oil API", value=35.0,
+                                       min_value=10.0, max_value=60.0,
+                                       key="wax_api")
+            wax_content = st.number_input(
+                "Paraffin wax content (wt %)", value=5.0,
+                min_value=0.0, max_value=40.0, step=0.5, key="wax_content",
+                help="Wax content of the stock-tank oil. Typical crudes "
+                     "are 1–10 wt%; waxy crudes can exceed 20%.")
+            wax_gor = st.number_input(
+                f"Solution GOR ({L['Rs']})",
+                value=U.to_user_Rs(600.0, unit_system),
+                min_value=0.0, key="wax_gor")
+            wax_gor_field = U.to_field_Rs(wax_gor, unit_system)
+
+            # Optional: load API/GOR from a saved oil fluid
+            _wax_oils = {nm: rec for nm, rec in
+                          st.session_state.get("fluid_registry", {}).items()
+                          if rec.get("fluid_type") == "oil"}
+            if _wax_oils:
+                _wsrc = st.selectbox("Or load from a saved oil",
+                                      ["(manual)"] + list(_wax_oils),
+                                      key="wax_load_src")
+                if _wsrc != "(manual)" and st.button("Apply saved oil",
+                                                       key="wax_apply"):
+                    _p = _wax_oils[_wsrc].get("parameters", {})
+                    st.session_state["wax_api"] = float(_p.get("api", 35.0))
+                    st.session_state["wax_gor"] = U.to_user_Rs(
+                        float(_p.get("Rsi_scfSTB", 600.0)), unit_system)
+                    st.rerun()
+
+            wax_T_op = st.number_input(
+                f"Operating temperature ({L['T']})",
+                value=U.to_user_T(90.0, unit_system), key="wax_Top",
+                help="Coldest temperature the fluid sees in normal "
+                     "operation — seabed, choke, flowline midpoint.")
+            wax_T_op_F = U.to_field_T(wax_T_op, unit_system)
+
+        with wc2:
+            wat_F = SR.estimate_wat(wax_api, wax_content, wax_gor_field)
+            risk = SR.wax_risk(wax_T_op_F, wat_F)
+            color = SR.RISK_COLORS.get(risk["level"], "#888888")
+
+            st.markdown("#### Result")
+            mcols = st.columns(3)
+            mcols[0].metric(f"Estimated WAT ({L['T']})",
+                            f"{U.to_user_T(wat_F, unit_system):.1f}")
+            mcols[1].metric(f"Operating T ({L['T']})",
+                            f"{U.to_user_T(wax_T_op_F, unit_system):.1f}")
+            mcols[2].metric(f"Margin ({L['deltaT'] if 'deltaT' in L else '°'})",
+                            f"{U.to_user_deltaT(risk['margin_F'], unit_system):.1f}")
+
+            st.markdown(
+                f"<div style='background:{color}22; border-left:5px solid "
+                f"{color}; padding:0.7rem 1rem; border-radius:4px;'>"
+                f"<b style='color:{color}; font-size:1.1rem;'>Wax risk: "
+                f"{risk['level']}</b><br>"
+                f"<span style='color:#333;'>{risk['message']}</span></div>",
+                unsafe_allow_html=True)
+
+            # WAT vs wax content sensitivity chart
+            st.markdown("##### WAT sensitivity to wax content")
+            wc_range = np.linspace(0.5, 25.0, 40)
+            wat_curve = [U.to_user_T(
+                SR.estimate_wat(wax_api, w, wax_gor_field), unit_system)
+                for w in wc_range]
+            wat_df = pd.DataFrame({"Wax content (wt %)": wc_range,
+                                    f"WAT ({L['T']})": wat_curve})
+            line_chart_plotly(wat_df, "Wax content (wt %)",
+                               f"WAT ({L['T']})",
+                               title="WAT vs wax content")
+
+            # Shut-in cooldown to WAT
+            st.markdown("##### Shut-in cooldown to wax onset")
+            st.caption(
+                "How long a shut-in line can cool before it reaches the "
+                "WAT — the safe no-touch time for wax.")
+            ccd = st.columns(3)
+            with ccd[0]:
+                cd_Tini = st.number_input(
+                    f"Initial T ({L['T']})",
+                    value=U.to_user_T(120.0, unit_system), key="wax_cd_Tini")
+            with ccd[1]:
+                cd_amb = st.number_input(
+                    f"Ambient T ({L['T']})",
+                    value=U.to_user_T(40.0, unit_system), key="wax_cd_amb")
+            with ccd[2]:
+                cd_k = st.number_input(
+                    "Cooling constant (1/hr)", value=0.30,
+                    min_value=0.01, step=0.05, key="wax_cd_k",
+                    help="Exponential cooling rate — depends on insulation. "
+                         "Insulated subsea lines ~0.1–0.3 /hr.")
+            t_to_wat = SR.wax_cooldown_to_wat(
+                U.to_field_T(cd_Tini, unit_system), wat_F,
+                U.to_field_T(cd_amb, unit_system), cd_k)
+            if t_to_wat is None:
+                st.success("The line never cools to the WAT — ambient is "
+                            "above the wax appearance temperature.")
+            elif t_to_wat <= 0:
+                st.error("The fluid is already at or below the WAT.")
+            else:
+                st.info(f"Estimated time to reach the WAT: "
+                         f"**{t_to_wat:.1f} hours**.")
+
+    # ---------------- ASPHALTENE ----------------
+    with tab_asph:
+        st.markdown("### Asphaltene stability & onset")
+        ac1, ac2 = st.columns([1, 2])
+        with ac1:
+            st.markdown("#### SARA assay (wt %)")
+            sara_s = st.number_input("Saturates", value=55.0,
+                                      min_value=0.0, max_value=100.0,
+                                      key="asph_s")
+            sara_a = st.number_input("Aromatics", value=25.0,
+                                      min_value=0.0, max_value=100.0,
+                                      key="asph_a")
+            sara_r = st.number_input("Resins", value=12.0,
+                                      min_value=0.0, max_value=100.0,
+                                      key="asph_r")
+            sara_asp = st.number_input("Asphaltenes", value=8.0,
+                                        min_value=0.0, max_value=100.0,
+                                        key="asph_asp")
+            _sara_sum = sara_s + sara_a + sara_r + sara_asp
+            if abs(_sara_sum - 100.0) > 1.0:
+                st.caption(f"SARA sums to {_sara_sum:.1f}% — only the "
+                            "ratio matters, but check the assay.")
+
+            st.markdown("#### Pressure / density")
+            asp_pb = st.number_input(
+                f"Bubble point ({L['P']})",
+                value=U.to_user_P(2500.0, unit_system),
+                min_value=U.to_user_P(50.0, unit_system), key="asph_pb")
+            asp_pres = st.number_input(
+                f"Reservoir pressure ({L['P']})",
+                value=U.to_user_P(6000.0, unit_system),
+                min_value=U.to_user_P(50.0, unit_system), key="asph_pres")
+            asp_rho = st.number_input(
+                "In-situ oil density (g/cm³)", value=0.78,
+                min_value=0.5, max_value=1.1, step=0.01, key="asph_rho",
+                help="Light oils (< 0.85 g/cm³) are the classic "
+                     "asphaltene-problem fluids.")
+            asp_pb_field = U.to_field_P(asp_pb, unit_system)
+            asp_pres_field = U.to_field_P(asp_pres, unit_system)
+
+        with ac2:
+            cii = SR.colloidal_instability_index(sara_s, sara_a,
+                                                  sara_r, sara_asp)
+            cii_r = SR.cii_risk(cii)
+            undersat = max(0.0, asp_pres_field - asp_pb_field)
+            db_r = SR.de_boer_risk(asp_rho, undersat)
+            # Instability factor for the onset estimate: blend CII and de Boer
+            inst = min(1.0, max(0.0, (cii - 0.5) / 0.6))
+            if db_r["level"] == "High":
+                inst = max(inst, 0.7)
+            elif db_r["level"] == "Moderate":
+                inst = max(inst, 0.45)
+            aop_field = SR.asphaltene_onset_pressure(
+                asp_pb_field, asp_pres_field, inst)
+            overall = SR.overall_solids_risk(cii_r["level"], db_r["level"])
+            ocolor = SR.RISK_COLORS.get(overall, "#888888")
+
+            st.markdown("#### Result")
+            amc = st.columns(3)
+            amc[0].metric("Colloidal Instability Index", f"{cii:.2f}")
+            amc[1].metric(f"Est. asphaltene onset P ({L['P']})",
+                          f"{U.to_user_P(aop_field, unit_system):.0f}")
+            amc[2].metric(f"Undersaturation ({L['P']})",
+                          f"{U.to_user_P(undersat, unit_system):.0f}")
+
+            st.markdown(
+                f"<div style='background:{ocolor}22; border-left:5px solid "
+                f"{ocolor}; padding:0.7rem 1rem; border-radius:4px;'>"
+                f"<b style='color:{ocolor}; font-size:1.1rem;'>Asphaltene "
+                f"risk: {overall}</b></div>",
+                unsafe_allow_html=True)
+            st.markdown(f"**CII screening:** {cii_r['message']}")
+            st.markdown(f"**de Boer screening:** {db_r['message']}")
+
+            # Pressure-domain risk diagram
+            st.markdown("##### Asphaltene-onset envelope")
+            st.caption(
+                "Asphaltene solvency is lowest near the bubble point. The "
+                "estimated onset pressure (AOP) sits above Pb; between the "
+                "AOP and Pb the oil is in the asphaltene-risk window.")
+            fig = go.Figure()
+            _pb_u = U.to_user_P(asp_pb_field, unit_system)
+            _pr_u = U.to_user_P(asp_pres_field, unit_system)
+            _aop_u = U.to_user_P(aop_field, unit_system)
+            # Risk window band (AOP down to Pb)
+            fig.add_shape(type="rect", x0=0, x1=1,
+                           y0=_pb_u, y1=_aop_u, xref="paper",
+                           fillcolor="#EB003722", line=dict(width=0),
+                           layer="below")
+            for yval, lbl, col in [
+                (_pr_u, "Reservoir P", TH.DARK_NAVY),
+                (_aop_u, "Asphaltene onset P (est.)", "#EB6E1F"),
+                (_pb_u, "Bubble point", TH.PISTACHIO)]:
+                fig.add_hline(y=yval, line_color=col, line_width=2.5,
+                               annotation_text=lbl,
+                               annotation_position="right")
+            fig.update_layout(**TH.plotly_layout(
+                title="Pressure-domain asphaltene risk",
+                xtitle="", ytitle=f"Pressure ({L['P']})",
+                height=380, showlegend=False))
+            fig.update_xaxes(showticklabels=False, range=[0, 1])
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.caption(
+        "⚠️ These are screening correlations and indices, not "
+        "thermodynamic deposition models. A positive screening result "
+        "should be confirmed with measured data — a lab WAT/cloud point "
+        "for wax, and an asphaltene-onset (depressurization) test plus a "
+        "SARA assay for asphaltene. Treat the numbers as risk indicators, "
+        "not design values.")
 
 
 # ================================================================
