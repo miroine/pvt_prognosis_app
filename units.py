@@ -201,3 +201,90 @@ def field_pred_to_user(pred_array, lab_list, units):
         else:
             out.append(val)
     return np.array(out)
+
+
+# ----------------------------------------------------------------------
+# Flowline / thermal-hydraulic unit conversions
+# ----------------------------------------------------------------------
+# All flowline physics in hydrate.py works in FIELD units (inch, ft,
+# psia, F, lb/ft3, cP, BTU/(hr.ft2.F), STB/d, Mscf/d). These helpers let
+# the UI accept and display SI equivalents.
+
+MM_PER_INCH = 25.4
+FT_PER_M = 3.280839895
+# U-value: 1 BTU/(hr.ft2.F) = 5.678263 W/(m2.K)
+WM2K_PER_BTUHRFT2F = 5.678263
+# Heat capacity: 1 BTU/(lb.F) = 4.1868 kJ/(kg.K)
+KJKGK_PER_BTULBF = 4.1868
+# Gas rate: 1 Mscf = 28.31685 Sm3 (standard cubic metres)
+SM3_PER_MSCF = 28.31685
+# Liquid rate: 1 STB = 0.1589873 Sm3
+SM3_PER_STB = 0.1589873
+
+
+def to_field_diameter(d_user, units):
+    """Pipe diameter: mm (SI) or inch (Field) -> inch."""
+    return d_user / MM_PER_INCH if units == "SI" else d_user
+
+def to_user_diameter(d_inch, units):
+    """inch -> mm (SI) or inch (Field)."""
+    return d_inch * MM_PER_INCH if units == "SI" else d_inch
+
+
+def to_field_length(L_user, units):
+    """Pipe length: m (SI) or ft (Field) -> ft."""
+    return L_user * FT_PER_M if units == "SI" else L_user
+
+def to_user_length(L_ft, units):
+    """ft -> m (SI) or ft (Field)."""
+    return L_ft / FT_PER_M if units == "SI" else L_ft
+
+
+def to_field_Uvalue(U_user, units):
+    """Heat-transfer coefficient: W/(m2.K) (SI) or BTU/(hr.ft2.F)
+    (Field) -> BTU/(hr.ft2.F)."""
+    return U_user / WM2K_PER_BTUHRFT2F if units == "SI" else U_user
+
+def to_user_Uvalue(U_field, units):
+    """BTU/(hr.ft2.F) -> W/(m2.K) (SI) or BTU/(hr.ft2.F) (Field)."""
+    return U_field * WM2K_PER_BTUHRFT2F if units == "SI" else U_field
+
+
+def to_field_cp(cp_user, units):
+    """Heat capacity: kJ/(kg.K) (SI) or BTU/(lb.F) (Field) ->
+    BTU/(lb.F)."""
+    return cp_user / KJKGK_PER_BTULBF if units == "SI" else cp_user
+
+def to_user_cp(cp_field, units):
+    """BTU/(lb.F) -> kJ/(kg.K) (SI) or BTU/(lb.F) (Field)."""
+    return cp_field * KJKGK_PER_BTULBF if units == "SI" else cp_field
+
+
+def to_field_qgas(q_user, units):
+    """Gas rate: Sm3/d (SI) or Mscf/d (Field) -> Mscf/d."""
+    return q_user / SM3_PER_MSCF if units == "SI" else q_user
+
+def to_user_qgas(q_mscfd, units):
+    """Mscf/d -> Sm3/d (SI) or Mscf/d (Field)."""
+    return q_mscfd * SM3_PER_MSCF if units == "SI" else q_mscfd
+
+
+def to_field_qliq(q_user, units):
+    """Liquid rate: Sm3/d (SI) or STB/d (Field) -> STB/d."""
+    return q_user / SM3_PER_STB if units == "SI" else q_user
+
+def to_user_qliq(q_stbd, units):
+    """STB/d -> Sm3/d (SI) or STB/d (Field)."""
+    return q_stbd * SM3_PER_STB if units == "SI" else q_stbd
+
+
+# Short unit-label helpers for the flowline UI.
+def flowline_labels(units):
+    """Return a dict of display unit strings for the active system."""
+    if units == "SI":
+        return {"D": "mm", "L": "m", "U": "W/(m²·K)",
+                "cp": "kJ/(kg·K)", "rho": "kg/m³", "mu": "cP",
+                "qgas": "Sm³/d", "qliq": "Sm³/d", "v": "m/s"}
+    return {"D": "inch", "L": "ft", "U": "BTU/(hr·ft²·°F)",
+            "cp": "BTU/(lb·°F)", "rho": "lb/ft³", "mu": "cP",
+            "qgas": "Mscf/d", "qliq": "STB/d", "v": "ft/s"}
