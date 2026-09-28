@@ -5,6 +5,8 @@ A stylized "PVT scientist" oil drop with a measuring beaker — small, lightweig
 and renders inline without external image dependencies.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 MASCOT_SVG = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100" width="180" height="90">
   <!-- Background panel -->

@@ -10,6 +10,8 @@ Output:
   viscosity  [cP]
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 from components import get_props
 
@@ -23,10 +25,14 @@ def lbc_viscosity(comp_names, comp_frac, rho, T, c7_props=None):
 
     x = np.asarray(comp_frac, dtype=float); x = x / x.sum()
 
-    # Dilute-gas viscosity, Stiel-Thodos
+    # Dilute-gas viscosity, Stiel-Thodos. The published coefficients
+    # (34e-5, 17.78e-5, and the LBC 1e-4 term) require the viscosity-
+    # reducing parameter in Tc [K] and Pc [atm]. The component table is in
+    # degR and psia, so convert HERE — using degR/psia directly made every
+    # LBC viscosity ~5.4x too high.
     Tr = T / Tc
-    # zeta_i = Tc^(1/6) / (MW^(1/2) * Pc^(2/3))   (Field-unit version)
-    zeta = Tc ** (1 / 6) / (MW ** 0.5 * Pc ** (2 / 3))
+    Tc_K, Pc_atm = Tc / 1.8, Pc / 14.696
+    zeta = Tc_K ** (1 / 6) / (MW ** 0.5 * Pc_atm ** (2 / 3))
     mu_star = np.where(Tr <= 1.5,
                        3.4e-4 * Tr ** 0.94 / zeta,
                        1.778e-4 * (4.58 * Tr - 1.67) ** (5 / 8) / zeta)
@@ -41,7 +47,7 @@ def lbc_viscosity(comp_names, comp_frac, rho, T, c7_props=None):
     MWm = float(np.dot(x, MW))
     Vcm = float(np.dot(x, Vc))
 
-    zeta_m = Tcm ** (1 / 6) / (MWm ** 0.5 * Pcm ** (2 / 3))
+    zeta_m = (Tcm / 1.8) ** (1 / 6) / (MWm ** 0.5 * (Pcm / 14.696) ** (2 / 3))
 
     # Reduced density
     rho_m = rho / MWm           # lbmol/ft3

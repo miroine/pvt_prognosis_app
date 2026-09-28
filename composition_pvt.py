@@ -14,6 +14,8 @@ For a gas condensate:
         - Track Rv = liquid (STB) / gas (Mscf) of the produced gas re-flashed at standard conditions
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 from eos_pr import flash, pr_phase, phase_density
 from lbc import lbc_viscosity
@@ -60,6 +62,40 @@ def standard_conditions_split(comp_frac, comp_names, c7_props=None):
     V_oil_bbl = n_oil * M_oil / rho_oil / 5.615
     V_gas_scf = n_gas * SCF_PER_LBMOL
     return n_oil, n_gas, V_oil_bbl, V_gas_scf, r["x"], r["y"]
+
+
+def _gas_row(vap, comp_names, P, T_res, Z_V, c7_props, phase):
+    """One PVTG-ready gas row for reservoir vapour `vap` at (P, T_res).
+
+    ECLIPSE PVTG wants Bg per Mscf of SURFACE DRY GAS and Rv per Mscf of
+    that same gas. The vapour is flashed to standard conditions; its
+    surface gas volume (not 379.49 scf per lbmol of reservoir vapour) is
+    the basis. The dry-gas end of the branch (Rv = 0) is that surface gas
+    re-flashed at reservoir P, T.
+    """
+    rho_g = phase_density(comp_names, vap, Z_V, P, T_res, c7_props)
+    V_res_rb = Z_V * 10.732 * T_res / P / 5.615          # rb per lbmol vapour
+    _, _, V_o_sc, V_g_sc, _, y_sc = standard_conditions_split(
+        vap, comp_names, c7_props)
+    if V_g_sc <= 0:
+        V_g_sc = SCF_PER_LBMOL
+    Bg = V_res_rb / V_g_sc * 1000.0                       # rb/Mscf dry gas
+    Rv = V_o_sc / V_g_sc * 1000.0                         # STB/Mscf
+    mu_g = lbc_viscosity(comp_names, vap, rho_g, T_res, c7_props)
+    # Dry-gas end point (Rv = 0)
+    Bg0, mu0 = Bg, mu_g
+    try:
+        if np.sum(y_sc) > 0:
+            rd = flash(y_sc, comp_names, P, T_res, c7_props)
+            Zd = rd.get("Z_V") or rd.get("Z_L")
+            if Zd:
+                Bg0 = Zd * 10.732 * T_res / P / 5.615 / SCF_PER_LBMOL * 1000.0
+                rho_d = phase_density(comp_names, y_sc, Zd, P, T_res, c7_props)
+                mu0 = lbc_viscosity(comp_names, y_sc, rho_d, T_res, c7_props)
+    except Exception:
+        pass
+    return {"P": P, "Z": Z_V, "Bg": Bg, "Rv": Rv, "mu_g": mu_g,
+            "rho_g": rho_g, "phase": phase, "Bg_dry": Bg0, "mu_g_dry": mu0}
 
 
 def black_oil_table_from_composition(z, comp_names, T_res, pressures,
@@ -145,39 +181,11 @@ def black_oil_table_from_composition(z, comp_names, T_res, pressures,
         for P in pressures:
             r = flash(z, comp_names, P, T_res, c7_props)
             if r["phase"] == "V":
-                Z_V = r["Z_V"]
-                rho_g = phase_density(comp_names, z, Z_V, P, T_res, c7_props)
-                # Bg = V_res / V_sc per lbmol
-                # 1 lbmol gas at (P,T) takes Z*R*T/P ft3; at SC takes 379.49 scf
-                Bg_rb_per_scf = (Z_V * 10.732 * T_res / P) / SCF_PER_LBMOL / 5.615
-                Bg_rb_per_Mscf = Bg_rb_per_scf * 1000.0
-
-                # Rv: re-flash z at SC to get STB/Mscf
-                n_o_sc, n_g_sc, V_o_sc, V_g_sc, *_ = standard_conditions_split(
-                    z, comp_names, c7_props)
-                if V_g_sc > 0:
-                    Rv_STB_per_Mscf = (V_o_sc / V_g_sc) * 1000.0
-                else:
-                    Rv_STB_per_Mscf = 0.0
-                mu_g = lbc_viscosity(comp_names, z, rho_g, T_res, c7_props)
-                rows.append({"P": P, "Z": Z_V, "Bg": Bg_rb_per_Mscf,
-                             "Rv": Rv_STB_per_Mscf, "mu_g": mu_g,
-                             "rho_g": rho_g, "phase": "V"})
+                rows.append(_gas_row(z, comp_names, P, T_res, r["Z_V"],
+                                     c7_props, "V"))
             else:
-                # Two-phase below Pdew
-                Z_V = r["Z_V"]
-                y = r["y"]
-                rho_g = phase_density(comp_names, y, Z_V, P, T_res, c7_props)
-                Bg_rb_per_scf = (Z_V * 10.732 * T_res / P) / SCF_PER_LBMOL / 5.615
-                Bg_rb_per_Mscf = Bg_rb_per_scf * 1000.0
-
-                # Rv from gas-phase composition re-flashed at SC
-                n_o_sc, n_g_sc, V_o_sc, V_g_sc, *_ = standard_conditions_split(
-                    y, comp_names, c7_props)
-                Rv_STB_per_Mscf = (V_o_sc / V_g_sc) * 1000.0 if V_g_sc > 0 else 0.0
-                mu_g = lbc_viscosity(comp_names, y, rho_g, T_res, c7_props)
-                rows.append({"P": P, "Z": Z_V, "Bg": Bg_rb_per_Mscf,
-                             "Rv": Rv_STB_per_Mscf, "mu_g": mu_g,
-                             "rho_g": rho_g, "phase": "LV"})
+                # Two-phase below Pdew: the gas phase y carries the Rv
+                rows.append(_gas_row(r["y"], comp_names, P, T_res, r["Z_V"],
+                                     c7_props, "LV"))
         rows = sorted(rows, key=lambda r: r["P"])
         return {"rows": rows, "fluid": "gas"}

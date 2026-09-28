@@ -14,6 +14,8 @@ Black-oil CVD for WET GAS:
     * Bo_cond(P) / Bg(Pdew) (approximate).
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 from correlations import OilCorrelations, GasCorrelations, WetGasCorrelations
 
@@ -113,10 +115,15 @@ def cvd_wetgas(wet_corr, Pdew, pressures):
             # Convert STB to reservoir bbl using typical condensate FVF ~ 1.1
             Bo_cond = 1.1
             dropout_bbl_per_scf = (Rv_max - Rv) * Bo_cond
-            # As % of Vsat (= Bg_dew per scf)
-            L_dropout = 100.0 * dropout_bbl_per_scf / Bg_dew
-            # Cumulative produced: approximate as (1 - Bg_dew/Bg) × some factor
-            cum_produced += 0.1  # placeholder rate; real CVD needs proper bookkeeping
+            # As % of Vsat. Rv is per scf of SEPARATOR gas, so the dew-point
+            # cell volume must be on the same basis: Bg_ws * (1 + Veq*Rv_max).
+            Veq = getattr(wet_corr, "Veq", 0.0)
+            L_dropout = 100.0 * dropout_bbl_per_scf / (Bg_dew * (1.0 + Veq * Rv_max))
+            # Cumulative well-stream produced (% of initial moles) from the
+            # constant-volume material balance (gas Z as the two-phase Z):
+            #   n_p / n_i = 1 - (P/Z) / (Pdew/Z_dew)
+            # (was a placeholder that added 0.1 % per step)
+            cum_produced = 100.0 * max(0.0, 1.0 - (P / Z) / (Pdew / Z_dew))
             rows.append({
                 "P": P, "Z": Z, "Bg": Bg * 1000.0,
                 "Rv_produced": Rv * 1000.0,

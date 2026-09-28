@@ -18,49 +18,100 @@ PVTG format (the dual of PVTO):
   /
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 
 
-def build_pvto(df, Pb, oil, Rsi, P_max):
-    """
-    Build PVTO keyword. df contains saturated branch for P <= Pb plus
-    one extra row at the highest tabulated pressure.
-    We construct nodes at several Rs values (Rs from 0 to Rsi) and add
-    under-saturated extension at the maximum Rs node up to P_max.
-    """
-    lines = ["PVTO", "-- Rs       Psat       Bo        Muo",
-             "-- Mscf/STB  psia       rb/STB    cP"]
+def pvto_nodes(oil, Rsi, Pb, P_max, P_min=14.7, n_sat=20, n_under=6,
+               extend_above_pb=True):
+    """Compute the PVTO node structure (FIELD units).
 
-    # Choose Rs node values (e.g. 8 nodes from low to Rsi)
-    n_nodes = 8
-    rs_nodes = np.linspace(max(Rsi * 0.05, 1.0), Rsi, n_nodes)
+    Returns a list of dicts, one per saturated Rs node, in increasing Rs:
+        {"Rs": scf/STB, "Psat": psia, "Bo_sat", "mu_sat",
+         "P_u": [...], "Bo_u": [...], "mu_u": [...]}   (undersaturated)
 
-    for i, Rs in enumerate(rs_nodes):
-        # Saturation pressure for this Rs
-        Psat = oil.bubble_point(Rs)
+    Span (the ECLIPSE-recommended layout):
+      * saturated nodes from ~1 atm up to Pb — and, if extend_above_pb,
+        on up to P_max using the correlation Rs(P) beyond Rsi, so cells
+        that re-dissolve gas (gas injection, gas-cap contact, pressure
+        maintenance) never fall off the table;
+      * Rsi at exactly Pb is always a node (the initial oil);
+      * EVERY node carries an undersaturated branch from its Psat up to
+        ~1.25 x the table top, so ECLIPSE never has to borrow a branch
+        from a neighbouring node.
+    """
+    P_lo = max(P_min, 14.7)
+    P_top_sat = max(P_max, Pb) if extend_above_pb else Pb
+    grid = set(np.round(np.geomspace(P_lo, P_top_sat, int(n_sat)), 3))
+    grid.add(round(Pb, 3))
+    P_grid = sorted(p for p in grid if P_lo <= p <= P_top_sat + 1e-6)
+    P_branch_top = max(P_max, Pb) * 1.25
+
+    # Reference undersaturated behaviour, taken at the REAL bubble point
+    # (Rsi, Pb) where the Vasquez-Beggs undersaturated correlations are
+    # valid, expressed as ratios vs (P - Psat). Every node's branch is
+    # Bo_sat*rBo(dP), mu_sat*rMu(dP) — the same shifting ECLIPSE applies
+    # when a branch is omitted. Evaluating V-B directly at a low Psat
+    # (e.g. 15 psia) is outside its range and blows up (mu x18, Bo < 1).
+    Bo_pb = oil.formation_volume_factor(Pb, Rsi, saturated=True)
+    mu_pb = oil.viscosity(Pb, Rsi, Pb, saturated=True)
+
+    def _ratios(dP):
+        P = Pb + dP
+        return (oil.formation_volume_factor(P, Rsi, saturated=False, Pb=Pb)
+                / Bo_pb,
+                oil.viscosity(P, Rsi, Pb, saturated=False) / mu_pb)
+
+    nodes, last_rs = [], -1.0
+    for P in P_grid:
+        if abs(P - Pb) < 1e-3:
+            Rs = Rsi
+        else:
+            Rs = oil.solution_gor(P)
+            if P < Pb:
+                Rs = min(Rs, Rsi * P / Pb if Rs <= 0 else Rs)
+        if not np.isfinite(Rs) or Rs <= last_rs + 1e-6:
+            continue                      # Rs must strictly increase
+        Psat = P
         Bo_sat = oil.formation_volume_factor(Psat, Rs, saturated=True)
         mu_sat = oil.viscosity(Psat, Rs, Psat, saturated=True)
+        P_u = list(np.linspace(Psat, P_branch_top, int(n_under) + 1)[1:])
+        rat = [_ratios(p - Psat) for p in P_u]
+        Bo_u = [Bo_sat * r[0] for r in rat]
+        mu_u = [mu_sat * r[1] for r in rat]
+        nodes.append({"Rs": Rs, "Psat": Psat, "Bo_sat": Bo_sat,
+                      "mu_sat": mu_sat, "P_u": P_u, "Bo_u": Bo_u,
+                      "mu_u": mu_u})
+        last_rs = Rs
+    return nodes
 
-        Rs_Mscf = Rs / 1000.0  # ECLIPSE wants Mscf/STB in METRIC, but METRIC differs.
-        # In FIELD units PVTO uses Mscf/STB for Rs.
 
-        line = f"  {Rs_Mscf:8.4f}   {Psat:9.2f}   {Bo_sat:7.4f}   {mu_sat:7.4f}"
+def build_pvto(df, Pb, oil, Rsi, P_max, P_min=14.7, n_sat=20, n_under=6,
+               extend_above_pb=True):
+    """PVTO keyword (FIELD units: Rs Mscf/STB, P psia, Bo rb/STB, cP).
 
-        # Under-saturated extension only on the LAST (highest Rs) node
-        if i == len(rs_nodes) - 1:
-            lines.append(line)
-            # Add P > Psat points up to P_max
-            P_under = np.linspace(Psat * 1.1, P_max, 5)
-            for Pu in P_under:
-                if Pu <= Psat:
-                    continue
-                Bo_u = oil.formation_volume_factor(Pu, Rs, saturated=False, Pb=Psat)
-                mu_u = oil.viscosity(Pu, Rs, Psat, saturated=False)
-                lines.append(f"            {Pu:9.2f}   {Bo_u:7.4f}   {mu_u:7.4f}")
-            lines[-1] += "  /"
-        else:
-            lines.append(line + "  /")
-
+    Layout per record (one saturated Rs node):
+        Rs  Psat  Bo_sat  mu_sat
+              P1    Bo1     mu1       <- undersaturated, same Rs
+              P2    Bo2     mu2  /
+    and a final '/' closes the table. See pvto_nodes() for the span.
+    `df` is kept for call-site compatibility and not used.
+    """
+    nodes = pvto_nodes(oil, Rsi, Pb, P_max, P_min=P_min, n_sat=n_sat,
+                       n_under=n_under, extend_above_pb=extend_above_pb)
+    lines = ["PVTO",
+             f"-- {len(nodes)} saturated Rs nodes, each with an "
+             f"undersaturated branch",
+             "-- Rs         Psat        Bo          Muo",
+             "-- Mscf/STB   psia        rb/STB      cP"]
+    for nd in nodes:
+        lines.append(f"  {nd['Rs'] / 1000.0:9.5f}   {nd['Psat']:9.2f}   "
+                     f"{nd['Bo_sat']:9.5f}   {nd['mu_sat']:9.5f}")
+        for j, (p, bo, mu) in enumerate(zip(nd["P_u"], nd["Bo_u"],
+                                             nd["mu_u"])):
+            end = "  /" if j == len(nd["P_u"]) - 1 else ""
+            lines.append(f"              {p:9.2f}   {bo:9.5f}   {mu:9.5f}{end}")
     lines.append("/")
     return "\n".join(lines) + "\n"
 
@@ -86,93 +137,193 @@ def build_pvtw(Pref, Bw, Cw, muw, viscosibility=0.0):
     return "\n".join(lines)
 
 
-def build_pvtg(pressures, wetgas):
+def _gas_props_at_rv(wetgas, P, Rv):
+    """Bg (rb/Mscf of SURFACE dry gas) and mu_g (cP) for gas carrying
+    Rv STB/scf of vaporised oil, at pressure P (psia).
+
+    The in-situ gas is separator gas + Rv of vaporised condensate. Its
+    gravity per scf of separator gas (McCain recombination):
+        gamma = (gamma_sep + 4584*gamma_o*Rv) / (1 + Veq*Rv)
+    Z and mu come from that mixture; Bg is converted to the surface-gas
+    basis ECLIPSE expects: Bg_dry = Bg_mix * (1 + Veq*Rv).
     """
-    PVTG: live (wet) gas table.
-    Outer loop = pressure node, inner branch = decreasing Rv values.
-    Bg here is in rb/Mscf (FIELD units), Rv in STB/Mscf.
+    from correlations import GasCorrelations
+    Veq = getattr(wetgas, "Veq", 0.0)
+    g_sep = getattr(wetgas, "gamma_g_sep", 0.7)
+    g_o = getattr(wetgas, "gamma_cond", 0.75)
+    gamma = (g_sep + 4584.0 * g_o * Rv) / (1.0 + Veq * Rv)
+    gas = GasCorrelations(gamma, wetgas.T, N2=wetgas.N2, CO2=wetgas.CO2,
+                          H2S=wetgas.H2S, z_corr=wetgas.z_corr,
+                          mu_corr=wetgas.mu_corr)
+    Z = gas.z_factor(P)
+    Bg = gas.formation_volume_factor(P, Z) * (1.0 + Veq * Rv) * 1000.0
+    return Bg, gas.viscosity(P, Z)
 
-    For each pressure node:
-        line 1 :  P   Rv_sat   Bg(P,Rv_sat)   mu_g(P,Rv_sat)
-        lines  :       Rv_low  Bg_dry         mu_g_dry        /
-    All terminated by /.
+
+def pvtg_nodes(pressures, wetgas, n_under=4):
+    """PVTG node structure (FIELD units), one dict per pressure node:
+        {"P": psia, "Rv": [STB/Mscf, decreasing, first = saturated, last 0],
+         "Bg": [rb/Mscf], "mu": [cP]}
+
+    Saturated Rv: below the dew point it follows the wet-gas model. Above
+    it the saturated line keeps rising, so the reservoir gas (Rv = CGR)
+    sits on an UNDERSATURATED branch and the dew point falls exactly where
+    Rv_sat = CGR. The extension slope is the largest (<= the slope below
+    Pdew) that keeps saturated Bg strictly decreasing with pressure —
+    rich gas extrapolated too steeply would imply negative compressibility.
+    Rv = CGR is a branch point on every node above the dew point.
     """
-    lines = ["PVTG", "-- P        Rv         Bg         Mug",
-             "-- psia     STB/Mscf   rb/Mscf    cP"]
+    Rv_max = wetgas.Rv_max
+    Pdew = wetgas.Pdew
+    const = getattr(wetgas, "rv_corr", "") == "Constant"
+    P_nodes = sorted(set(float(p) for p in pressures) | (
+        {float(Pdew)} if min(pressures) < Pdew < max(pressures) else set()))
+    P_nodes = [p for p in P_nodes if p >= 14.7]   # dew point is a node
 
-    for P in pressures:
-        if P < 14.7:
-            continue
-        Z = wetgas.z_factor(P)
-        Bg = wetgas.formation_volume_factor(P, Z) * 1000.0   # rb/scf -> rb/Mscf
-        mu = wetgas.viscosity(P, Z)
-        Rv_sat = wetgas.rv(P) * 1000.0                       # STB/scf -> STB/Mscf
-        # ECLIPSE PVTG Bg is reservoir volume per Mscf of SURFACE DRY gas.
-        # The wet-gas Z/Bg are per scf of well-stream gas, which also
-        # contains the condensate's gas-equivalent (Veq scf per STB):
-        #   Bg_dry = Bg_wet * (1 + Veq * Rv[STB/scf])
-        Veq = getattr(wetgas, "Veq", 0.0)
-        Bg_wet = Bg
-        Bg = Bg_wet * (1.0 + Veq * Rv_sat / 1000.0)
+    def rv_sat_at(P, slope):
+        if const:
+            return Rv_max
+        if P < Pdew:
+            return wetgas.rv(P)
+        return Rv_max * (1.0 + slope * (P - Pdew) / Pdew)
 
-        # Saturated (highest Rv) line
-        lines.append(f"  {P:8.2f}  {Rv_sat:9.5f}  {Bg:9.5f}  {mu:8.5f}")
+    def sat_bg(slope):
+        return [_gas_props_at_rv(wetgas, P, rv_sat_at(P, slope))[0]
+                for P in P_nodes]
 
-        # Lower-Rv branch — Bg decreases slightly, mu increases slightly
-        # Use a small linear correction with Rv (typical lab behaviour)
-        Rv_branch = np.linspace(Rv_sat, 0.0, 4)[1:]
-        for i, Rv in enumerate(Rv_branch):
-            # Approximate corrections (~0.5–1 % in Bg, ~1–2 % in mu)
-            frac = (Rv_sat - Rv) / max(Rv_sat, 1e-9)
-            Bg_b = Bg_wet * (1 - 0.005 * frac) * (1.0 + Veq * Rv / 1000.0)
-            mu_b = mu * (1 + 0.015 * frac)
-            terminator = "  /" if i == len(Rv_branch) - 1 else ""
-            lines.append(f"            {Rv:9.5f}  {Bg_b:9.5f}  {mu_b:8.5f}{terminator}")
+    def decreasing(v):
+        return all(x > y for x, y in zip(v, v[1:]))
 
+    slope = 0.95
+    if not const and any(P >= Pdew for P in P_nodes) \
+            and not decreasing(sat_bg(slope)):
+        lo, hi = 0.0, slope              # lo = flat, always feasible above Pdew
+        for _ in range(25):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if decreasing(sat_bg(mid)) else (lo, mid)
+        slope = lo
+
+    nodes = []
+    for P in P_nodes:
+        rv_sat = rv_sat_at(P, slope)
+        grid = list(np.linspace(rv_sat, 0.0, int(n_under) + 1))
+        if 0.0 < Rv_max < rv_sat:
+            # snap the nearest interior grid point to the reservoir-gas Rv
+            k = min(range(1, len(grid) - 1),
+                    key=lambda i: abs(grid[i] - Rv_max), default=None)
+            if k is not None:
+                grid[k] = Rv_max
+            else:
+                grid.insert(1, Rv_max)
+        rvs = sorted(set(round(r, 12) for r in grid), reverse=True)
+        props = [_gas_props_at_rv(wetgas, P, rv) for rv in rvs]
+        nodes.append({"P": P, "Rv": [rv * 1000.0 for rv in rvs],
+                      "Bg": [p[0] for p in props],
+                      "mu": [p[1] for p in props]})
+    return nodes
+
+
+def build_pvtg(pressures, wetgas, n_under=4):
+    """PVTG keyword (FIELD units: P psia, Rv STB/Mscf, Bg rb/Mscf, cP).
+
+    One record per pressure node:
+        P   Rv_sat  Bg  mu        <- saturated gas at this pressure
+            Rv_2    Bg  mu        <- undersaturated (leaner) gas
+            0.0     Bg  mu  /     <- dry gas
+    and a final '/' closes the table.
+    """
+    nodes = pvtg_nodes(pressures, wetgas, n_under=n_under)
+    lines = ["PVTG",
+             f"-- {len(nodes)} pressure nodes, each with an undersaturated "
+             f"branch down to dry gas (Rv = 0)",
+             "-- P          Rv            Bg           Mug",
+             "-- psia       STB/Mscf      rb/Mscf      cP"]
+    for nd in nodes:
+        for j, (rv, bg, mu) in enumerate(zip(nd["Rv"], nd["Bg"], nd["mu"])):
+            end = "  /" if j == len(nd["Rv"]) - 1 else ""
+            lead = f"  {nd['P']:9.2f}" if j == 0 else " " * 11
+            lines.append(f"{lead}   {rv:11.6f}   {bg:10.5f}   {mu:9.6f}{end}")
     lines.append("/")
     return "\n".join(lines) + "\n"
 
 
 def build_pvto_from_compositional(rows, Pb, P_max):
+    """PVTO from EOS black-oil rows (FIELD units).
+
+    `rows` is the list returned by black_oil_table_from_composition (oil):
+    saturated rows at P <= Pb (Rs, Bo, mu_o from the DLE) and rows above
+    Pb at constant Rsi. Every saturated Rs node gets an undersaturated
+    branch: the EOS rows above Pb define the reference behaviour as
+    ratios Bo/Bo_pb and mu/mu_pb vs (P - Pb), applied from each node's
+    own Psat (the same shifting ECLIPSE uses for omitted branches).
     """
-    Build PVTO from compositional black-oil table rows.
-    `rows` is the list returned by black_oil_table_from_composition (oil).
-    """
-    sat_rows = [r for r in rows if r["P"] <= Pb + 1.0]
-    und_rows = [r for r in rows if r["P"] >  Pb + 1.0]
-
-    lines = ["PVTO", "-- Rs       Psat       Bo        Muo",
-             "-- Mscf/STB  psia       rb/STB    cP"]
-
-    for i, r in enumerate(sat_rows):
-        Rs = r["Rs"] / 1000.0
-        is_last_sat = (i == len(sat_rows) - 1)
-        line = f"  {Rs:8.4f}   {r['P']:9.2f}   {r['Bo']:7.4f}   {r['mu_o']:7.4f}"
-        if is_last_sat and und_rows:
-            lines.append(line)
-            for j, ru in enumerate(und_rows):
-                terminator = "  /" if j == len(und_rows) - 1 else ""
-                lines.append(f"            {ru['P']:9.2f}   {ru['Bo']:7.4f}   {ru['mu_o']:7.4f}{terminator}")
-        else:
-            lines.append(line + "  /")
-
+    rows = sorted(rows, key=lambda r: r["P"])
+    sat = [r for r in rows if r["P"] <= Pb + 1.0]
+    und = [r for r in rows if r["P"] > Pb + 1.0]
+    # Rs must strictly increase node to node
+    nodes, last = [], -1.0
+    for r in sat:
+        if r["Rs"] > last + 1e-6:
+            nodes.append(r)
+            last = r["Rs"]
+    lines = ["PVTO",
+             f"-- EOS-derived; {len(nodes)} saturated Rs nodes, each with an "
+             f"undersaturated branch",
+             "-- Rs         Psat        Bo          Muo",
+             "-- Mscf/STB   psia        rb/STB      cP"]
+    if not nodes:
+        lines.append("/")
+        return "\n".join(lines) + "\n"
+    ref = nodes[-1]
+    if und:
+        dP = [r["P"] - ref["P"] for r in und]
+        rBo = [r["Bo"] / ref["Bo"] for r in und]
+        rMu = [r["mu_o"] / ref["mu_o"] for r in und]
+    else:
+        # No EOS data above Pb (table top <= Pb): a minimal branch with a
+        # typical oil compressibility (1e-5 /psi) so ECLIPSE has the
+        # mandatory undersaturated data. Widen the pressure range to
+        # replace it with EOS values.
+        lines.insert(2, "-- NOTE: no EOS points above Pb - undersaturated "
+                        "branch uses co = 1e-5 /psi")
+        dP = [500.0, 1000.0, 2000.0]
+        rBo = [float(np.exp(-1e-5 * d)) for d in dP]
+        rMu = [1.0 + 5e-5 * d for d in dP]
+    for nd in nodes:
+        lines.append(f"  {nd['Rs'] / 1000.0:9.5f}   {nd['P']:9.2f}   "
+                     f"{nd['Bo']:9.5f}   {nd['mu_o']:9.5f}")
+        for j, (d, rb, rm) in enumerate(zip(dP, rBo, rMu)):
+            end = "  /" if j == len(dP) - 1 else ""
+            lines.append(f"              {nd['P'] + d:9.2f}   "
+                         f"{nd['Bo'] * rb:9.5f}   {nd['mu_o'] * rm:9.5f}{end}")
     lines.append("/")
     return "\n".join(lines) + "\n"
 
 
-def build_pvtg_from_compositional(rows, Pdew):
-    """Build PVTG from compositional gas-condensate table rows."""
-    lines = ["PVTG", "-- P        Rv         Bg         Mug",
-             "-- psia     STB/Mscf   rb/Mscf    cP"]
-    for r in rows:
-        P = r["P"]
-        Rv = r["Rv"]   # already in STB/Mscf in the table
-        Bg = r["Bg"]
-        mu = r["mu_g"]
-        lines.append(f"  {P:8.2f}  {Rv:9.5f}  {Bg:9.5f}  {mu:8.5f}")
-        Bg_dry = Bg * 0.995
-        mu_dry = mu * 1.02
-        lines.append(f"            {0.0:9.5f}  {Bg_dry:9.5f}  {mu_dry:8.5f}  /")
+def build_pvtg_from_compositional(rows, Pdew, n_under=4):
+    """PVTG from EOS gas-condensate rows (FIELD units).
+
+    Each pressure node: the saturated gas (Rv, Bg, mu from the EOS vapour,
+    Bg per Mscf of surface dry gas) and an undersaturated branch down to
+    dry gas (Rv = 0: the surface gas re-flashed at reservoir P, T).
+    Interior branch points interpolate linearly in Rv between the two
+    computed end points.
+    """
+    lines = ["PVTG",
+             "-- EOS-derived; each node has a branch to dry gas (Rv = 0)",
+             "-- P          Rv            Bg           Mug",
+             "-- psia       STB/Mscf      rb/Mscf      cP"]
+    for r in sorted(rows, key=lambda q: q["P"]):
+        P, rv, bg, mu = r["P"], r["Rv"], r["Bg"], r["mu_g"]
+        bg0, mu0 = r.get("Bg_dry", bg), r.get("mu_g_dry", mu)
+        if rv <= 0:
+            continue
+        for j, f in enumerate(np.linspace(1.0, 0.0, int(n_under) + 1)):
+            end = "  /" if j == int(n_under) else ""
+            lead = f"  {P:9.2f}" if j == 0 else " " * 11
+            lines.append(f"{lead}   {rv * f:11.6f}   "
+                         f"{bg0 + f * (bg - bg0):10.5f}   "
+                         f"{mu0 + f * (mu - mu0):9.6f}{end}")
     lines.append("/")
     return "\n".join(lines) + "\n"
 
@@ -273,10 +424,10 @@ def _convert_pvto_to_metric(field_text):
         if len(vals) == 4:
             Rs, P, Bo, Mu = vals
             Rs_si = Rs * 1000.0 / SCF_PER_SM3
-            new = f"  {Rs_si:8.4f}   {P/PSI_PER_BAR:9.3f}   {Bo:7.4f}   {Mu:7.4f}"
+            new = f"  {Rs_si:9.4f}   {P/PSI_PER_BAR:9.3f}   {Bo:9.5f}   {Mu:9.5f}"
         elif len(vals) == 3:
             P, Bo, Mu = vals
-            new = f"            {P/PSI_PER_BAR:9.3f}   {Bo:7.4f}   {Mu:7.4f}"
+            new = f"             {P/PSI_PER_BAR:9.3f}   {Bo:9.5f}   {Mu:9.5f}"
         else:
             out_lines.append(line); continue
         if has_slash: new += "  /"
@@ -341,12 +492,12 @@ def _convert_pvtg_to_metric(field_text):
             P, Rv, Bg, Mu = vals
             Rv_si = Rv * 0.158987 / 28.3168
             Bg_si = Bg * 0.158987 / 28.3168
-            new = f"  {P/PSI_PER_BAR:9.3f}  {Rv_si:11.7f}  {Bg_si:11.7f}  {Mu:8.5f}"
+            new = f"  {P/PSI_PER_BAR:9.3f}  {Rv_si:13.6e}  {Bg_si:13.6e}  {Mu:9.6f}"
         elif len(vals) == 3:
             Rv, Bg, Mu = vals
             Rv_si = Rv * 0.158987 / 28.3168
             Bg_si = Bg * 0.158987 / 28.3168
-            new = f"             {Rv_si:11.7f}  {Bg_si:11.7f}  {Mu:8.5f}"
+            new = f"             {Rv_si:13.6e}  {Bg_si:13.6e}  {Mu:9.6f}"
         else:
             out.append(line); continue
         if has_slash: new += "  /"

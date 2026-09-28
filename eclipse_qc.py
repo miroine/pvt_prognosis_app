@@ -20,6 +20,8 @@ Helpers that make the generated ECLIPSE decks safer and more useful:
    vaporized-oil content varies with depth.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import re
 
 
@@ -280,6 +282,135 @@ def parse_pvto_branches(pvto_text):
         branches.append(current)
     return branches
 
+
+
+def parse_pvtg_branches(pvtg_text):
+    """Parse a PVTG keyword block into per-pressure nodes.
+
+    A 4-number row (P, Rv, Bg, mu) opens a pressure node (its saturated
+    gas); 3-number rows (Rv, Bg, mu) that follow are that node's
+    undersaturated branch. Returns
+        [{"P": float, "Rv": [...], "Bg": [...], "mu": [...]}, ...]
+    in the deck's own units. (Flattening PVTG into one table — as the old
+    QC did — shifts every branch row into the wrong columns.)
+    """
+    nodes, cur = [], None
+    for line in pvtg_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("--") or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", s):
+            continue
+        s = s.rstrip("/").strip()
+        if not s:
+            continue
+        try:
+            vals = [float(n) for n in
+                    re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)]
+        except ValueError:
+            continue
+        if len(vals) >= 4:
+            if cur is not None:
+                nodes.append(cur)
+            cur = {"P": vals[0], "Rv": [vals[1]], "Bg": [vals[2]],
+                   "mu": [vals[3]]}
+        elif len(vals) == 3 and cur is not None:
+            cur["Rv"].append(vals[0]); cur["Bg"].append(vals[1])
+            cur["mu"].append(vals[2])
+    if cur is not None:
+        nodes.append(cur)
+    return nodes
+
+
+def _fmt(v):
+    return f"{v:.6g}"
+
+
+def qc_pvto_branches(branches):
+    """ECLIPSE rules for a PVTO table, checked on its real structure.
+
+    errors   — ECLIPSE rejects the deck:
+        Rs and Psat strictly increasing node to node; within each branch
+        P strictly increasing and Bo strictly decreasing; the highest-Rs
+        node must carry undersaturated data; all values positive.
+    warnings — accepted but physically suspicious:
+        saturated Bo not increasing with Rs, saturated mu not decreasing
+        with Rs, branch viscosity decreasing with pressure.
+    """
+    err, warn = [], []
+    if not branches:
+        return {"ok": False, "problems": ["PVTO table is empty."],
+                "warnings": []}
+    for i, b in enumerate(branches):
+        tag = f"node {i+1} (Rs {_fmt(b['Rs'])})"
+        if min([b["Rs"]] + b["P"] + b["Bo"] + b["mu"]) <= 0 and b["Rs"] < 0:
+            err.append(f"{tag}: negative value.")
+        if min(b["P"] + b["Bo"] + b["mu"]) <= 0:
+            err.append(f"{tag}: non-positive P, Bo or viscosity.")
+        for k in range(1, len(b["P"])):
+            if b["P"][k] <= b["P"][k-1]:
+                err.append(f"{tag}: branch pressure not increasing at "
+                           f"P = {_fmt(b['P'][k])}.")
+            if b["Bo"][k] >= b["Bo"][k-1]:
+                err.append(f"{tag}: undersaturated Bo not decreasing at "
+                           f"P = {_fmt(b['P'][k])} (negative compressibility).")
+            if b["mu"][k] < b["mu"][k-1]:
+                warn.append(f"{tag}: viscosity falls with pressure above "
+                            f"Psat at P = {_fmt(b['P'][k])}.")
+        if i:
+            a = branches[i-1]
+            if b["Rs"] <= a["Rs"]:
+                err.append(f"{tag}: Rs not strictly increasing.")
+            if b["P"][0] <= a["P"][0]:
+                err.append(f"{tag}: Psat not strictly increasing "
+                           f"({_fmt(a['P'][0])} -> {_fmt(b['P'][0])}).")
+            if b["Bo"][0] <= a["Bo"][0]:
+                warn.append(f"{tag}: saturated Bo does not increase with Rs.")
+            if b["mu"][0] > a["mu"][0]:
+                warn.append(f"{tag}: saturated viscosity increases with Rs.")
+    if len(branches[-1]["P"]) < 2:
+        err.append("The highest-Rs node has no undersaturated data — "
+                   "ECLIPSE requires it.")
+    return {"ok": not err, "problems": err, "warnings": warn}
+
+
+def qc_pvtg_branches(nodes):
+    """ECLIPSE rules for a PVTG table, checked on its real structure.
+
+    errors   — pressure nodes strictly increasing; within each node Rv
+               strictly decreasing and non-negative; Bg and mu positive;
+               the highest-pressure node carries undersaturated data.
+    warnings — saturated Rv falling with pressure; saturated Bg not
+               decreasing with pressure (negative gas compressibility —
+               typical of a near-critical fluid; use the EOS PVTG).
+    """
+    err, warn = [], []
+    if not nodes:
+        return {"ok": False, "problems": ["PVTG table is empty."],
+                "warnings": []}
+    for i, n in enumerate(nodes):
+        tag = f"P node {_fmt(n['P'])}"
+        if min(n["Bg"] + n["mu"]) <= 0 or n["P"] <= 0:
+            err.append(f"{tag}: non-positive P, Bg or viscosity.")
+        if min(n["Rv"]) < 0:
+            err.append(f"{tag}: negative Rv.")
+        for k in range(1, len(n["Rv"])):
+            if n["Rv"][k] >= n["Rv"][k-1]:
+                err.append(f"{tag}: Rv not strictly decreasing along the "
+                           f"branch ({_fmt(n['Rv'][k-1])} -> "
+                           f"{_fmt(n['Rv'][k])}).")
+        if i:
+            a = nodes[i-1]
+            if n["P"] <= a["P"]:
+                err.append(f"{tag}: pressure not strictly increasing.")
+            if n["Rv"][0] < a["Rv"][0]:
+                warn.append(f"{tag}: saturated Rv falls with pressure.")
+            if n["Bg"][0] >= a["Bg"][0]:
+                warn.append(f"{tag}: saturated Bg does not decrease with "
+                            f"pressure — negative gas compressibility; "
+                            f"consider the EOS (compositional) PVTG.")
+    if len(nodes[-1]["Rv"]) < 2:
+        err.append("The highest-pressure node has no undersaturated data "
+                   "— ECLIPSE requires it.")
+    return {"ok": not err, "problems": err, "warnings": warn}
 
 # ----------------------------------------------------------------------
 # Auto-fix: enforce monotonicity on a PVT table

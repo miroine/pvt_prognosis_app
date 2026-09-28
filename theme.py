@@ -5,6 +5,8 @@ Brand reference: Equinor 2018+ rebrand uses Torch Red (#EB0037) as primary,
 Karry (#FFE7D6) and Pistachio (#9DBA00) as secondary, on white / dark-navy base.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 # -----------------------------
 # Color palette
 # -----------------------------

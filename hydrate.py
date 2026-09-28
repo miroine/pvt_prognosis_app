@@ -25,6 +25,8 @@ Inputs/outputs are in FIELD units at the boundary (psia, °F), with internal
 calculations in metric.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 
 

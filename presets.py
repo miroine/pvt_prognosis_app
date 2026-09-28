@@ -14,6 +14,8 @@ input widget keys, then rerunning.
 Values are representative literature fluids, not any specific reservoir.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 # ----------------------------------------------------------------------
 # Oil presets — black-oil branch
 # ----------------------------------------------------------------------

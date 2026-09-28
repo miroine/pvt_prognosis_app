@@ -99,15 +99,65 @@ check("Dolomite -> Newman limestone recommended",
       R.recommend_correlation("Dolomite", "Consolidated", 8000)["recommended"]
       == "Newman — Limestone")
 
-# 7. PVTG Bg on surface-dry-gas basis ------------------------------------
-print("\n7. ECLIPSE PVTG")
+# 7. PVTO / PVTG structure, span and QC ----------------------------------
+print("\n7. ECLIPSE PVTO / PVTG")
+import eclipse_qc as Q
+import multi_region as MR
+o = C.OilCorrelations(35, 0.75, 180)
+pb = o.bubble_point(600)
+nodes = E.pvto_nodes(o, 600, pb, 5000)
+check("PVTO span starts at ~1 atm", nodes[0]["Psat"] <= 15.0)
+check("PVTO extends above Pb to P_max", nodes[-1]["Psat"] >= 4999.0)
+check("PVTO has Rsi exactly at Pb", any(abs(n["Rs"] - 600) < 1e-6
+                                        and abs(n["Psat"] - pb) < 1e-2 for n in nodes))
+check("Every PVTO node carries an undersaturated branch",
+      all(len(n["P_u"]) >= 2 for n in nodes))
+check("Low-Rs branch viscosity bounded (< 3x over the branch)",
+      nodes[0]["mu_u"][-1] / nodes[0]["mu_sat"] < 3.0,
+      f"{nodes[0]['mu_u'][-1] / nodes[0]['mu_sat']:.2f}x")
+pvto = E.build_pvto(None, pb, o, 600, 5000)
+for u in ("FIELD", "METRIC"):
+    t = pvto if u == "FIELD" else E.convert_deck_to_metric(pvto=pvto)["pvto"]
+    r = Q.qc_pvto_branches(Q.parse_pvto_branches(t))
+    check(f"PVTO {u} passes structural QC", r["ok"], "; ".join(r["problems"][:2]))
+for cgr, api in ((20, 60), (80, 55), (200, 50)):
+    wg = C.WetGasCorrelations(0.7, api, cgr, 220.0, Pdew=4500.0)
+    pvtg = E.build_pvtg(list(np.linspace(500, 6000, 12)), wg)
+    nd = Q.parse_pvtg_branches(pvtg)
+    check(f"PVTG CGR {cgr}: dew point is a node", any(abs(n["P"] - 4500) < 0.01 for n in nd))
+    for u in ("FIELD", "METRIC"):
+        t = pvtg if u == "FIELD" else E.convert_deck_to_metric(pvtg=pvtg)["pvtg"]
+        r = Q.qc_pvtg_branches(Q.parse_pvtg_branches(t))
+        check(f"PVTG CGR {cgr} {u} passes structural QC", r["ok"],
+              "; ".join(r["problems"][:2]))
+    hi = nd[-1]
+    check(f"PVTG CGR {cgr}: leaner gas less viscous at high P",
+          hi["mu"][-1] < hi["mu"][0])
 wg = C.WetGasCorrelations(0.7, 55.0, 80.0, 220.0, Pdew=4500.0)
-line = E.build_pvtg([3000.0], wg).splitlines()[3].split()
-Z = wg.z_factor(3000.0)
-Rv = wg.rv(3000.0)
-bg_ref = wg.formation_volume_factor(3000.0, Z) * 1000.0 * (1 + wg.Veq * Rv)
-check("PVTG Bg includes (1 + Veq*Rv) dry-gas basis", close(float(line[2]), bg_ref, 2e-4),
-      f"{line[2]} vs {bg_ref:.5f}")
+bg, _ = E._gas_props_at_rv(wg, 3000.0, wg.rv(3000.0))
+Z = C.GasCorrelations((0.7 + 4584 * wg.gamma_cond * wg.rv(3000.0))
+                      / (1 + wg.Veq * wg.rv(3000.0)), 220.0).z_factor(3000.0)
+ref = 0.00504 * Z * (220 + 460) / 3000.0 * 1000 * (1 + wg.Veq * wg.rv(3000.0))
+check("PVTG Bg on surface-dry-gas basis (1 + Veq*Rv)", close(bg, ref, 1e-6))
+bad = "PVTG\n  1000 0.02 3.0 0.015\n       0.03 2.9 0.016 /\n/\n"
+check("PVTG QC catches Rv increasing along a branch",
+      not Q.qc_pvtg_branches(Q.parse_pvtg_branches(bad))["ok"])
+st = MR.build_multi_region_pvto([pvto, pvto, pvto])
+check("Multi-region PVTO: one terminator per region",
+      sum(1 for l in st.splitlines() if l.strip() == "/") == 3)
+
+# 7b. LBC viscosity units (Stiel-Thodos needs K and atm) --------------------
+import lbc
+check("LBC methane 100 F, 1 atm = 0.0114 cP (+-5 %)",
+      close(lbc.lbc_viscosity(["C1"], [1.0], 0.0392, 559.67), 0.0114, 0.05))
+
+# 7c. Wet-gas CVD material balance ------------------------------------------
+import correlation_experiments as CE
+cv = sorted(CE.cvd_wetgas(wg, 4500.0, [4500, 3500, 2500, 1500, 500]),
+            key=lambda r: -r["P"])
+cp = [r["cum_produced_pct"] for r in cv]
+check("CVD cumulative production 0 at Pdew, rising with depletion",
+      cp[0] == 0 and all(a < b for a, b in zip(cp, cp[1:])))
 
 # 8. Multi-simulator exporters (all kinds x units) ------------------------
 print("\n8. Multi-simulator export")
@@ -154,6 +204,20 @@ gas_ = V.build_vfp_table(flow_rates_bbl_d=[500], flo_kind="GAS", **kw)
 b = liq["bhp_table_disp"][0, 0, 0, 0]
 check("VFP FLO=OIL axis consistent with LIQ", close(oil_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
 check("VFP FLO=GAS axis consistent with LIQ", close(gas_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
+
+# 10. Deployment stamp ------------------------------------------------------
+print("\n10. Deployment")
+import os, re
+_app = open("pvt_app.py").read()
+_ver = re.search(r'^APP_VERSION = "([^"]+)"', _app, re.M).group(1)
+_req = eval(re.search(r"^_REQUIRED = (\[.*?\])", _app, re.M | re.S).group(1))
+_bad = [m for m in _req if not re.search(r'^APP_VERSION = "%s"' % re.escape(_ver),
+                                          open(m + ".py").read(), re.M)]
+check(f"All {len(_req)} runtime modules stamped {_ver}", not _bad, ", ".join(_bad))
+_mods = {f[:-3] for f in os.listdir(".") if f.endswith(".py")} - {"pvt_app", "validate_nodal"}
+_mods = {m for m in _mods if not m.startswith("test_")}
+check("Every runtime module is in the deployment check list",
+      _mods == set(_req), str(sorted(_mods ^ set(_req))))
 
 print("\n" + "=" * 70)
 print(f"  {sum(results)} / {len(results)} audit checks passed")

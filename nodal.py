@@ -51,6 +51,8 @@ limit, find a stable operating point, or compare lift options, not as
 the final design number.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import math
 import numpy as np
 

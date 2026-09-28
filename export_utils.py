@@ -7,6 +7,8 @@ Export utilities for PVT Studio.
             Uses reportlab; imported lazily so missing dep doesn't break the app.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import io
 import json
 from datetime import datetime

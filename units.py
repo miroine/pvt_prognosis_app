@@ -17,6 +17,8 @@ SI conventions used here (petroleum-industry SI, not strict SI):
     salinity     ppm (same)
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 # Conversion factors (multiply field -> SI; divide for reverse)
 PSIA_PER_BAR = 14.50377
 F_TO_C_SCALE = 5.0 / 9.0

@@ -46,6 +46,8 @@ All builders take the same `case` dict:
 Only the fields relevant to `kind` need to be populated.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import io
 import json
 import datetime as _dt

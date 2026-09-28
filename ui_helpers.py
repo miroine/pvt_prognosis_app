@@ -19,6 +19,8 @@ Contents:
   - tuning_is_stale        : tuning-staleness check
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -108,8 +110,157 @@ def styled_dataframe(df, height=380):
         st.dataframe(df, width='stretch', height=height)
 
 
+# ----------------------------------------------------------------------
+# PVTO / PVTG plots — drawn from the parsed keyword structure
+# ----------------------------------------------------------------------
+_DECK_UNITS = {
+    "FIELD":  {"P": "psia", "Rs": "Mscf/STB", "Bo": "rb/STB",
+               "Rv": "STB/Mscf", "Bg": "rb/Mscf"},
+    "METRIC": {"P": "bara", "Rs": "Sm³/Sm³", "Bo": "rm³/Sm³",
+               "Rv": "Sm³/Sm³", "Bg": "rm³/Sm³"},
+}
+
+
+def _seq_colors(n, light="#BCD0E0", dark=TH.DARK_NAVY):
+    """n colours on ONE hue, light -> dark (a magnitude ramp: low -> high).
+    Branch families encode magnitude (Rs or P), so a sequential ramp — not
+    a rainbow of n hues — is the correct encoding."""
+    def h2r(h):
+        h = h.lstrip("#")
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    a, b = h2r(light), h2r(dark)
+    out = []
+    for i in range(max(n, 1)):
+        t = i / max(n - 1, 1)
+        out.append("#%02x%02x%02x" % tuple(round(a[k] + t * (b[k] - a[k]))
+                                          for k in range(3)))
+    return out
+
+
+def render_pvto_plot(branches, deck_units="FIELD", key="pvto"):
+    """Standard PVTO display: the saturated curve plus one undersaturated
+    branch per Rs node (the 'whiskers'), for Bo, viscosity or Rs."""
+    u = _DECK_UNITS.get(deck_units, _DECK_UNITS["FIELD"])
+    view = st.radio("Plot", ["Bo vs P", "Viscosity vs P", "Rs vs Psat"],
+                    horizontal=True, key=f"{key}_view")
+    fig = go.Figure()
+    if view == "Rs vs Psat":
+        fig.add_trace(go.Scatter(
+            x=[b["P"][0] for b in branches], y=[b["Rs"] for b in branches],
+            mode="lines+markers", name="Saturated Rs",
+            line=dict(color=TH.TORCH_RED, width=2), marker=dict(size=8),
+            hovertemplate="Psat %{x:.4g}<br>Rs %{y:.4g}<extra></extra>"))
+        ytitle = f"Rs ({u['Rs']})"
+    else:
+        prop, lab = (("Bo", f"Bo ({u['Bo']})") if view == "Bo vs P"
+                     else ("mu", "Oil viscosity (cP)"))
+        cols = _seq_colors(len(branches))
+        for b, c in zip(branches, cols):
+            fig.add_trace(go.Scatter(
+                x=b["P"], y=b[prop], mode="lines", showlegend=False,
+                line=dict(color=c, width=1.5),
+                hovertemplate=(f"Rs {b['Rs']:.4g} {u['Rs']}<br>"
+                               "P %{x:.4g}<br>" + prop + " %{y:.4g}"
+                               "<extra></extra>")))
+        fig.add_trace(go.Scatter(
+            x=[b["P"][0] for b in branches], y=[b[prop][0] for b in branches],
+            mode="lines+markers", name="Saturated (P = Psat)",
+            line=dict(color=TH.TORCH_RED, width=2.5), marker=dict(size=8),
+            hovertemplate="Psat %{x:.4g}<br>" + prop + " %{y:.4g}<extra></extra>"))
+        fig.add_trace(go.Scatter(   # legend key for the branch family
+            x=[None], y=[None], mode="lines", name="Undersaturated branch "
+            "(light → dark = low → high Rs)",
+            line=dict(color=TH.DARK_NAVY, width=1.5)))
+        ytitle = lab
+    fig.update_layout(**TH.plotly_layout(
+        title=f"PVTO — {view}", xtitle=f"Pressure ({u['P']})",
+        ytitle=ytitle, height=440, showlegend=True))
+    st.plotly_chart(fig, width="stretch", key=f"{key}_fig")
+    st.caption(f"{len(branches)} saturated Rs nodes. Each thin curve starts "
+               "on the red saturated line at its bubble point and runs to "
+               "higher pressure at constant Rs (the undersaturated branch).")
+
+
+def render_pvtg_plot(nodes, deck_units="FIELD", cgr_ref=None, key="pvtg"):
+    """Standard PVTG display: saturated Rv curve, Bg and gas viscosity with
+    the saturated and dry-gas (Rv = 0) limits joined by each pressure
+    node's undersaturated branch, and the Bg-vs-Rv branch family."""
+    u = _DECK_UNITS.get(deck_units, _DECK_UNITS["FIELD"])
+    view = st.radio("Plot", ["Rv (saturated) vs P", "Bg vs P",
+                             "Gas viscosity vs P", "Bg vs Rv (branches)"],
+                    horizontal=True, key=f"{key}_view")
+    fig = go.Figure()
+    P = [n["P"] for n in nodes]
+    if view == "Rv (saturated) vs P":
+        fig.add_trace(go.Scatter(
+            x=P, y=[n["Rv"][0] for n in nodes], mode="lines+markers",
+            name="Saturated Rv (max vaporised oil)",
+            line=dict(color=TH.TORCH_RED, width=2.5), marker=dict(size=8),
+            hovertemplate="P %{x:.4g}<br>Rv_sat %{y:.4g}<extra></extra>"))
+        if cgr_ref:
+            fig.add_trace(go.Scatter(
+                x=[min(P), max(P)], y=[cgr_ref, cgr_ref], mode="lines",
+                name="Reservoir gas Rv (CGR)",
+                line=dict(color=TH.DARK_NAVY, width=2, dash="dash")))
+        xt, yt = f"Pressure ({u['P']})", f"Rv ({u['Rv']})"
+        cap = ("The dew point is where the saturated curve crosses the "
+               "reservoir-gas line: above it the gas is undersaturated, "
+               "below it condensate drops out.")
+    elif view == "Bg vs Rv (branches)":
+        cols = _seq_colors(len(nodes))
+        for n, c in zip(nodes, cols):
+            fig.add_trace(go.Scatter(
+                x=n["Rv"], y=n["Bg"], mode="lines+markers", showlegend=False,
+                line=dict(color=c, width=1.5), marker=dict(size=6),
+                hovertemplate=(f"P {n['P']:.4g} {u['P']}<br>"
+                               "Rv %{x:.4g}<br>Bg %{y:.4g}<extra></extra>")))
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            name="One curve per pressure node (light → dark = low → high P)",
+            line=dict(color=TH.DARK_NAVY, width=1.5)))
+        xt, yt = f"Rv ({u['Rv']})", f"Bg ({u['Bg']})"
+        cap = ("Each curve is one pressure node, from saturated gas (right "
+               "end) to dry gas at Rv = 0 (left end).")
+    else:
+        prop, yt = (("Bg", f"Bg ({u['Bg']})") if view == "Bg vs P"
+                    else ("mu", "Gas viscosity (cP)"))
+        for n in nodes:                         # branch segments
+            fig.add_trace(go.Scatter(
+                x=[n["P"]] * len(n[prop]), y=n[prop], mode="lines",
+                showlegend=False, line=dict(color="#9AA5AE", width=1.5),
+                hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=P, y=[n[prop][0] for n in nodes], mode="lines+markers",
+            name="Saturated gas", line=dict(color=TH.TORCH_RED, width=2.5),
+            marker=dict(size=8),
+            hovertemplate="P %{x:.4g}<br>" + prop + " %{y:.4g}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=P, y=[n[prop][-1] for n in nodes], mode="lines+markers",
+            name="Dry gas (Rv = 0)", line=dict(color=TH.DARK_NAVY, width=2),
+            marker=dict(size=8),
+            hovertemplate="P %{x:.4g}<br>" + prop + " %{y:.4g}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            name="Undersaturated branch at each node",
+            line=dict(color="#9AA5AE", width=1.5)))
+        xt = f"Pressure ({u['P']})"
+        cap = ("At each pressure node the grey segment spans the "
+               "undersaturated branch, from saturated gas to dry gas.")
+    fig.update_layout(**TH.plotly_layout(
+        title=f"PVTG — {view}", xtitle=xt, ytitle=yt, height=440,
+        showlegend=True))
+    if view in ("Bg vs P", "Bg vs Rv (branches)"):
+        # Bg spans ~10x over the table; on a linear axis the low-pressure
+        # nodes flatten the saturated/dry-gas spread at reservoir pressure.
+        fig.update_yaxes(type="log")
+    st.plotly_chart(fig, width="stretch", key=f"{key}_fig")
+    st.caption(f"{len(nodes)} pressure nodes. " + cap)
+
+
+
 def render_eclipse_qc(df_field, kind, label="PVT table", pb=None,
-                       df_display=None, pvto_branches=None):
+                       df_display=None, pvto_branches=None,
+                       pvtg_nodes=None, deck_units="FIELD", cgr_ref=None):
     """Render a monotonicity QC panel + a plot of the export table.
 
     df_field    : the field-unit property DataFrame (QC always runs on this,
@@ -126,7 +277,12 @@ def render_eclipse_qc(df_field, kind, label="PVT table", pb=None,
                   Rs (the real PVTO structure) instead of a single line.
     Returns the QC result dict so callers can block export on failure.
     """
-    if kind == "pvto":
+    structural = False
+    if kind == "pvto" and pvto_branches:
+        qc = EQC.qc_pvto_branches(pvto_branches); structural = True
+    elif kind == "pvtg" and pvtg_nodes:
+        qc = EQC.qc_pvtg_branches(pvtg_nodes); structural = True
+    elif kind == "pvto":
         qc = EQC.qc_pvto_table(df_field, pb=pb)
     elif kind == "pvdg":
         qc = EQC.qc_pvdg_table(df_field)
@@ -134,8 +290,26 @@ def render_eclipse_qc(df_field, kind, label="PVT table", pb=None,
         qc = EQC.qc_pvtg_table(df_field)
     else:
         qc = EQC.qc_pvto_table(df_field, pb=pb)
+    warns = qc.get("warnings", [])
     if qc["ok"]:
-        st.success(f"✓ {label} is monotonic — ECLIPSE should accept it.")
+        st.success(f"✓ {label} passes the ECLIPSE structure and "
+                   f"monotonicity rules.")
+        if warns:
+            with st.expander(f"⚠️ {len(warns)} physical-consistency "
+                             f"warning{'s' if len(warns) != 1 else ''} "
+                             f"(accepted by ECLIPSE, worth reviewing)"):
+                for w in warns:
+                    st.markdown(f"- {w}")
+    elif structural:
+        n = len(qc["problems"])
+        st.error(f"⛔ {label} breaks {n} ECLIPSE rule"
+                 f"{'s' if n != 1 else ''} — the simulator will reject it.")
+        with st.expander("Show the issues", expanded=True):
+            for p in qc["problems"] + [f"(warning) {w}" for w in warns]:
+                st.markdown(f"- {p}")
+            st.caption("Usually caused by the table range: widen the "
+                       "pressure range, add nodes, or move the dew/bubble "
+                       "point inside the range.")
     else:
         n = len(qc["problems"])
         st.error(f"⛔ {label} has {n} monotonicity problem"
@@ -192,26 +366,11 @@ def render_eclipse_qc(df_field, kind, label="PVT table", pb=None,
         # A true PVTO table has one Bo (and viscosity) curve per saturated
         # Rs node. When the caller supplies pvto_branches, draw that family.
         if kind == "pvto" and pvto_branches:
-            metric = st.radio("Property", ["Bo", "Viscosity"],
-                               horizontal=True, key=f"eqc_pvto_metric_{label}")
-            fig = go.Figure()
-            for br in pvto_branches:
-                ydata = br["Bo"] if metric == "Bo" else br.get("mu", [])
-                if not len(ydata):
-                    continue
-                fig.add_trace(go.Scatter(
-                    x=br["P"], y=ydata, mode="lines+markers",
-                    name=f"Rs = {br['Rs']:.4g}",
-                    line=dict(width=2)))
-            fig.update_layout(**TH.plotly_layout(
-                title=f"{label} — {metric} for each Rs branch",
-                xtitle=plot_df.columns[0],
-                ytitle=metric, height=420, showlegend=True))
-            st.plotly_chart(fig, width='stretch')
-            st.caption("Each curve is one saturated-Rs node. The point "
-                        "where a curve starts is the saturated state; the "
-                        "curve to higher pressure is its under-saturated "
-                        "(constant-Rs) extension.")
+            render_pvto_plot(pvto_branches, deck_units,
+                             key=f"eqc_pvto_{label}")
+        elif kind == "pvtg" and pvtg_nodes:
+            render_pvtg_plot(pvtg_nodes, deck_units, cgr_ref=cgr_ref,
+                             key=f"eqc_pvtg_{label}")
         else:
             num_cols = [c for c in plot_df.columns
                          if pd.api.types.is_numeric_dtype(plot_df[c])]

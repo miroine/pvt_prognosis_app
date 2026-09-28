@@ -21,6 +21,8 @@ Published validity envelopes are taken from the original correlation
 papers and from McCain, *The Properties of Petroleum Fluids* (1990).
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import streamlit as st
 
 

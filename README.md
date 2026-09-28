@@ -49,6 +49,49 @@ reference).
 
 ## Change history
 
+## v1.4.1 — deployment check
+
+Every module now carries `APP_VERSION`. On startup the app checks that all
+files come from the same release. If any are older or missing, it stops
+with a list of the files to re-upload, instead of failing inside a page
+(e.g. `AttributeError: ... parse_pvtg_branches`). **Always upload every file
+from the release zip together.**
+
+## v1.4 — PVTO/PVTG rebuild + second formula audit (Sep 2026)
+
+**PVTO (correlation and EOS).** The table now spans from ~1 atm to Pb, and
+optionally on up to the table top (gas re-solution). Rsi sits exactly at Pb,
+and **every** Rs node carries an undersaturated branch up to 1.25 × the table
+top. Branches use the bubble-point reference behaviour (the Petrel/PVTi and
+ECLIPSE-default method): Vasquez-Beggs evaluated at a 15-psia Psat had inflated
+viscosity 18×. There are span controls (saturated nodes, undersaturated points,
+extend above Pb). The EOS export re-runs the depletion on a dense grid, where it
+previously had about 6 Rs nodes.
+
+**PVTG.** Each (P, Rv) point is computed from the gas that actually carries that
+Rv, with Bg on a surface-dry-gas basis. This fixes branch viscosity (it
+increased as gas got leaner) and the saturated gravity below the dew point. The
+saturated Rv line continues above the dew point, so reservoir gas sits on an
+undersaturated branch. The dew point is a node, and the extension is limited so
+saturated Bg keeps decreasing. The EOS PVTG uses the surface-gas basis and a
+computed dry-gas branch end.
+
+**QC and plots.** QC parses the real keyword structure. The old QC flattened
+PVTG into one table, which shifted every branch row into the wrong columns, so
+it always failed and the plot was garbled. Checks are split into ECLIPSE errors
+and physical warnings. PVTO plots show the saturated curve with branches, μ, and
+Rs vs Psat. PVTG plots show Rv_sat vs P with the CGR line, Bg and μg (saturated
+and dry gas with branch segments), and Bg vs Rv.
+
+**Other fixes.** LBC viscosity used °R/psia in K/atm coefficients, so every EOS
+viscosity was about 5.4× high; there is now a Vc(C7+) lever to match measured oil
+viscosity. Multi-region PVTO/PVDG/PVTG had one terminator for all regions and
+now has one per PVTNUM table. The wet-gas CVD cumulative production was a
+placeholder (+0.1 %/step) and now uses the material balance. METRIC PVTO/PVTG
+output has more precision, and PVTG Rv is written in scientific notation.
+
+Tests: `test_audit.py` (56), `test_validation.py` (51), `validate_nodal.py` (16).
+
 ## v1.3 — formula & bug audit (Sep 2026)
 
 Run `python test_audit.py` (33 regression checks), plus `python test_validation.py`

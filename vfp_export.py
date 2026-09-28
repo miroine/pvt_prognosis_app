@@ -31,6 +31,8 @@ References:
     OPM Flow keyword reference (open-source equivalent)
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 from nodal import lift_curve, march_pressure
 

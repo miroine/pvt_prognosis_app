@@ -7,6 +7,34 @@ standalone flash calculator, ECLIPSE export (PVTO/PVDG/PVTG/PVTW).
 
 import streamlit as st
 import numpy as np
+
+# ---- Deployment consistency check ------------------------------------
+# Every module carries the same APP_VERSION. Deploying only some of the
+# files (e.g. a new pvt_app.py with an old eclipse_qc.py) otherwise fails
+# deep inside a page with a cryptic AttributeError/ImportError. The stamp
+# is read from the file TEXT, so it works even if a stale module would
+# itself fail to import.
+APP_VERSION = "1.4.1"
+import os as _os, re as _re
+_here = _os.path.dirname(_os.path.abspath(__file__))
+_REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'eclipse_export', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export']
+_stale = []
+for _m in _REQUIRED:
+    try:
+        with open(_os.path.join(_here, _m + ".py"), encoding="utf-8") as _fh:
+            _v = _re.search(r'^APP_VERSION = "([^"]+)"', _fh.read(), _re.M)
+        if not _v or _v.group(1) != APP_VERSION:
+            _stale.append(f"{_m}.py (version {_v.group(1) if _v else 'unknown'})")
+    except FileNotFoundError:
+        _stale.append(f"{_m}.py (missing)")
+if _stale:
+    st.set_page_config(page_title="PVT Studio — update incomplete")
+    st.error(f"PVT Studio {APP_VERSION}: the deployment is incomplete — "
+             f"{len(_stale)} file(s) are from an older version or missing. "
+             f"Upload ALL files from the release zip together, then reboot "
+             f"the app.")
+    st.markdown("\n".join(f"- `{s}`" for s in _stale))
+    st.stop()
 import pandas as pd
 import plotly.graph_objects as go
 import copy
@@ -1804,13 +1832,42 @@ if fluid == "Oil (Black Oil)":
         "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
         "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
     } for r in rows])
-    pvto_text = build_pvto(df_field, Pb, oil, Rsi, P_max)
+    _pvto_kw = dict(P_min=P_min,
+                    n_sat=int(st.session_state.get("oil_pvto_nsat", 20)),
+                    n_under=int(st.session_state.get("oil_pvto_nund", 6)),
+                    extend_above_pb=bool(st.session_state.get(
+                        "oil_pvto_extend", True)))
+    pvto_text = build_pvto(df_field, Pb, oil, Rsi, P_max, **_pvto_kw)
     density_text = build_density(api=api, gas_sg=gas_sg)
     pvtw_text = ""
 
     if enable_eclipse_export:
         st.markdown("---")
         st.markdown(f"### ECLIPSE Export ({eclipse_unit_choice} units)")
+
+        # ---- PVTO table span (saturated / undersaturated nodes) ----
+        with st.expander("⚙️ PVTO table span", expanded=False):
+            st.caption(
+                "Saturated nodes run from the minimum table pressure "
+                "(~1 atm) up to Pb — and, if extended, on to the maximum "
+                "table pressure so cells that re-dissolve gas stay on the "
+                "table. Every node gets an undersaturated branch up to "
+                "1.25 × the table top.")
+            _sc = st.columns(3)
+            _sc[0].slider("Saturated nodes", 6, 40, 20, key="oil_pvto_nsat")
+            _sc[1].slider("Undersaturated points per node", 2, 12, 6,
+                          key="oil_pvto_nund")
+            _sc[2].checkbox("Extend saturated table above Pb", value=True,
+                            key="oil_pvto_extend",
+                            help="Tabulates Rs(P) beyond the initial Rsi "
+                                 "(gas injection / gas-cap re-solution). "
+                                 "Turn off for a strict depletion table.")
+        _pvto_kw = dict(P_min=P_min,
+                        n_sat=int(st.session_state.get("oil_pvto_nsat", 20)),
+                        n_under=int(st.session_state.get("oil_pvto_nund", 6)),
+                        extend_above_pb=bool(st.session_state.get(
+                            "oil_pvto_extend", True)))
+        pvto_text = build_pvto(df_field, Pb, oil, Rsi, P_max, **_pvto_kw)
 
         # ---- Choose which fluid to export ----
         # Options: current (untuned), tuned (if available), or any saved
@@ -1837,7 +1894,7 @@ if fluid == "Oil (Black Oil)":
                 "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
             } for r in oil_tuned_rows])
             pvto_text = build_pvto(df_field, oil_tuned_Pb, oil_tuned_corr,
-                                    Rsi, P_max)
+                                    Rsi, P_max, **_pvto_kw)
             st.caption(f"PVTO built from the **tuned** fluid "
                         f"(Pb = {U.to_user_P(oil_tuned_Pb, unit_system):.1f} "
                         f"{L['P']}).")
@@ -1865,7 +1922,7 @@ if fluid == "Oil (Black Oil)":
                     "P (psia)": r["P_field"], "Rs (scf/STB)": r["Rs_field"],
                     "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
                 } for r in s_rows])
-                pvto_text = build_pvto(df_field, s_Pb, s_oil, s_Rsi, P_max)
+                pvto_text = build_pvto(df_field, s_Pb, s_oil, s_Rsi, P_max, **_pvto_kw)
                 density_text = build_density(api=s_api, gas_sg=s_sg)
                 st.caption(f"PVTO built from saved fluid "
                             f"**{export_choice[len('Saved: '):]}** "
@@ -1897,7 +1954,8 @@ if fluid == "Oil (Black Oil)":
         # PVTO branches so the plot matches the ECLIPSE unit selection.
         _pvto_branches = EQC.parse_pvto_branches(pvto_show)
         render_eclipse_qc(df_field, "pvto", label="PVTO table", pb=Pb,
-                           pvto_branches=_pvto_branches)
+                           pvto_branches=_pvto_branches,
+                           deck_units=eclipse_unit_choice)
 
         deck = build_full_deck(pvto=pvto_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
@@ -2134,7 +2192,7 @@ if fluid == "Oil (Black Oil)":
                             "Rs (scf/STB)": r["Rs_field"],
                             "Bo (rb/STB)": r["Bo"], "μo (cp)": r["mu"],
                         } for r in r_rows])
-                        r_pvto = build_pvto(r_df, r_Pb, r_oil, r_Rsi, P_max)
+                        r_pvto = build_pvto(r_df, r_Pb, r_oil, r_Rsi, P_max, **_pvto_kw)
                         # Per-region surface densities
                         r_api_val = (spec.get("api", api)
                                       if spec["source"] == "Current fluid"
@@ -3844,13 +3902,18 @@ elif fluid == "Wet Gas / Condensate":
 
         # ---- Monotonicity QC ----
         st.markdown("#### Quality check")
-        _pvtg_rows = EQC.extract_numeric_rows(pvtg_show)
-        if _pvtg_rows:
-            _ncol = len(_pvtg_rows[0])
-            _p_lbl = "P (bara)" if eclipse_unit_choice == "METRIC" else "P (psia)"
-            _cols = [_p_lbl, "Rv", "Bg", "μg (cp)"][:_ncol]
-            _pvtg_df = pd.DataFrame(_pvtg_rows, columns=_cols)
-            render_eclipse_qc(_pvtg_df, "pvtg", label="PVTG table")
+        # QC and plot the PVTG on its real structure (pressure nodes, each
+        # with an Rv branch). Flattening it into one table shifted every
+        # branch row into the wrong columns and always failed the QC.
+        _pvtg_nodes = EQC.parse_pvtg_branches(pvtg_show)
+        _cgr_ref = None
+        if wg_export_choice.startswith("Current"):
+            _cgr_ref = (U.to_user_Rv(cgr / 1000.0, "SI")
+                        if eclipse_unit_choice == "METRIC" else cgr / 1000.0)
+        render_eclipse_qc(None, "pvtg", label="PVTG table",
+                          pvtg_nodes=_pvtg_nodes,
+                          deck_units=eclipse_unit_choice,
+                          cgr_ref=_cgr_ref)
 
         deck = build_full_deck(pvtg=pvtg_show, pvtw=pvtw_show,
                                 density=dens_show, units=eclipse_unit_choice)
@@ -4313,6 +4376,20 @@ elif fluid == "Compositional (EOS)":
         st.stop()
     z_arr = z_raw / z_raw.sum()
     c7_props = characterize_c7plus(MW_c7=MW_c7, SG_c7=SG_c7) if "C7+" in comp_names else None
+    # LBC viscosity lever: the C7+ critical volume enters ONLY the
+    # Lohrenz-Bray-Clark viscosity (not the PR phase behaviour). Untuned
+    # LBC typically under-predicts oil viscosity; industry practice is to
+    # scale Vc(C7+) to match a measured viscosity.
+    with st.expander("🔧 LBC viscosity tuning (C7+ critical volume)",
+                     expanded=False):
+        _vc_mult = st.slider(
+            "Vc(C7+) multiplier", 0.5, 2.0, 1.0, 0.01, key="comp_vc_mult",
+            help="Increase to raise liquid viscosity. Affects viscosity "
+                 "only — saturation pressure, Bo, Rs are unchanged. "
+                 "Untuned LBC commonly under-predicts oil viscosity by "
+                 "30-60%; match to a lab value before using μo.")
+    if c7_props is not None and abs(_vc_mult - 1.0) > 1e-9:
+        c7_props = dict(c7_props, Vc=c7_props["Vc"] * _vc_mult)
     T_R = T_res + 460.0
     fluid_kind = "oil" if "Oil" in comp_fluid_kind else "gas"
 
@@ -5863,6 +5940,25 @@ elif fluid == "Compositional (EOS)":
         _psat_for_export = (Psat_tuned if comp_export_tuned and
                              Psat_tuned is not None else Psat)
 
+        # Dense export grid: the display table uses the coarse app grid
+        # (only a handful of points fall below Psat, giving a PVTO with ~6
+        # Rs nodes). Re-run the depletion on ~20 geometric points from
+        # ~1 atm to Psat, Psat itself, and points above it for the
+        # undersaturated branches / PVTG nodes.
+        if bot_rows_for_export and _psat_for_export is not None:
+            _ps = float(_psat_for_export)
+            _grid = sorted(set(
+                list(np.geomspace(max(P_min, 14.7), _ps, 20))
+                + [_ps] + list(np.linspace(_ps, max(P_max, _ps) * 1.25, 7)[1:])))
+            try:
+                with st.spinner("Building the dense PVT export grid..."):
+                    bot_rows_for_export = black_oil_table_from_composition(
+                        z_arr, comp_names, T_R, _grid,
+                        c7_props=_c7_for_export, fluid_kind=fluid_kind)["rows"]
+            except Exception as _e:
+                st.warning(f"Dense export grid failed ({_e}); using the "
+                           f"display table grid instead.")
+
         if bot_rows_for_export and _psat_for_export is not None:
             if fluid_kind == "oil":
                 kw_text = build_pvto_from_compositional(
@@ -5914,18 +6010,18 @@ elif fluid == "Compositional (EOS)":
 
             # ---- Monotonicity QC ----
             st.markdown("#### Quality check")
-            _comp_rows = EQC.extract_numeric_rows(kw_text)
-            if _comp_rows:
-                _nc = len(_comp_rows[0])
-                if fluid_kind == "oil":
-                    _cnames = ["Rs", "P (psia)", "Bo", "μo (cp)"][:_nc]
-                    _qc_kind = "pvto"
-                else:
-                    _cnames = ["P (psia)", "Rv", "Bg", "μg (cp)"][:_nc]
-                    _qc_kind = "pvtg"
-                render_eclipse_qc(pd.DataFrame(_comp_rows, columns=_cnames),
-                                   _qc_kind,
-                                   label=f"{'PVTO' if fluid_kind=='oil' else 'PVTG'} table")
+            # QC + plot on the real keyword structure (PVTO Rs nodes /
+            # PVTG pressure nodes), in the exported deck's units.
+            if fluid_kind == "oil":
+                render_eclipse_qc(None, "pvto", label="PVTO table",
+                                  pvto_branches=EQC.parse_pvto_branches(
+                                      kw_text_out),
+                                  deck_units=eclipse_units)
+            else:
+                render_eclipse_qc(None, "pvtg", label="PVTG table",
+                                  pvtg_nodes=EQC.parse_pvtg_branches(
+                                      kw_text_out),
+                                  deck_units=eclipse_units)
 
             _ct_sfx = "_TUNED" if comp_export_tuned else ""
             if fluid_kind == "oil":

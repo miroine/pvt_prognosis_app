@@ -18,6 +18,8 @@ Example PVTO with 2 regions:
 Note the double trailing `/`: one closes the last region, one closes the keyword.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 
 def build_multi_region_pvto(region_texts):
     """
@@ -39,7 +41,10 @@ def build_multi_region_pvto(region_texts):
         out.append(f"-- =========== Region {i+1} ===========")
         body = _strip_keyword_and_outer_terminator(txt, "PVTO")
         out.append(body.rstrip())
-    out.append("/")  # closes the keyword (already-stripped regions end in their own `/`)
+        # Each PVTNUM table ends with its own empty record. ECLIPSE reads
+        # exactly NTPVT tables, so there is no extra keyword terminator —
+        # a single trailing '/' merged every region into table 1.
+        out.append("/")
     return "\n".join(out) + "\n"
 
 
@@ -52,7 +57,7 @@ def build_multi_region_pvdg(region_texts):
         out.append(f"-- =========== Region {i+1} ===========")
         body = _strip_keyword_and_outer_terminator(txt, "PVDG")
         out.append(body.rstrip())
-    out.append("/")
+        out.append("/")     # one terminator per PVTNUM table
     return "\n".join(out) + "\n"
 
 
@@ -65,7 +70,7 @@ def build_multi_region_pvtg(region_texts):
         out.append(f"-- =========== Region {i+1} ===========")
         body = _strip_keyword_and_outer_terminator(txt, "PVTG")
         out.append(body.rstrip())
-    out.append("/")
+        out.append("/")     # one terminator per PVTNUM table
     return "\n".join(out) + "\n"
 
 

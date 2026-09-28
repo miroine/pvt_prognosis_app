@@ -11,6 +11,8 @@ Pattern: Whitson (1989), Coats (1985). Only C7+ properties are perturbed by
 default — the standard practice when tuning a black-oil composition.
 """
 
+APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+
 import numpy as np
 from scipy.optimize import least_squares
 
