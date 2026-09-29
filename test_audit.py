@@ -188,6 +188,75 @@ z = zipfile.ZipFile(io.BytesIO(MSE.build_bundle(
     dict(base, kind="oil", units="FIELD", df_field=oil), "PVTO\n/\n")))
 check("Bundle contains all formats + README", len(z.namelist()) == 10)
 
+# 8b. Multi-sim for every fluid type + ASCII decks ---------------------------
+print("\n8b. Multi-simulator export: wet gas, water, compositional")
+wgc = C.WetGasCorrelations(0.7, 55.0, 80.0, 220.0, Pdew=4500.0)
+pvtg_f = E.build_pvtg(list(np.linspace(500, 6000, 12)), wgc)
+wdf = MSE.df_from_deck("wetgas", pvtg_f)
+check("Wet-gas df from PVTG: one row per pressure node, Rv at dew-point > 0",
+      len(wdf) == len(Q.parse_pvtg_branches(pvtg_f)) and wdf["Rv (STB/Mscf)"].max() > 0)
+odf = MSE.df_from_deck("oil", pvto)
+check("Oil df from PVTO: Rs back in scf/STB (Rsi = 600)",
+      (abs(odf["Rs (scf/STB)"] - 600) < 0.1).any())
+wat = pd.DataFrame({"P (psia)": [1000, 3000], "Bw (rb/STB)": [1.03, 1.02]})
+crash, nonascii = 0, 0
+for kind, df in (("wetgas", wdf), ("water", wat), ("oil", odf), ("drygas", gas)):
+    for u in ("FIELD", "METRIC"):
+        case = dict(base, kind=kind, units=u, df_field=df, Cvw=1e-5)
+        for fn in (MSE.build_cmg_imex, MSE.build_cmg_gem, MSE.build_nexus,
+                   MSE.build_intersect, MSE.build_csv):
+            try:
+                t = fn(case)
+                nonascii += any(ord(ch) > 127 for ch in t)
+            except Exception:
+                crash += 1
+check("No crash: wetgas/water/oil/drygas x 2 units x 5 formats", crash == 0)
+check("Every simulator text export is plain ASCII", nonascii == 0)
+t = MSE.build_intersect(dict(base, kind="wetgas", units="METRIC", df_field=wdf))
+check("IX wet gas carries the Rv array", "Rv = [" in t)
+t = MSE.build_cmg_imex(dict(base, kind="water", units="METRIC", df_field=wat))
+check("CMG water case: *BWI/*CW/*PBW written, no oil/gas table",
+      "*BWI" in t and "*PBW" in t and "*PVT" not in t)
+t = MSE.build_nexus(dict(base, kind="oil", units="METRIC", df_field=odf))
+check("Header reservoir T in degC for METRIC", "93.33 degC" in t)
+z = zipfile.ZipFile(io.BytesIO(MSE.build_bundle(
+    dict(base, kind="oil", units="FIELD", df_field=oil,
+         extra_files={"E300_PROPS.INC": "CNAMES\n/\n"}), "PVTO\n/\n")))
+check("Bundle includes extra (E300) files", any(n.endswith("E300_PROPS.INC")
+                                                for n in z.namelist()))
+
+# 8c. ECLIPSE 300 / GEM compositional export ------------------------------
+print("\n8c. Compositional (E300 / GEM) export")
+import e300_export as E3
+from components import characterize_c7plus
+names = ["N2", "CO2", "C1", "C2", "C3", "iC4", "nC4", "iC5", "nC5", "C6", "C7+"]
+zz = [0.005, 0.02, 0.4, 0.08, 0.06, 0.01, 0.03, 0.01, 0.015, 0.03, 0.34]
+c7 = characterize_c7plus(220, 0.85)
+for u in ("FIELD", "METRIC"):
+    t = E3.build_e300_props(names, zz, 200.0, c7, units=u, psat_psia=3000,
+                            sat_kind="Bubble point")
+    r = E3.qc_e300_props(t, len(names))
+    check(f"E300 {u}: structural QC", r["ok"], "; ".join(r["problems"]))
+    check(f"E300 {u}: ASCII only", all(ord(ch) < 128 for ch in t))
+kw = E3.parse_e300_props(E3.build_e300_props(names, zz, 200.0, c7, units="METRIC"))
+i1 = names.index("C1")
+check("E300 METRIC: C1 Tc = 190.56 K", close(float(kw["TCRIT"][i1]), 190.56, 1e-3))
+check("E300 METRIC: C1 Pc = 46.0 bara", close(float(kw["PCRIT"][i1]), 46.04, 2e-3))
+check("E300 METRIC: C1 Vc = 0.0993 m3/kmol", close(float(kw["VCRIT"][i1]), 0.09926, 2e-3))
+check("E300 METRIC: RTEMP in degC", close(float(kw["RTEMP"][0]), 93.333, 1e-4))
+kwf = E3.parse_e300_props(E3.build_e300_props(
+    names, zz, 200.0, c7, units="FIELD",
+    kij_overrides={("C1", "C7+"): 0.0777}))
+check("E300: tuned C1-C7+ kij written into BIC", "0.07770" in kwf["BIC"])
+g = E3.build_gem_eos(names, zz, 200.0, c7, units="METRIC")
+check("GEM EOS: Pc in atm (C1 = 45.44)", "45.4397" in g and "*BIN" in g)
+
+# 8d. SI messages carry SI units --------------------------------------------
+print("\n8d. SI units in messages")
+_txt = " ".join(str(U.fmt(k, 1000.0, "SI")) for k in ("P", "dP", "T", "dT", "Rs"))
+check("U.fmt SI never prints field units",
+      not any(x in _txt for x in ("psi", "°F", "scf")), _txt)
+
 # 9. Nodal phase split ----------------------------------------------------
 print("\n9. Nodal / VFP")
 r = N.lift_curve([100], 500.0, 200.0, 80.0, 180.0, [(8000.0, 90.0)],

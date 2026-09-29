@@ -17,7 +17,7 @@ SI conventions used here (petroleum-industry SI, not strict SI):
     salinity     ppm (same)
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 # Conversion factors (multiply field -> SI; divide for reverse)
 PSIA_PER_BAR = 14.50377
@@ -295,3 +295,51 @@ def flowline_labels(units):
     return {"D": "inch", "L": "ft", "U": "BTU/(hr·ft²·°F)",
             "cp": "BTU/(lb·°F)", "rho": "lb/ft³", "mu": "cP",
             "qgas": "Mscf/d", "qliq": "STB/d", "v": "ft/s"}
+
+
+# ----------------------------------------------------------------
+# Message formatting: a FIELD value rendered in the display units.
+# Used by modules that build user-facing sentences (hydrate, solids),
+# so alerts never mix field units into an SI session.
+#   kind: "P" (absolute), "dP" (pressure difference), "T" (absolute),
+#         "dT" (temperature difference), "Rs", "cgr"
+# ----------------------------------------------------------------
+def fmt(kind, v, units="SI", digits=None):
+    if units not in ("Field", "SI"):
+        units = "SI"
+    lab = UNIT_LABELS[units]
+    if kind in ("P", "dP"):
+        x, u, d = to_user_P(v, units), lab["P"], 0 if units == "Field" else 1
+        if kind == "dP":
+            u = "psi" if units == "Field" else "bar"
+    elif kind == "T":
+        x, u, d = to_user_T(v, units), lab["T"], 1
+    elif kind == "dT":
+        x, u, d = to_user_deltaT(v, units), lab["T"], 1
+    elif kind == "Rs":
+        x, u, d = to_user_Rs(v, units), lab["Rs"], 0 if units == "Field" else 1
+    elif kind == "cgr":
+        x, u, d = to_user_cgr(v, units), ("STB/MMscf" if units == "Field"
+                                          else "Sm³/MSm³"), 1
+    else:
+        return f"{v:g}"
+    d = d if digits is None else digits
+    return f"{x:,.{d}f} {u}"
+
+
+# ----------------------------------------------------------------
+# Simulator decks must be plain ASCII: some ECLIPSE / Nexus / CMG
+# readers reject non-ASCII characters even inside comments.
+# ----------------------------------------------------------------
+_ASCII_MAP = {"°": "deg", "μ": "mu", "—": "-", "–": "-", "³": "3",
+              "²": "2", "γ": "gamma", "ρ": "rho", "σ": "sigma",
+              "≈": "~", "≤": "<=", "≥": ">=", "×": "x", "→": "->",
+              "·": ".", "₀": "0", "ᵢ": "i"}
+
+
+def to_ascii(text):
+    if not isinstance(text, str):
+        return text
+    for k, v in _ASCII_MAP.items():
+        text = text.replace(k, v)
+    return text.encode("ascii", "replace").decode("ascii")

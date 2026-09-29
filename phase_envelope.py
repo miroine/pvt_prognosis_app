@@ -16,7 +16,7 @@ Strategy:
   saturation pressure. The envelope is a single closed loop in (P,T) space.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from eos_pr import flash, saturation_pressure

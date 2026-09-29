@@ -51,7 +51,7 @@ limit, find a stable operating point, or compare lift options, not as
 the final design number.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import math
 import numpy as np
@@ -125,7 +125,7 @@ def _gas_z_simple(P_psia, T_F, gas_sg):
     A = 1.39 * (Tpr - 0.92) ** 0.5 - 0.36 * Tpr - 0.101
     B = ((0.62 - 0.23 * Tpr) * Ppr
           + (0.066 / max(Tpr - 0.86, 0.05) - 0.037) * Ppr ** 2
-          + 0.32 * Ppr ** 6 / max(10 ** (9 * (Tpr - 1)), 1e-12))
+          + 0.32 * Ppr ** 6 / max(10 ** min(9 * (Tpr - 1), 300.0), 1e-12))
     C = 0.132 - 0.32 * math.log10(Tpr)
     D = 10 ** (0.3106 - 0.49 * Tpr + 0.1824 * Tpr ** 2)
     Z = A + (1 - A) / math.exp(min(B, 50.0)) + C * Ppr ** D

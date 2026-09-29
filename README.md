@@ -49,6 +49,43 @@ reference).
 
 ## Change history
 
+## v1.4.2 — SI by default, unit-consistent messages, E300 + multi-export everywhere
+
+**Bugs fixed**
+- `build_pvto() got an unexpected keyword argument 'P_min'` / `parse_pvtg_branches`
+  AttributeError on Streamlit Cloud: the app now purges stale cached modules
+  when any module's APP_VERSION differs from the main script (self-heals
+  after a push; one "Reboot app" is still recommended after this upload).
+- Compressibility plot Pb at the wrong pressure: the share-URL restore could
+  inject field-unit values into SI widgets after a unit switch. The restore
+  now runs once per session, before any widget, together with the unit
+  system. A warning is shown when Pb exceeds the table's P_max.
+- Tuned EOS: Psat, the tuned export table and the E300 deck now use the
+  tuned C1/N2-C7+ kij (previously only the C7+ multipliers were applied).
+
+**Units**
+- SI (bara, degC, Sm3/Sm3) is the default everywhere; ECLIPSE and VFP exports
+  default to METRIC. SI P_min default = 1.01325 bara.
+- All validator, hydrate, wax, Monte-Carlo, CGR and saturation messages are
+  formatted in the selected unit system (`units.fmt`).
+- RSVD/RVVD grading points are stored in field units, edited in display
+  units and written in the deck unit set. Unit switch clears every
+  unit-dependent widget, including depth-grading rows.
+- Multi-simulator headers print reservoir T in the export's unit set.
+- Every deck / simulator file is plain ASCII.
+
+**New**
+- Compositional (EOS) → **ECLIPSE 300 PROPS deck**: CNAMES, EOS PR + PRCORR,
+  TCRIT, PCRIT, VCRIT, ZCRIT, ACF, MW, PARACHOR, BIC, RTEMP, STCOND, ZI
+  (FIELD or METRIC), with a component table, structural QC, the RUNSPEC
+  lines and Psat as a QC target. Also a **CMG GEM EOS** block.
+- Multi-simulator export (CMG IMEX/GEM, tNavigator, OPM, Nexus, IX, CSV,
+  JSON, zip bundle) in **all fluid types**: oil, dry gas, wet gas (with Rv),
+  water (Bw/Cw/mu_w/Cvw) and compositional (black-oil tables + E300 + GEM).
+  Shared helper: `ui_helpers.render_multi_sim_export`.
+- test_audit.py: 77 checks (E300 criticals/units, ASCII decks, wet-gas and
+  water writers, bundle extras).
+
 ## v1.4.1 — deployment check
 
 Every module now carries `APP_VERSION`. On startup the app checks that all

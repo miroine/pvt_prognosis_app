@@ -14,7 +14,7 @@ For a gas condensate:
         - Track Rv = liquid (STB) / gas (Mscf) of the produced gas re-flashed at standard conditions
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from eos_pr import flash, pr_phase, phase_density

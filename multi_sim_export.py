@@ -46,7 +46,7 @@ All builders take the same `case` dict:
 Only the fields relevant to `kind` need to be populated.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import io
 import json
@@ -65,6 +65,16 @@ _LB_TO_KG = 0.453592
 # ----------------------------------------------------------------------
 # Header block — used by every text-format builder
 # ----------------------------------------------------------------------
+def _t_str(case):
+    """Reservoir temperature in the export's unit set."""
+    t = case.get("T_res_F")
+    if t is None:
+        return "?"
+    if str(case.get("units", "FIELD")).upper() == "METRIC":
+        return f"{(float(t) - 32.0) / 1.8:.2f} degC"
+    return f"{float(t):.2f} degF"
+
+
 def _header(case, tag, comment_prefix="--"):
     """Return a multi-line header block using the given comment prefix."""
     now = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -74,7 +84,7 @@ def _header(case, tag, comment_prefix="--"):
         f"{comment_prefix} Case          : {case.get('fluid_name', 'unnamed')}",
         f"{comment_prefix} Kind          : {case.get('kind', '?')}",
         f"{comment_prefix} Units         : {case.get('units', 'FIELD')}",
-        f"{comment_prefix} Reservoir T   : {case.get('T_res_F', '?')} °F",
+        f"{comment_prefix} Reservoir T   : {_t_str(case)}",
         f"{comment_prefix} Oil API       : {case.get('api', '?')}",
         f"{comment_prefix} Gas SG (air=1): {case.get('gas_sg', '?')}",
         f"{comment_prefix} Generated at  : {now}",
@@ -107,7 +117,62 @@ def _kind(case):
         return "wetgas"
     if "gas" in k:
         return "drygas"
+    if "water" in k or "brine" in k:
+        return "water"
     return k
+
+
+def df_from_deck(kind, field_text):
+    """Saturated rows of a FIELD-unit PVTO / PVTG keyword as the
+    field-unit DataFrame the writers expect. Used where the app builds the
+    ECLIPSE keyword directly (wet gas, compositional) rather than from a
+    display table."""
+    import pandas as pd
+    import eclipse_qc as EQC
+    if kind == "oil":
+        rows = [{"P (psia)": b["P"][0], "Rs (scf/STB)": b["Rs"] * 1000.0,
+                 "Bo (rb/STB)": b["Bo"][0], "mu_o (cp)": b["mu"][0]}
+                for b in EQC.parse_pvto_branches(field_text)]
+    else:
+        rows = [{"P (psia)": n["P"], "Rv (STB/Mscf)": n["Rv"][0],
+                 "Bg (rb/Mscf)": n["Bg"][0], "mu_g (cp)": n["mu"][0]}
+                for n in EQC.parse_pvtg_branches(field_text)]
+    return pd.DataFrame(rows).sort_values("P (psia)").reset_index(drop=True)
+
+
+def _water_lines(case, units, style):
+    """Water block for every writer: Bw, Cw, mu_w, Cvw at Pref."""
+    Pref = case.get("Pref_psia", 3000.0)
+    bw, muw = case.get("Bw", 1.02), case.get("muw", 0.5)
+    cw = case.get("Cw", 3.5e-6)
+    cvw = case.get("Cvw", 0.0)
+    metric = units == "METRIC"
+    if style == "cmg":
+        f = (1.0 / _PSIA_TO_KPA) if metric else 1.0
+        pu = "kPa" if metric else "psi"
+        return [f"*PBW    {_conv('P', Pref, units, 'kPa'):.2f}   ** Pref ({'kPa' if metric else 'psia'})",
+                f"*BWI    {bw:.5f}   ** Bw at Pref",
+                f"*CW     {cw * f:.5e}  ** Cw (1/{pu})",
+                f"*VWI    {muw:.5f}   ** mu_w (cP)",
+                f"*CVW    {cvw * muw * f:.5e}  ** d(mu_w)/dP (cP/{pu})"]
+    f = (14.50377) if metric else 1.0     # 1/psi -> 1/bar
+    pu = "bar" if metric else "psi"
+    P = _conv('P', Pref, units)
+    if style == "nexus":
+        return ["! Water properties (PREF, BW, CW 1/%s, VISW cP, "
+                "CVW = (1/mu) dmu/dP 1/%s)" % (pu, pu),
+                "WATER",
+                "  PREF      BW        CW           VISW      CVW",
+                f"  {P:.3f}  {bw:.6f}  {cw * f:.5e}  {muw:.5f}  {cvw * f:.5e}",
+                "ENDWATER"]
+    # intersect
+    return ["    water_properties = {",
+            f"        reference_pressure = {P:.4f}",
+            f"        formation_volume_factor = {bw:.6f}",
+            f"        compressibility = {cw * f:.5e}   // 1/{pu}",
+            f"        viscosity = {muw:.6f}   // cP",
+            f"        viscosibility = {cvw * f:.5e}",
+            "    }"]
 
 
 def _find(df, *names):
@@ -185,7 +250,10 @@ def build_cmg_imex(case):
     out.append("*INUNIT *SI" if units == "METRIC" else "*INUNIT *FIELD")
     p_lbl = "kPa" if units == "METRIC" else "psia"
 
-    if kind == "oil":
+    if kind == "water":
+        cols = []
+        out.append("** Water-only case: water properties below.")
+    elif kind == "oil":
         Pb = case.get("Pb_psia")
         if Pb:
             out.append(f"** Bubble point : {_conv('P', Pb, units, 'kPa'):.2f} {p_lbl}")
@@ -196,10 +264,11 @@ def build_cmg_imex(case):
         out.append("*PVT *GAS 1")
     names = {"P": "p", "Rs": "rs", "Bo": "bo", "muo": "viso",
              "Bg": "bg", "mug": "visg", "Z": "z", "Rv": "rv"}
-    out.append("**   " + "".join(f"{names[k]:>14s}" for k in cols))
-    for i in range(len(d.get("P", []))):
-        out.append("     " + "".join(
-            f"{_conv(k, d[k][i], units, 'kPa'):14.6g}" for k in cols))
+    if cols:
+        out.append("**   " + "".join(f"{names[k]:>14s}" for k in cols))
+        for i in range(len(d.get("P", []))):
+            out.append("     " + "".join(
+                f"{_conv(k, d[k][i], units, 'kPa'):14.6g}" for k in cols))
     out.append("")
 
     rho_o, rho_g, rho_w = _densities(case, units)
@@ -208,13 +277,8 @@ def build_cmg_imex(case):
     out.append(f"*DENSITY *WATER {rho_w:.4f}")
 
     if case.get("Bw"):
-        Pref = case.get("Pref_psia", 3000.0)
         out.append("")
-        out.append(f"*BWI    {case['Bw']:.5f}   ** Bw at reference")
-        out.append(f"*PBW    {_conv('P', Pref, units, 'kPa'):.2f}   ** Pref ({p_lbl})")
-        cw = case["Cw"] if units != "METRIC" else case["Cw"] / _PSIA_TO_KPA
-        out.append(f"*CW     {cw:.5e}  ** Cw (1/{'kPa' if units == 'METRIC' else 'psi'})")
-        out.append(f"*VWI    {case.get('muw', 0.5):.5f}   ** μw (cP)")
+        out += _water_lines(case, units, "cmg")
     return "\n".join(out) + "\n"
 
 
@@ -296,7 +360,22 @@ def build_nexus(case):
                 f"  {d.get('Bo', [0]*n)[i]:10.6f}"
                 f"  {d.get('muo', [0]*n)[i]:10.6f}")
         lines.append("ENDTABLE")
-    else:
+    elif kind == "wetgas" and "Rv" in d:
+        lines.append("! Saturated (dew-point) gas: vaporized oil ratio RV per node")
+        lines.append("! Check the TYPE / PROPS keywords against your Nexus version's")
+        lines.append("! keyword document before running.")
+        lines.append("PVT_TABLE 1  TYPE WETGAS")
+        lines.append("PROPS  BG  VISCG  RV")
+        lines.append("TABLE")
+        lines.append("!     PRES          BG            MU_G         RV")
+        for i in range(n):
+            lines.append(
+                f"  {_conv('P', d['P'][i], units):12.4f}"
+                f"  {_conv('Bg', d.get('Bg', [0]*n)[i], units):14.6e}"
+                f"  {d.get('mug', [0]*n)[i]:12.6f}"
+                f"  {_conv('Rv', d['Rv'][i], units):12.6e}")
+        lines.append("ENDTABLE")
+    elif kind != "water":
         lines.append("PVT_TABLE 1  TYPE DRYGAS")
         lines.append("PROPS  BG  VISCG")
         lines.append("TABLE")
@@ -307,6 +386,9 @@ def build_nexus(case):
                 f"  {_conv('Bg', d.get('Bg', [0]*n)[i], units):14.6e}"
                 f"  {d.get('mug', [0]*n)[i]:12.6f}")
         lines.append("ENDTABLE")
+    if case.get("Bw"):
+        lines.append("")
+        lines += _water_lines(case, units, "nexus")
 
     rho_o, rho_g, rho_w = _densities(case, units)
     lines.append("")
@@ -350,13 +432,26 @@ def build_intersect(case):
         _arr("Rs", "Rs", "%.6g")
         _arr("Bo", "Bo", "%.6f")
         _arr("oil_viscosity", "muo", "%.6f")
-    else:
+    elif kind == "wetgas" and "Rv" in d:
+        lines.append("    // Check the table / field names against your IX version's")
+        lines.append("    // reference before running.")
+        lines.append("    wet_gas_pvt_table = {")
+        lines.append(f"        // pressure ({p_unit}), Rv, Bg, gas viscosity (cP)"
+                     " at the dew point")
+        _arr("pressure", "P", "%.4f")
+        _arr("Rv", "Rv", "%.6e")
+        _arr("Bg", "Bg", "%.6e")
+        _arr("gas_viscosity", "mug", "%.6f")
+    elif kind != "water":
         lines.append("    dry_gas_pvt_table = {")
         lines.append(f"        // pressure ({p_unit}), Bg, gas viscosity (cP)")
         _arr("pressure", "P", "%.4f")
         _arr("Bg", "Bg", "%.6e")
         _arr("gas_viscosity", "mug", "%.6f")
-    lines.append("    }")
+    if kind != "water":
+        lines.append("    }")
+    if case.get("Bw"):
+        lines += _water_lines(case, units, "ix")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -389,7 +484,7 @@ def build_json(case):
         "_format": "pvt_studio_pvt_case",
         "_version": 1,
         "case": {k: v for k, v in case.items()
-                 if k not in ("df_field",)
+                 if k not in ("df_field", "extra_files")
                  and not hasattr(v, "to_dict")},
         "table_field_units": (case["df_field"].to_dict(orient="records")
                               if "df_field" in case else []),
@@ -416,6 +511,8 @@ def build_bundle(case, eclipse_body):
         z.writestr(f"{name}_INTERSECT.afi", build_intersect(case))
         z.writestr(f"{name}_table.csv", build_csv(case))
         z.writestr(f"{name}_case.json", build_json(case))
+        for fname, body in (case.get("extra_files") or {}).items():
+            z.writestr(f"{name}_{fname}", body)
         # Simple README
         readme = (f"PVT Studio — export bundle for '{name}'\n"
                    f"Generated {_dt.datetime.utcnow().isoformat(timespec='seconds')} UTC\n\n"
@@ -431,5 +528,30 @@ def build_bundle(case, eclipse_body):
                    f"  {name}_case.json       — full machine-readable case\n"
                    f"\nAll simulator files are field-unit unless the case "
                    f"specifies METRIC.\n")
+        for fname in (case.get("extra_files") or {}):
+            readme += f"  {name}_{fname}\n"
         z.writestr("README.txt", readme)
     return buf.getvalue()
+
+
+# ----------------------------------------------------------------------
+# Every text deck leaves this module as plain ASCII (see units.to_ascii).
+# ----------------------------------------------------------------------
+from units import to_ascii as _to_ascii
+
+
+def _ascii_out(fn):
+    def wrapped(*a, **k):
+        return _to_ascii(fn(*a, **k))
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+build_cmg_imex = _ascii_out(build_cmg_imex)
+build_cmg_gem = _ascii_out(build_cmg_gem)
+build_nexus = _ascii_out(build_nexus)
+build_intersect = _ascii_out(build_intersect)
+build_tnavigator = _ascii_out(build_tnavigator)
+build_opm = _ascii_out(build_opm)
+build_csv = _ascii_out(build_csv)

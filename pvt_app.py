@@ -14,10 +14,10 @@ import numpy as np
 # deep inside a page with a cryptic AttributeError/ImportError. The stamp
 # is read from the file TEXT, so it works even if a stale module would
 # itself fail to import.
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 import os as _os, re as _re
 _here = _os.path.dirname(_os.path.abspath(__file__))
-_REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'eclipse_export', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export']
+_REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'e300_export', 'eclipse_export', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export']
 _stale = []
 for _m in _REQUIRED:
     try:
@@ -27,6 +27,17 @@ for _m in _REQUIRED:
             _stale.append(f"{_m}.py (version {_v.group(1) if _v else 'unknown'})")
     except FileNotFoundError:
         _stale.append(f"{_m}.py (missing)")
+# Streamlit re-runs this script after a git push, but modules imported on an
+# earlier run stay cached in sys.modules at their OLD version — the new
+# pvt_app.py then calls stale code (AttributeError / unexpected keyword).
+# If any cached app module is out of date, purge ALL app modules so the
+# imports below reload every one fresh from disk.
+import sys as _sys
+if not _stale and any(
+        getattr(_sys.modules.get(_m), "APP_VERSION", None) != APP_VERSION
+        for _m in _REQUIRED if _m in _sys.modules):
+    for _m in _REQUIRED:
+        _sys.modules.pop(_m, None)
 if _stale:
     st.set_page_config(page_title="PVT Studio — update incomplete")
     st.error(f"PVT Studio {APP_VERSION}: the deployment is incomplete — "
@@ -155,12 +166,47 @@ with st.expander("ℹ️ Quick help — how to use this app"):
 # ----------------------------------------------------------------
 # Sidebar — global controls
 # ----------------------------------------------------------------
+# Share-link keys that may be restored from the URL (whitelist).
+_SHARE_KEYS = ("res_T_w", "oil_api_w", "oil_sg_w", "oil_rsi_w",
+               "oil_rs_corr", "oil_bo_corr", "oil_mu_corr",
+               "dg_sg_w", "wg_sg_w")
+
 with st.sidebar:
     st.markdown("### Settings")
-    unit_system = st.radio("Unit system", ["Field", "SI"], horizontal=True,
-                            help="Internal calculations use field units; SI converts at I/O. "
-                                 "ECLIPSE export is always FIELD (the keyword spec).")
+    # Restore a shared case ONCE per session, BEFORE any widget exists, and
+    # restore its unit system with it: the URL's numbers are in the units
+    # of the moment it was shared. (Restoring them after the widgets had
+    # drawn, and again after every unit switch, put field values such as
+    # 600 scf/STB into SI widgets as 600 Sm3/Sm3.)
+    if not st.session_state.get("_qp_restored"):
+        st.session_state["_qp_restored"] = True
+        try:
+            _qp = dict(st.query_params)
+            if _qp.get("units") in ("Field", "SI"):
+                st.session_state["unit_system_w"] = _qp["units"]
+                st.session_state["_prev_unit_system"] = _qp["units"]
+                if _qp.get("fluid"):
+                    st.session_state["fluid_w"] = _qp["fluid"]
+                for _k in _SHARE_KEYS:
+                    _v = _qp.get(_k)
+                    if _v:
+                        try:
+                            st.session_state[_k] = float(_v)
+                        except ValueError:
+                            st.session_state[_k] = _v
+        except Exception:
+            pass
+    # SI is the default unit system (NCS practice). Pass `index` only when
+    # the widget has no stored value, to avoid Streamlit's double-default
+    # warning.
+    unit_system = st.radio(
+        "Unit system", ["Field", "SI"], horizontal=True, key="unit_system_w",
+        **({} if "unit_system_w" in st.session_state else {"index": 1}),
+        help="Display units. Internal calculations use field units and "
+             "convert at input/output. The ECLIPSE deck unit set (FIELD / "
+             "METRIC) is chosen separately below.")
     L = U.UNIT_LABELS[unit_system]
+    VAL.set_display_units(unit_system)   # alerts speak display units
 
     # Detect a unit-system switch and clear the unit-dependent widget
     # values, so each widget recomputes its default from the new unit
@@ -227,20 +273,24 @@ with st.sidebar:
             "oilsep_P_", "oilsep_T_", "olt_P_", "olt_val_", "oil_mr_rsi_",
             "oil_mr_T_", "dgsep_P_", "dgsep_T_", "dglt_P_", "dglt_val_",
             "dg_mr_T_", "wglt_P_", "wglt_val_", "wg_mr_pdew_", "wg_mr_cgr_",
-            "sepP_", "sepT_", "meas_P_", "meas_val_", "reg_offset_")
+            "sepP_", "sepT_", "meas_P_", "meas_val_", "reg_offset_",
+            "depth_d_", "depth_v_", "oil_rsvd", "wg_rvvd")
         for k in list(st.session_state.keys()):
             if k in _unit_dep_keys or str(k).startswith(_unit_dep_prefixes):
                 del st.session_state[k]
     st.session_state["_prev_unit_system"] = unit_system
 
-    fluid = st.selectbox("Fluid type / Analysis",
-                         ["Oil (Black Oil)", "Dry Gas", "Wet Gas / Condensate",
+    _FLUID_OPTIONS = ["Oil (Black Oil)", "Dry Gas", "Wet Gas / Condensate",
                           "Water", "Compositional (EOS)",
                           "❄️ Hydrate Likelihood",
                           "🪨 Rock Compressibility",
                           "🧊 Wax & Asphaltene Risk",
                           "📈 Nodal Analysis / Lift Curves",
-                          "📚 Documentation"])
+                          "📚 Documentation"]
+    if st.session_state.get("fluid_w") not in _FLUID_OPTIONS:
+        st.session_state.pop("fluid_w", None)
+    fluid = st.selectbox("Fluid type / Analysis", _FLUID_OPTIONS,
+                         key="fluid_w")
 
     st.markdown("### Reservoir Conditions")
     # A preset's "Load" button runs inside a branch — after this sidebar
@@ -271,7 +321,10 @@ with st.sidebar:
         P_min_user = st.number_input(f"P min ({L['P']})", value=14.7, min_value=14.7)
         P_max_user = st.number_input(f"P max ({L['P']})", value=6000.0, min_value=100.0)
     else:
-        P_min_user = st.number_input(f"P min ({L['P']})", value=1.0, min_value=1.0)
+        # 1 atm = 1.01325 bara. (1.0 bara is 14.50 psia — below atmospheric,
+        # which tripped the "below 14.7 psia" warning on every SI start.)
+        P_min_user = st.number_input(f"P min ({L['P']})", value=1.01325,
+                                     min_value=1.0, format="%.2f")
         P_max_user = st.number_input(f"P max ({L['P']})", value=414.0, min_value=10.0)
     P_min = U.to_field_P(P_min_user, unit_system)
     P_max = U.to_field_P(P_max_user, unit_system)
@@ -286,11 +339,13 @@ with st.sidebar:
         eclipse_unit_choice = st.radio(
             "ECLIPSE deck unit system", ["FIELD", "METRIC"],
             horizontal=True, key="global_eclipse_units",
+            **({} if "global_eclipse_units" in st.session_state
+               else {"index": 1}),                  # METRIC by default
             help=("Independent of the Field/SI display toggle. ECLIPSE keywords "
                   "must be in consistent units (set via RUNSPEC). "
                   "Internal calcs are FIELD, METRIC is converted at output."))
     else:
-        eclipse_unit_choice = "FIELD"   # default unused
+        eclipse_unit_choice = "METRIC"  # default unused
     include_water = st.checkbox("Add PVTW to ECLIPSE export", value=True)
 
     # ---- Project session save / load ----
@@ -347,10 +402,7 @@ with st.sidebar:
     try:
         _qp_state = {"fluid": fluid, "units": unit_system}
         # Add a couple of universally-relevant inputs if present.
-        for _k in ("res_T_w", "P_min_w", "P_max_w", "P_res_w",
-                    "oil_api_w", "oil_sg_w", "oil_rsi_w",
-                    "oil_rs_corr", "oil_bo_corr", "oil_mu_corr",
-                    "dg_sg_w", "wg_sg_w"):
+        for _k in _SHARE_KEYS:
             _v = st.session_state.get(_k)
             if _v is not None:
                 _qp_state[_k] = str(_v)
@@ -370,20 +422,6 @@ with st.sidebar:
                                 "address bar.")
                 except Exception:
                     st.warning(f"Could not update URL: {_e}")
-        # Auto-restore on load (best-effort)
-        try:
-            _qp = dict(st.query_params)
-            for _k, _v in _qp.items():
-                if _k in ("fluid", "units"):
-                    continue   # handled by the sidebar widgets
-                if _k not in st.session_state and _v:
-                    # Try to convert numeric strings to floats
-                    try:
-                        st.session_state[_k] = float(_v)
-                    except ValueError:
-                        st.session_state[_k] = _v
-        except Exception:
-            pass
     except Exception as _e:
         st.caption(f"Share-URL feature unavailable: {_e}")
 
@@ -408,7 +446,8 @@ from ui_helpers import (line_chart_plotly, styled_dataframe,
                          render_property_plots, render_input_correlation,
                          render_tornado_chart, fluid_fingerprint,
                          tuning_is_stale, lab_data_changed,
-                         render_stale_tuning_banner)
+                         render_stale_tuning_banner,
+                         render_multi_sim_export)
 
 
 pressures = np.linspace(P_min, P_max, n_points)
@@ -713,6 +752,14 @@ if fluid == "Oil (Black Oil)":
     oil = OilCorrelations(api=api, gas_sg=gas_sg, T=T_res,
                           rs_corr=rs_corr, bo_corr=bo_corr, mu_corr=mu_corr)
     Pb = Pb_input if Pb_input > 0 else oil.bubble_point(Rsi)
+    if Pb > P_max:
+        st.warning(
+            f"⚠️ The bubble point ({U.fmt('P', Pb, unit_system)}) is above "
+            f"the table's maximum pressure ({U.fmt('P', P_max, unit_system)}), "
+            f"so every row of the table is saturated and plots will show Pb "
+            f"off to the right of the data. Check the solution GOR "
+            f"({U.fmt('Rs', Rsi, unit_system)}) — in SI it is Sm³/Sm³, about "
+            f"5.6× smaller than the same value in scf/STB — or raise P max.")
 
     def _build_oil_rows(oil_corr, Pb_val):
         """Compute the P-Rs-Bo-mu property table for a given oil correlation."""
@@ -1150,9 +1197,12 @@ if fluid == "Oil (Black Oil)":
             "  using flash-only data.\n"
             "- **σ(gas SG) ≈ 0.01–0.05** depending on whether multi-stage "
             "  separator gas is fully sampled.\n"
-            "- **σ(Rsi) ≈ 25–75 scf/STB** for measured DLE data; ±10% for "
-            "  correlation-only estimates.\n"
-            "- **σ(T) ≈ 5–15 °F** for downhole gauges; lower for surface RTDs.\n\n"
+            f"- **σ(Rsi) ≈ {U.fmt('Rs', 25.0, unit_system)} – "
+            f"{U.fmt('Rs', 75.0, unit_system)}** for measured DLE data; "
+            "±10% for correlation-only estimates.\n"
+            f"- **σ(T) ≈ {U.fmt('dT', 5.0, unit_system)} – "
+            f"{U.fmt('dT', 15.0, unit_system)}** for downhole gauges; lower "
+            "for surface RTDs.\n\n"
             "**Note on correlated inputs:** This implementation treats the four "
             "parameters as independent. In reality, API and Rsi are often "
             "**positively correlated** (lighter oils tend to have higher GOR), "
@@ -1791,7 +1841,7 @@ if fluid == "Oil (Black Oil)":
             gc_sg  = float(_p.get("gas_sg", gas_sg))
             gc_rsi = float(_p.get("Rsi_scfSTB", _p.get("Rsi", Rsi)))
         st.caption(f"Guess inputs: API={gc_api:.1f}, gas SG={gc_sg:.3f}, "
-                    f"Rsi={gc_rsi:.0f} scf/STB")
+                    f"Rsi={U.fmt('Rs', gc_rsi, unit_system)}")
         if st.button("Generate composition guess"):
             comp_guess, MW_c7, SG_c7 = guess_oil_composition(
                 gc_api, gc_sg, gc_rsi)
@@ -1971,80 +2021,16 @@ if fluid == "Oil (Black Oil)":
                             file_name=f"PVT_BLACKOIL{_suffix}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
 
-        # ---- Multi-tool export: CMG / tNavigator / OPM / CSV / JSON ----
-        st.markdown("---")
-        with st.expander("📦 Multi-simulator export "
-                         "(CMG / tNavigator / OPM / CSV / JSON)",
-                         expanded=False):
-            st.markdown(
-                "The **same PVT table** re-formatted for other "
-                "reservoir simulators, plus generic CSV / JSON for "
-                "downstream tools (Excel, PowerBI, custom scripts). "
-                "All files use the same numeric values as the "
-                "ECLIPSE deck above — the difference is only in the "
-                "keyword syntax and header.")
-            import multi_sim_export as MSE
-            _case = {
-                "kind": "oil",
-                "fluid_name": f"OIL{_suffix or '_current'}",
-                "notes": f"Exported from PVT Studio, case: {export_choice}",
-                "units": eclipse_unit_choice,
-                "df_field": df_field,
-                "api": api, "gas_sg": gas_sg, "water_sg": 1.02,
-                "Pb_psia": Pb, "Pref_psia": 3000.0, "T_res_F": T_res,
-                "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4,
-            }
-            _fmt_choice = st.radio(
-                "Format",
-                ["CMG IMEX", "CMG GEM", "tNavigator", "OPM Flow",
-                 "Nexus", "INTERSECT (IX)",
-                 "CSV (table)", "JSON (full case)",
-                 "📦 Bundle (all formats, .zip)"],
-                horizontal=False, key="oil_multiexport_fmt")
-            if _fmt_choice == "CMG IMEX":
-                _body = MSE.build_cmg_imex(_case)
-                _mime = "text/plain"; _ext = "CMG_IMEX.dat"
-            elif _fmt_choice == "CMG GEM":
-                _body = MSE.build_cmg_gem(_case)
-                _mime = "text/plain"; _ext = "CMG_GEM.dat"
-            elif _fmt_choice == "tNavigator":
-                _body = MSE.build_tnavigator(_case, deck)
-                _mime = "text/plain"; _ext = "tNav.INC"
-            elif _fmt_choice == "OPM Flow":
-                _body = MSE.build_opm(_case, deck)
-                _mime = "text/plain"; _ext = "OPM.INC"
-            elif _fmt_choice == "Nexus":
-                _body = MSE.build_nexus(_case)
-                _mime = "text/plain"; _ext = "Nexus.dat"
-            elif _fmt_choice == "INTERSECT (IX)":
-                _body = MSE.build_intersect(_case)
-                _mime = "text/plain"; _ext = "IX.afi"
-            elif _fmt_choice == "CSV (table)":
-                _body = MSE.build_csv(_case)
-                _mime = "text/csv"; _ext = "table.csv"
-            elif _fmt_choice == "JSON (full case)":
-                _body = MSE.build_json(_case)
-                _mime = "application/json"; _ext = "case.json"
-            else:  # bundle
-                _body = MSE.build_bundle(_case, deck)
-                _mime = "application/zip"; _ext = "bundle.zip"
-
-            if _fmt_choice.startswith("📦"):
-                st.download_button(
-                    f"⬇ Download {_fmt_choice}", _body,
-                    file_name=f"PVT_OIL{_suffix}_{_ext}",
-                    mime=_mime, width='stretch')
-                st.caption("Zip contains all formats plus a README.")
-            else:
-                st.code(_body[:2000]
-                          + ("\n\n... (truncated preview) ..."
-                              if len(_body) > 2000 else ""),
-                          language=("json" if _fmt_choice.startswith("JSON")
-                                     else "text"))
-                st.download_button(
-                    f"⬇ Download {_fmt_choice}", _body,
-                    file_name=f"PVT_OIL{_suffix}_{_ext}",
-                    mime=_mime, width='stretch')
+        # ---- Multi-simulator export (shared helper) ----
+        render_multi_sim_export(
+            {"kind": "oil",
+             "fluid_name": f"OIL{_suffix or '_current'}",
+             "notes": f"Exported from PVT Studio, case: {export_choice}",
+             "units": eclipse_unit_choice, "df_field": df_field,
+             "api": api, "gas_sg": gas_sg, "water_sg": 1.02,
+             "Pb_psia": Pb, "Pref_psia": P_res, "T_res_F": T_res,
+             "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4},
+            deck, key="oil_multiexport", file_stem=f"PVT_OIL{_suffix}")
 
         # ---- Rs vs depth (RSVD) ----
         st.markdown("---")
@@ -3038,75 +3024,16 @@ elif fluid == "Dry Gas":
                             file_name=f"PVT_DRYGAS{_sfx}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
 
-        # ---- Multi-tool export for dry gas ----
-        st.markdown("---")
-        with st.expander("📦 Multi-simulator export "
-                         "(CMG / tNavigator / OPM / Nexus / IX / CSV / JSON)",
-                         expanded=False):
-            st.markdown(
-                "The same dry-gas PVT table re-formatted for every major "
-                "commercial and open-source reservoir simulator. All "
-                "files use the same numeric values as the ECLIPSE deck "
-                "above — only the keyword syntax differs.")
-            import multi_sim_export as MSE
-            _dg_case = {
-                "kind": "dry_gas",
-                "fluid_name": f"DRYGAS{_sfx or '_current'}",
-                "notes": f"Exported from PVT Studio, case: {dg_export_choice}",
-                "units": eclipse_unit_choice,
-                "df_field": df_field,
-                "api": 35.0, "gas_sg": gas_sg, "water_sg": 1.02,
-                "Pb_psia": 0.0, "Pref_psia": P_res, "T_res_F": T_res,
-                "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4,
-            }
-            _dg_fmt = st.radio(
-                "Format",
-                ["CMG IMEX", "CMG GEM", "tNavigator", "OPM Flow",
-                 "Nexus", "INTERSECT (IX)",
-                 "CSV (table)", "JSON (full case)",
-                 "📦 Bundle (all formats, .zip)"],
-                horizontal=False, key="dg_multiexport_fmt")
-            if _dg_fmt == "CMG IMEX":
-                _b = MSE.build_cmg_imex(_dg_case)
-                _m = "text/plain"; _e = "CMG_IMEX.dat"
-            elif _dg_fmt == "CMG GEM":
-                _b = MSE.build_cmg_gem(_dg_case)
-                _m = "text/plain"; _e = "CMG_GEM.dat"
-            elif _dg_fmt == "tNavigator":
-                _b = MSE.build_tnavigator(_dg_case, deck)
-                _m = "text/plain"; _e = "tNav.INC"
-            elif _dg_fmt == "OPM Flow":
-                _b = MSE.build_opm(_dg_case, deck)
-                _m = "text/plain"; _e = "OPM.INC"
-            elif _dg_fmt == "Nexus":
-                _b = MSE.build_nexus(_dg_case)
-                _m = "text/plain"; _e = "Nexus.dat"
-            elif _dg_fmt == "INTERSECT (IX)":
-                _b = MSE.build_intersect(_dg_case)
-                _m = "text/plain"; _e = "IX.afi"
-            elif _dg_fmt == "CSV (table)":
-                _b = MSE.build_csv(_dg_case)
-                _m = "text/csv"; _e = "table.csv"
-            elif _dg_fmt == "JSON (full case)":
-                _b = MSE.build_json(_dg_case)
-                _m = "application/json"; _e = "case.json"
-            else:
-                _b = MSE.build_bundle(_dg_case, deck)
-                _m = "application/zip"; _e = "bundle.zip"
-
-            if _dg_fmt.startswith("📦"):
-                st.download_button(
-                    f"⬇ Download {_dg_fmt}", _b,
-                    file_name=f"PVT_DRYGAS{_sfx}_{_e}",
-                    mime=_m, width='stretch')
-                st.caption("Zip contains all formats plus a README.")
-            else:
-                st.code(_b if isinstance(_b, str) else "(binary)",
-                         language="text")
-                st.download_button(
-                    f"⬇ Download {_dg_fmt}", _b,
-                    file_name=f"PVT_DRYGAS{_sfx}_{_e}",
-                    mime=_m, width='stretch')
+        # ---- Multi-simulator export (shared helper) ----
+        render_multi_sim_export(
+            {"kind": "drygas",
+             "fluid_name": f"DRYGAS{_sfx or '_current'}",
+             "notes": f"Exported from PVT Studio, case: {dg_export_choice}",
+             "units": eclipse_unit_choice, "df_field": df_field,
+             "api": 35.0, "gas_sg": gas_sg, "water_sg": 1.02,
+             "Pb_psia": 0.0, "Pref_psia": P_res, "T_res_F": T_res,
+             "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4},
+            deck, key="dg_multiexport", file_stem=f"PVT_DRYGAS{_sfx}")
 
     # -------- Multi-region PVT (PVTNUM > 1) --------
     if enable_eclipse_export:
@@ -3562,7 +3489,7 @@ elif fluid == "Wet Gas / Condensate":
     # -------- Composition guess for wet gas --------
     with st.expander("🔬 Guess composition for EOS comparison"):
         st.markdown(f"Synthesize a wet-gas composition from SG = {gas_sg:.3f} "
-                     f"and CGR = {cgr:.1f} STB/MMscf.")
+                     f"and CGR = {U.fmt('cgr', cgr, unit_system)}.")
         if st.button("Generate composition guess", key="wg_guess"):
             cg, MW_c7, SG_c7 = guess_gas_composition(
                 gas_sg, is_wet=True, cgr=cgr)
@@ -3928,6 +3855,26 @@ elif fluid == "Wet Gas / Condensate":
                             file_name=f"PVT_WETGAS{_sfx}_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
 
+        # ---- Multi-simulator export (shared helper) ----
+        # The PVTG keyword is built directly (no display table), so the
+        # writers get its saturated (dew-point) rows in field units.
+        try:
+            import multi_sim_export as _MSE
+            _wg_df_field = _MSE.df_from_deck("wetgas", pvtg_text)
+        except Exception as _e:
+            _wg_df_field = None
+            st.warning(f"Multi-simulator export unavailable: {_e}")
+        if _wg_df_field is not None and len(_wg_df_field):
+            render_multi_sim_export(
+                {"kind": "wetgas",
+                 "fluid_name": f"WETGAS{_sfx or '_current'}",
+                 "notes": f"Exported from PVT Studio, case: {wg_export_choice}",
+                 "units": eclipse_unit_choice, "df_field": _wg_df_field,
+                 "api": api_cond, "gas_sg": gas_sg, "water_sg": 1.02,
+                 "Pb_psia": 0.0, "Pref_psia": P_res, "T_res_F": T_res,
+                 "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4},
+                deck, key="wg_multiexport", file_stem=f"PVT_WETGAS{_sfx}")
+
         # ---- Rv vs depth (RVVD) ----
         st.markdown("---")
         _rv_ref_field = wet.rv(P_res) * 1000.0   # STB/Mscf (field)
@@ -4173,6 +4120,30 @@ elif fluid == "Water":
                             file_name=f"PVTW_{eclipse_unit_choice}.INC",
                             mime="text/plain", type="primary")
 
+        # ---- Multi-simulator export (shared helper) ----
+        _dPw = max(P_res * 0.01, 10.0)
+        _mu_lo, _mu_hi = water.viscosity(P_res - _dPw), water.viscosity(P_res + _dPw)
+        _w_mu = water.viscosity(P_res)
+        render_multi_sim_export(
+            {"kind": "water", "fluid_name": "WATER",
+             "notes": f"Brine {salinity:,.0f} ppm, {bw_corr} correlation",
+             "units": eclipse_unit_choice,
+             "df_field": pd.DataFrame([{
+                 "P (psia)": r["P_field"], "Bw (rb/STB)": r["Bw"],
+                 "Cw (1/psi)": r["Cw_field"], "mu_w (cp)": r["mu"],
+                 "Rsw (scf/STB)": r["Rsw"],
+                 "rho_w (lb/ft3)": r["rho"]} for r in rows]),
+             "api": 35.0, "gas_sg": 0.65,
+             # McCain surface brine density (S in wt%)
+             "water_sg": (62.368 + 0.438603 * salinity / 1e4
+                          + 1.60074e-3 * (salinity / 1e4) ** 2) / 62.368,
+             "Pref_psia": P_res, "T_res_F": T_res,
+             "Bw": float(water.bw(P_res)),
+             "Cw": float(water.compressibility(P_res)),
+             "muw": float(_w_mu),
+             "Cvw": float((_mu_hi - _mu_lo) / (2 * _dPw) / max(_w_mu, 1e-9))},
+            deck, key="water_multiexport", file_stem="PVTW")
+
     render_tools_section(
         branch_name="water", fluid_type="water",
         units=unit_system,
@@ -4408,6 +4379,16 @@ elif fluid == "Compositional (EOS)":
                 "re-tune.")
         else:
             c7_props_tuned = _comp_tr["tuned_c7_props"]
+    # Tuned binary interaction coefficients (C1/N2 - C7+). The tuning fits
+    # them together with the C7+ multipliers, so every tuned calculation
+    # (Psat, export table, E300 deck) must use them too.
+    _tuned_kij = {}
+    if c7_props_tuned is not None and "C7+" in comp_names:
+        if "C1" in comp_names and "kij_C1_C7" in _comp_tr:
+            _tuned_kij[("C1", "C7+")] = float(_comp_tr["kij_C1_C7"])
+        if "N2" in comp_names and "kij_N2_C7" in _comp_tr:
+            _tuned_kij[("N2", "C7+")] = float(_comp_tr["kij_N2_C7"])
+    from eos_tuning import KijOverride as _KijOverride
 
     # ---- Saturation point + C7+ summary metrics ----
     kind = "bubble" if fluid_kind == "oil" else "dew"
@@ -4423,8 +4404,9 @@ elif fluid == "Compositional (EOS)":
     Psat_tuned = None
     if c7_props_tuned is not None:
         try:
-            Psat_tuned = saturation_pressure(z_arr, comp_names, T_R,
-                                              c7_props=c7_props_tuned, kind=kind)
+            with _KijOverride(_tuned_kij):
+                Psat_tuned = saturation_pressure(
+                    z_arr, comp_names, T_R, c7_props=c7_props_tuned, kind=kind)
         except Exception:
             Psat_tuned = None
 
@@ -5924,7 +5906,8 @@ elif fluid == "Compositional (EOS)":
                      "properties before generating PVTO/PVTG.")
             if comp_export_tuned:
                 try:
-                    with st.spinner("Rebuilding black-oil table with tuned EOS..."):
+                    with st.spinner("Rebuilding black-oil table with tuned EOS..."), \
+                            _KijOverride(_tuned_kij):
                         _res_t = black_oil_table_from_composition(
                             z_arr, comp_names, T_R, pressures,
                             c7_props=c7_props_tuned, fluid_kind=fluid_kind)
@@ -5951,7 +5934,8 @@ elif fluid == "Compositional (EOS)":
                 list(np.geomspace(max(P_min, 14.7), _ps, 20))
                 + [_ps] + list(np.linspace(_ps, max(P_max, _ps) * 1.25, 7)[1:])))
             try:
-                with st.spinner("Building the dense PVT export grid..."):
+                with st.spinner("Building the dense PVT export grid..."), \
+                        _KijOverride(_tuned_kij if comp_export_tuned else {}):
                     bot_rows_for_export = black_oil_table_from_composition(
                         z_arr, comp_names, T_R, _grid,
                         c7_props=_c7_for_export, fluid_kind=fluid_kind)["rows"]
@@ -6035,6 +6019,106 @@ elif fluid == "Compositional (EOS)":
             st.download_button("Download PVT deck (.INC)", deck,
                                 file_name=fname, mime="text/plain", type="primary")
 
+            # ---- Compositional ECLIPSE 300 deck ----
+            st.markdown("---")
+            st.markdown(f"### 🧬 Compositional deck — ECLIPSE 300 "
+                        f"({eclipse_units} units)")
+            st.caption(
+                "The same Peng-Robinson fluid the app uses (C7+ "
+                "characterisation, Vc multiplier"
+                + (", tuned C7+ and tuned C1/N2-C7+ kij" if comp_export_tuned
+                   else "") +
+                ") written as E300 PROPS keywords. Add the RUNSPEC lines "
+                "shown below to your model.")
+            import e300_export as E3
+            _e3_kij = _tuned_kij if comp_export_tuned else None
+            _e3_sat = "Bubble point" if fluid_kind == "oil" else "Dew point"
+            try:
+                e300_text = E3.build_e300_props(
+                    comp_names, z_arr, T_res, c7_props=_c7_for_export,
+                    units=eclipse_units, kij_overrides=_e3_kij,
+                    psat_psia=_psat_for_export, sat_kind=_e3_sat,
+                    title=f"PVT Studio compositional {fluid_kind}"
+                          f"{' (tuned)' if comp_export_tuned else ''}")
+                gem_text = E3.build_gem_eos(
+                    comp_names, z_arr, T_res, c7_props=_c7_for_export,
+                    units=eclipse_units, kij_overrides=_e3_kij)
+            except Exception as _e:
+                e300_text = gem_text = None
+                st.error(f"Could not build the E300 deck: {_e}")
+            if e300_text:
+                _e3_rows, _ = E3.e300_component_table(
+                    comp_names, _c7_for_export, _e3_kij)
+                _si = unit_system == "SI"
+                st.dataframe(pd.DataFrame([{
+                    "Component": r["name"],
+                    "z": float(zi),
+                    ("Tc (K)" if _si else "Tc (°R)"):
+                        round(r["Tc_R"] / 1.8 if _si else r["Tc_R"], 2),
+                    ("Pc (bara)" if _si else "Pc (psia)"):
+                        round(r["Pc_psia"] / 14.50377 if _si else r["Pc_psia"], 3),
+                    ("Vc (m³/kmol)" if _si else "Vc (ft³/lbmol)"):
+                        round(r["Vc_ft3"] * E3.FT3_PER_LBMOL_TO_M3_PER_KMOL
+                              if _si else r["Vc_ft3"], 5),
+                    "Zc": round(r["Zc"], 4), "ω": round(r["omega"], 4),
+                    "MW": round(r["MW"], 3)}
+                    for r, zi in zip(_e3_rows, z_arr / np.sum(z_arr))]),
+                    hide_index=True, width='stretch')
+                _e3_qc = E3.qc_e300_props(e300_text, len(comp_names))
+                if _e3_qc["ok"]:
+                    st.success("✅ E300 structure check passed: every "
+                               "per-component keyword has "
+                               f"{len(comp_names)} entries, BIC has "
+                               f"{len(comp_names) * (len(comp_names) - 1) // 2}"
+                               ", ZI sums to 1, Zc in range.")
+                else:
+                    for _p in _e3_qc["problems"]:
+                        st.error(_p)
+                st.code("-- RUNSPEC section\n"
+                        f"{eclipse_units}\nCOMPS\n   {len(comp_names)} /\n",
+                        language="text")
+                st.code(e300_text, language="text")
+                st.download_button(
+                    "Download E300 PROPS (.INC)", e300_text,
+                    file_name=f"PVT_E300_{fluid_kind.upper()}{_ct_sfx}_"
+                              f"{eclipse_units}.INC",
+                    mime="text/plain", key="comp_e300_dl")
+
+            # ---- Multi-simulator export (black-oil + compositional) ----
+            try:
+                import multi_sim_export as _MSE
+                _cmp_df_field = _MSE.df_from_deck(
+                    "oil" if fluid_kind == "oil" else "wetgas", kw_text)
+            except Exception as _e:
+                _cmp_df_field = None
+                st.warning(f"Multi-simulator export unavailable: {_e}")
+            if _cmp_df_field is not None and len(_cmp_df_field):
+                _extra = {}
+                if e300_text:
+                    _extra["ECLIPSE 300 (compositional)"] = (
+                        e300_text, "E300_PROPS.INC")
+                    _extra["CMG GEM (compositional EOS)"] = (
+                        gem_text, "GEM_EOS.dat")
+                _api_c = (141.5 / (rho_o_sc / 62.428) - 131.5
+                          if rho_o_sc > 0 else 35.0)
+                render_multi_sim_export(
+                    {"kind": "oil" if fluid_kind == "oil" else "wetgas",
+                     "fluid_name": f"COMP_{fluid_kind.upper()}"
+                                   f"{_ct_sfx or '_current'}",
+                     "notes": "Black-oil tables from the PR EOS"
+                              + (" (tuned)" if comp_export_tuned else ""),
+                     "units": eclipse_units, "df_field": _cmp_df_field,
+                     "api": round(_api_c, 2),
+                     "gas_sg": round(rho_g_sc / 0.0764, 4),
+                     "water_sg": 1.02,
+                     "Pb_psia": (_psat_for_export if fluid_kind == "oil"
+                                 else 0.0),
+                     "Pref_psia": P_res, "T_res_F": T_res,
+                     "Bw": 1.02, "Cw": 3.5e-6, "muw": 0.4},
+                    deck, key="comp_multiexport",
+                    file_stem=f"PVT_COMP_{fluid_kind.upper()}{_ct_sfx}",
+                    extra_formats=_extra)
+
             # ---- RSVD / RVVD vs depth ----
             st.markdown("---")
             st.markdown("### RSVD / RVVD — composition vs depth")
@@ -6045,56 +6129,88 @@ elif fluid == "Compositional (EOS)":
             )
             from eclipse_export import build_rsvd, build_rvvd
 
-            if "depth_grading" not in st.session_state:
-                Rsi_now = (bot_rows[-1].get("Rs", 600) if fluid_kind == "oil"
-                           else bot_rows[-1].get("Rv", 0.08))
-                base_d = 8000.0 if unit_system == "Field" else 2440.0
-                st.session_state["depth_grading"] = [
-                    {"depth": base_d, "value": Rsi_now},
-                    {"depth": base_d + 200.0, "value": Rsi_now * 1.05},
-                    {"depth": base_d + 500.0, "value": Rsi_now * 1.10},
+            # Grading points are STORED in field units (depth ft, Rs scf/STB
+            # or Rv STB/Mscf), EDITED in display units, and WRITTEN in the
+            # deck's unit set. (Previously field values were seeded under
+            # display-unit labels and passed to the deck unconverted.)
+            _is_oil = fluid_kind == "oil"
+            if "depth_grading_f" not in st.session_state:
+                _v0 = (bot_rows[-1].get("Rs", 600.0) if _is_oil
+                       else bot_rows[-1].get("Rv", 0.08)) if bot_rows else \
+                      (600.0 if _is_oil else 0.08)
+                st.session_state["depth_grading_f"] = [
+                    {"depth_ft": 8000.0, "value_f": _v0},
+                    {"depth_ft": 8200.0, "value_f": _v0 * 1.05},
+                    {"depth_ft": 8500.0, "value_f": _v0 * 1.10},
                 ]
+
+            def _v_to_user(v):
+                return (U.to_user_Rs(v, unit_system) if _is_oil
+                        else U.to_user_Rv(v, unit_system))
+
+            def _v_to_field(v):
+                return (U.to_field_Rs(v, unit_system) if _is_oil
+                        else U.to_field_Rv(v, unit_system))
 
             depth_label = "ft" if unit_system == "Field" else "m"
             grading_to_remove = []
-            for i, pt in enumerate(st.session_state["depth_grading"]):
+            for i, pt in enumerate(st.session_state["depth_grading_f"]):
                 gc = st.columns([2, 2, 1])
                 with gc[0]:
-                    pt["depth"] = st.number_input(
+                    _d = st.number_input(
                         f"Depth ({depth_label}) #{i+1}",
-                        value=float(pt["depth"]), key=f"depth_d_{i}")
+                        value=float(U.to_user_length(pt["depth_ft"],
+                                                     unit_system)),
+                        key=f"depth_d_{i}")
+                    pt["depth_ft"] = U.to_field_length(_d, unit_system)
                 with gc[1]:
-                    label = f"Rs ({L['Rs']})" if fluid_kind == "oil" else f"Rv ({L['Rv']})"
-                    pt["value"] = st.number_input(
-                        label, value=float(pt["value"]),
-                        key=f"depth_v_{i}", format="%.4f")
+                    label = (f"Rs ({L['Rs']})" if _is_oil
+                             else f"Rv ({L['Rv']})")
+                    _v = st.number_input(
+                        label, value=float(_v_to_user(pt["value_f"])),
+                        key=f"depth_v_{i}",
+                        format="%.4f" if _is_oil else "%.4e")
+                    pt["value_f"] = _v_to_field(_v)
                 with gc[2]:
                     if st.button("✕", key=f"depth_rm_{i}"):
                         grading_to_remove.append(i)
 
             if grading_to_remove:
                 for idx in sorted(grading_to_remove, reverse=True):
-                    st.session_state["depth_grading"].pop(idx)
+                    st.session_state["depth_grading_f"].pop(idx)
                 st.rerun()
 
             if st.button("➕ Add depth point"):
-                st.session_state["depth_grading"].append(
-                    {"depth": 8500.0 if unit_system == "Field" else 2590.0,
-                     "value": 600.0 if fluid_kind == "oil" else 0.08})
+                _last = st.session_state["depth_grading_f"][-1] \
+                    if st.session_state["depth_grading_f"] else \
+                    {"depth_ft": 8000.0, "value_f": 600.0 if _is_oil else 0.08}
+                st.session_state["depth_grading_f"].append(
+                    {"depth_ft": _last["depth_ft"] + 500.0,
+                     "value_f": _last["value_f"]})
                 st.rerun()
 
             if st.button("Generate RSVD/RVVD keyword", type="primary"):
-                pairs = [(p["depth"], p["value"])
-                         for p in st.session_state["depth_grading"]]
-                if fluid_kind == "oil":
+                _met = eclipse_units == "METRIC"
+                pairs = []
+                for p in sorted(st.session_state["depth_grading_f"],
+                                key=lambda q: q["depth_ft"]):
+                    d = p["depth_ft"] * 0.3048 if _met else p["depth_ft"]
+                    if _is_oil:
+                        v = U.to_user_Rs(p["value_f"], "SI") if _met \
+                            else p["value_f"]
+                    else:
+                        v = U.to_user_Rv(p["value_f"], "SI") if _met \
+                            else p["value_f"]
+                    pairs.append((d, v))
+                if _is_oil:
                     grad_text = build_rsvd(pairs, units=eclipse_units)
                 else:
                     grad_text = build_rvvd(pairs, units=eclipse_units)
                 st.code(grad_text, language="text")
                 st.download_button(
-                    f"Download {'RSVD' if fluid_kind == 'oil' else 'RVVD'} keyword",
+                    f"Download {'RSVD' if _is_oil else 'RVVD'} keyword",
                     grad_text,
-                    file_name=f"{'RSVD' if fluid_kind == 'oil' else 'RVVD'}.INC",
+                    file_name=f"{'RSVD' if _is_oil else 'RVVD'}_{eclipse_units}.INC",
                     mime="text/plain")
 
         elif not bot_rows_for_export:
@@ -6103,7 +6219,7 @@ elif fluid == "Compositional (EOS)":
     # -------- Tools at the bottom of the compositional branch --------
     bot_summary = []
     if Psat is not None:
-        bot_summary.append(f"Psat = {Psat:.1f} psia ({kind})")
+        bot_summary.append(f"Psat = {U.fmt('P', Psat, unit_system)} ({kind})")
     if bot_rows:
         bot_summary.append(f"Black-oil table: {len(bot_rows)} rows")
     render_tools_section(
@@ -6264,7 +6380,8 @@ elif fluid == "❄️ Hydrate Likelihood":
 
     # Run the assessment
     risk = assess_hydrate_risk(T_op_F, P_op_psia, gas_sg_h, H2S_h, CO2_h,
-                                safety_margin_psia=margin_psia)
+                                safety_margin_psia=margin_psia,
+                                unit_system=unit_system)
 
     with col_h_out:
         st.markdown("### Risk Assessment")
@@ -6488,7 +6605,8 @@ elif fluid == "❄️ Hydrate Likelihood":
             else:
                 still_need = T_op_F - new_T_hyd_F
                 st.warning(f"⚠️ Still in hydrate zone — need "
-                            f"{abs(still_need):.1f} °F more suppression.")
+                            f"{U.fmt('dT', abs(still_need), unit_system)} "
+                            f"more suppression.")
 
     with cinh[1]:
         # Plot: uninhibited curve vs inhibited curve (shifted by ΔT in T)
@@ -6751,7 +6869,7 @@ uncertain.
         T_op_F=T_op_init_F, P_op_psia=P_op_psia, T_ambient_F=T_amb_F,
         gas_sg=gas_sg_h, H2S_frac=H2S_h, CO2_frac=CO2_h,
         U_pipe=U_pipe, D_outer_ft=D_pipe_in / 12.0,
-        rho_fluid=rho_fluid, cp_fluid=cp_fluid)
+        rho_fluid=rho_fluid, cp_fluid=cp_fluid, unit_system=unit_system)
 
     if not np.isnan(cd["time_hours"]) and cd["time_hours"] != float('inf'):
         ccm = st.columns(3)
@@ -7555,7 +7673,7 @@ elif fluid == "🧊 Wax & Asphaltene Risk":
 
         with wc2:
             wat_F = SR.estimate_wat(wax_api, wax_content, wax_gor_field)
-            risk = SR.wax_risk(wax_T_op_F, wat_F)
+            risk = SR.wax_risk(wax_T_op_F, wat_F, unit_system=unit_system)
             color = SR.RISK_COLORS.get(risk["level"], "#888888")
 
             st.markdown("#### Result")
@@ -8169,6 +8287,8 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     vfp_units = st.radio(
                         "ECLIPSE units", ["FIELD", "METRIC"],
                         horizontal=True, key="vfp_units",
+                        **({} if "vfp_units" in st.session_state
+                           else {"index": 1}),
                         help="Independent of the Field/SI display "
                              "toggle. Must match your RUNSPEC.")
                     vfp_flo = st.selectbox(
@@ -8187,12 +8307,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                 with vc2:
                     st.caption("**THP sweep** — outlet pressure values "
                                 f"({L['P']})")
-                    _thp_default = (
-                        ", ".join(f"{U.to_user_P(p, unit_system):.0f}"
-                                   for p in [100, 200, 400, 800])
-                        if unit_system == "Field" else
-                        ", ".join(f"{U.to_user_P(p, unit_system):.0f}"
-                                   for p in [100, 200, 400, 800]))
+                    _thp_default = ("100, 200, 400, 800"
+                                    if unit_system == "Field"
+                                    else "10, 20, 40, 60")
                     vfp_thp_txt = st.text_input(
                         f"THP values, comma-separated ({L['P']})",
                         value=_thp_default, key="vfp_thp")
@@ -8204,11 +8321,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     st.caption(f"**GFR sweep** — gas ratios "
                                 f"({'scf/STB' if unit_system=='Field' else 'Sm³/Sm³'})")
                     _glr_field_default = [200, 500, 1500, 5000]
-                    _glr_default_disp = (
-                        ", ".join(str(g) for g in _glr_field_default)
-                        if unit_system == "Field" else
-                        ", ".join(f"{g/5.6146:.0f}"
-                                   for g in _glr_field_default))
+                    _glr_default_disp = ("200, 500, 1500, 5000"
+                                         if unit_system == "Field"
+                                         else "35, 90, 270, 900")
                     vfp_glr_txt = st.text_input(
                         "GLR/GOR values",
                         value=_glr_default_disp, key="vfp_glr")

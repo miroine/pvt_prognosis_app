@@ -28,7 +28,7 @@ References (methods of the type used here):
   - Asphaltene colloidal-instability / SARA indices (various)
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import math
 
@@ -57,7 +57,7 @@ def estimate_wat(api, wax_content_pct, gor_scf_stb=0.0):
     return wat
 
 
-def wax_risk(operating_T_F, wat_F):
+def wax_risk(operating_T_F, wat_F, unit_system="Field"):
     """Classify wax-deposition risk from the margin between the operating
     temperature and the WAT.
 
@@ -74,7 +74,9 @@ def wax_risk(operating_T_F, wat_F):
                "pigging.")
     elif margin <= 10.0:
         level = "Elevated"
-        msg = ("The operating temperature is within 10 °F of the WAT. "
+        import units as _U
+        msg = (f"The operating temperature is within "
+               f"{_U.fmt('dT', 10.0, unit_system)} of the WAT. "
                "Small temperature excursions (a cold restart, a subsea "
                "section) can trigger wax. Monitor closely.")
     elif margin <= 25.0:

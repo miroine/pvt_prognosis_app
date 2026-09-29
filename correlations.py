@@ -4,7 +4,7 @@ All correlations use field units: psia, °F, °R, scf/STB, rb/STB, cp.
 References: McCain "Properties of Petroleum Fluids", Ahmed "Reservoir Engineering Handbook".
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 

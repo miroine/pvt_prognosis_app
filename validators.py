@@ -21,9 +21,37 @@ Published validity envelopes are taken from the original correlation
 papers and from McCain, *The Properties of Petroleum Fluids* (1990).
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import streamlit as st
+
+# ----------------------------------------------------------------------
+# Display units for messages. Checks receive FIELD values (the physics is
+# field-based) but must SPEAK in the user's unit system. pvt_app calls
+# set_display_units() right after the unit toggle.
+# ----------------------------------------------------------------------
+_DISPLAY_UNITS = "SI"
+
+
+def set_display_units(unit_system):
+    global _DISPLAY_UNITS
+    _DISPLAY_UNITS = unit_system if unit_system in ("Field", "SI") else "SI"
+
+
+def _q(kind, v):
+    """Format a FIELD value of quantity `kind` in the display units."""
+    import units as U
+    u = _DISPLAY_UNITS
+    if kind == "P":
+        return f"{U.to_user_P(v, u):.4g} {U.UNIT_LABELS[u]['P']}"
+    if kind == "T":
+        return f"{U.to_user_T(v, u):.4g} {U.UNIT_LABELS[u]['T']}"
+    if kind == "Rs":
+        return f"{U.to_user_Rs(v, u):.4g} {U.UNIT_LABELS[u]['Rs']}"
+    if kind == "cgr":
+        return (f"{U.to_user_cgr(v, u):.4g} "
+                f"{'STB/MMscf' if u == 'Field' else 'Sm³/MSm³'}")
+    return f"{v:g}"
 
 
 # ----------------------------------------------------------------------
@@ -134,14 +162,14 @@ def check_pressure_range(p_min, p_max, label="pressure range"):
         return r
     if p_min < 0 or p_max < 0:
         r.error(f"The {label} cannot be negative "
-                 f"(got {p_min:g} to {p_max:g}).")
+                 f"(got {_q('P', p_min)} to {_q('P', p_max)}).")
     if p_max <= p_min:
         r.error(f"The {label} maximum must be greater than the minimum "
-                 f"(got {p_min:g} to {p_max:g}).")
-    if p_min < 14.7 and p_min >= 0:
-        r.warn("Minimum pressure is below atmospheric (14.7 psia). "
-               "Property correlations are not reliable below ~14.7 psia; "
-               "the table will start there.")
+                 f"(got {_q('P', p_min)} to {_q('P', p_max)}).")
+    if p_min < 14.69 and p_min >= 0:     # tolerance: 1.01325 bara = 14.696 psia
+        r.warn(f"Minimum pressure is below atmospheric ({_q('P', 14.696)}). "
+               f"Property correlations are not reliable below 1 atm; "
+               f"the table will start there.")
     return r
 
 
@@ -153,26 +181,28 @@ def check_temperature(T_F, label="reservoir temperature"):
         return r
     # Absolute zero is -459.67 F; reservoirs are far above that.
     if T_F <= -200.0:
-        r.error(f"The {label} of {T_F:g} °F is physically implausible.")
+        r.error(f"The {label} of {_q('T', T_F)} is physically implausible.")
     elif T_F < 32.0:
-        r.warn(f"The {label} of {T_F:g} °F is below freezing — unusual "
+        r.warn(f"The {label} of {_q('T', T_F)} is below freezing — unusual "
                "for a reservoir. Check the unit setting.")
     elif T_F > 400.0:
-        r.warn(f"The {label} of {T_F:g} °F is very high. Most PVT "
-               "correlations are calibrated below ~300 °F.")
+        r.warn(f"The {label} of {_q('T', T_F)} is very high. Most PVT "
+               f"correlations are calibrated below ~{_q('T', 300.0)}.")
     return r
 
 
-def check_positive(value, name, allow_zero=False):
-    """Generic guard: a quantity that must be positive (or non-negative)."""
+def check_positive(value, name, allow_zero=False, kind=None):
+    """Generic guard: a quantity that must be positive (or non-negative).
+    `kind` ("P", "T", "Rs", "cgr") formats the value in display units."""
     r = ValidationResult()
     if value is None:
         r.error(f"{name} is not set.")
         return r
+    shown = _q(kind, value) if kind else f"{value:g}"
     if allow_zero and value < 0:
-        r.error(f"{name} cannot be negative (got {value:g}).")
+        r.error(f"{name} cannot be negative (got {shown}).")
     elif not allow_zero and value <= 0:
-        r.error(f"{name} must be greater than zero (got {value:g}).")
+        r.error(f"{name} must be greater than zero (got {shown}).")
     return r
 
 
@@ -182,7 +212,8 @@ def check_positive(value, name, allow_zero=False):
 def check_oil_inputs(api, gas_sg, T_F, Rsi, rs_corr, p_min, p_max):
     """Full validation for the black-oil branch inputs."""
     r = ValidationResult()
-    r.merge(check_positive(Rsi, "Solution GOR (Rsi)", allow_zero=False))
+    r.merge(check_positive(Rsi, "Solution GOR (Rsi)", allow_zero=False,
+                           kind="Rs"))
     r.merge(check_temperature(T_F))
     r.merge(check_pressure_range(p_min, p_max))
 
@@ -260,7 +291,7 @@ def check_wetgas_inputs(gas_sg, api_cond, cgr, T_F, Pdew, p_min, p_max):
     r.merge(check_temperature(T_F))
     r.merge(check_pressure_range(p_min, p_max))
     r.merge(check_positive(cgr, "Condensate–gas ratio (CGR)",
-                            allow_zero=True))
+                            allow_zero=True, kind="cgr"))
 
     if gas_sg is not None and gas_sg <= 0:
         r.error(f"Gas specific gravity must be positive (got {gas_sg:g}).")
@@ -268,11 +299,11 @@ def check_wetgas_inputs(gas_sg, api_cond, cgr, T_F, Pdew, p_min, p_max):
         r.warn(f"Condensate API of {api_cond:g} is unusual — condensates "
                "are typically 45–65 °API.")
     if Pdew is not None and Pdew <= 0:
-        r.error(f"Dew-point pressure must be positive (got {Pdew:g}).")
+        r.error(f"Dew-point pressure must be positive (got {_q('P', Pdew)}).")
     if (Pdew is not None and p_max is not None and Pdew > p_max):
-        r.warn(f"Dew-point pressure ({Pdew:g}) is above the maximum table "
-               "pressure — the table will not show the single-phase gas "
-               "region above the dew point.")
+        r.warn(f"Dew-point pressure ({_q('P', Pdew)}) is above the maximum "
+               f"table pressure ({_q('P', p_max)}) — the table will not show "
+               f"the single-phase gas region above the dew point.")
     return r
 
 
@@ -347,10 +378,16 @@ def _envelope_warn(result, ranges, key, value, corr_name):
         return
     lo, hi, unit, src = ranges[key]
     if value < lo or value > hi:
-        unit_str = f" {unit}" if unit else ""
+        # Ranges are stored in field units; speak in display units.
+        kind = {"T": "T", "Rsi": "Rs"}.get(key)
+        if kind:
+            v_s, lo_s, hi_s = _q(kind, value), _q(kind, lo), _q(kind, hi)
+        else:
+            u = f" {unit}" if unit else ""
+            v_s, lo_s, hi_s = f"{value:g}{u}", f"{lo:g}", f"{hi:g}{u}"
         result.warn(
-            f"{_pretty(key)} = {value:g}{unit_str} is outside the "
-            f"{corr_name} validity range ({lo:g}–{hi:g}{unit_str}). "
+            f"{_pretty(key)} = {v_s} is outside the "
+            f"{corr_name} validity range ({lo_s} – {hi_s}). "
             f"Results are extrapolated beyond the correlation's data. "
             f"[{src}]")
 

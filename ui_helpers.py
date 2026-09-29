@@ -19,7 +19,7 @@ Contents:
   - tuning_is_stale        : tuning-staleness check
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 import pandas as pd
@@ -706,3 +706,72 @@ def render_stale_tuning_banner(is_stale):
             "refresh it.</span></div>",
             unsafe_allow_html=True)
     return is_stale
+
+
+# ----------------------------------------------------------------------
+# Multi-simulator export — one expander shared by every fluid branch
+# ----------------------------------------------------------------------
+_MSE_FORMATS = ["CMG IMEX", "CMG GEM", "tNavigator", "OPM Flow", "Nexus",
+                "INTERSECT (IX)", "CSV (table)", "JSON (full case)"]
+
+
+def render_multi_sim_export(case, eclipse_deck, key, file_stem,
+                            extra_formats=None, intro=None):
+    """Expander offering the case in every supported simulator format.
+
+    case          : dict for multi_sim_export (kind, units, df_field, ...)
+    eclipse_deck  : the ECLIPSE include text (wrapped for tNavigator / OPM)
+    key           : unique widget key prefix
+    file_stem     : download file-name stem, e.g. "PVT_WETGAS_TUNED"
+    extra_formats : optional {label: (text, file_suffix)} added to the list
+                    and to the bundle (e.g. the E300 / GEM EOS decks)
+    """
+    import multi_sim_export as MSE
+    extra_formats = extra_formats or {}
+    st.markdown("---")
+    with st.expander("📦 Multi-simulator export "
+                     "(CMG / tNavigator / OPM / Nexus / IX / CSV / JSON)",
+                     expanded=False):
+        st.markdown(intro or (
+            "The same PVT data re-formatted for other reservoir "
+            "simulators, plus CSV / JSON for downstream tools. Numbers are "
+            "identical to the ECLIPSE deck above; only the keyword syntax "
+            f"differs. Unit set: **{case.get('units', 'FIELD')}**."))
+        opts = (list(extra_formats) + _MSE_FORMATS
+                + ["📦 Bundle (all formats, .zip)"])
+        choice = st.radio("Format", opts, key=f"{key}_fmt")
+        builders = {
+            "CMG IMEX": (lambda: MSE.build_cmg_imex(case), "CMG_IMEX.dat", "text/plain"),
+            "CMG GEM": (lambda: MSE.build_cmg_gem(case), "CMG_GEM.dat", "text/plain"),
+            "tNavigator": (lambda: MSE.build_tnavigator(case, eclipse_deck), "tNav.INC", "text/plain"),
+            "OPM Flow": (lambda: MSE.build_opm(case, eclipse_deck), "OPM.INC", "text/plain"),
+            "Nexus": (lambda: MSE.build_nexus(case), "Nexus.dat", "text/plain"),
+            "INTERSECT (IX)": (lambda: MSE.build_intersect(case), "IX.afi", "text/plain"),
+            "CSV (table)": (lambda: MSE.build_csv(case), "table.csv", "text/csv"),
+            "JSON (full case)": (lambda: MSE.build_json(case), "case.json", "application/json"),
+        }
+        for lbl, (txt, sfx) in extra_formats.items():
+            builders[lbl] = ((lambda t=txt: t), sfx, "text/plain")
+        try:
+            if choice.startswith("📦"):
+                bcase = dict(case)
+                bcase["extra_files"] = {sfx: txt for txt, sfx
+                                        in extra_formats.values()}
+                body = MSE.build_bundle(bcase, eclipse_deck)
+                st.download_button(f"⬇ Download {choice}", body,
+                                   file_name=f"{file_stem}_bundle.zip",
+                                   mime="application/zip",
+                                   key=f"{key}_dl_zip", width='stretch')
+                st.caption("Zip contains every format plus a README.")
+                return
+            fn, ext, mime = builders[choice]
+            body = fn()
+        except Exception as e:           # never take the page down
+            st.error(f"Could not build the {choice} export: {e}")
+            return
+        st.code(body[:4000] + ("\n\n... (truncated preview) ..."
+                               if len(body) > 4000 else ""),
+                language=("json" if choice.startswith("JSON") else "text"))
+        st.download_button(f"⬇ Download {choice}", body,
+                           file_name=f"{file_stem}_{ext}", mime=mime,
+                           key=f"{key}_dl", width='stretch')

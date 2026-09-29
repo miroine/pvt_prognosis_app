@@ -12,7 +12,7 @@ Each saved fluid is a dict with:
 Fluids are serialized as JSON and can be downloaded / uploaded as files.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import json
 from datetime import datetime, timezone

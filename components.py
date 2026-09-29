@@ -6,7 +6,7 @@ Sources: Reid-Prausnitz-Poling, Whitson-Brule, Ahmed.
 Units: Tc [R], Pc [psia], MW [lb/lb-mol], parachor [-].
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 

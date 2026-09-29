@@ -25,9 +25,10 @@ Inputs/outputs are in FIELD units at the boundary (psia, °F), with internal
 calculations in metric.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
+import units as _U
 
 
 def hydrate_pressure_makogon(T_F, gas_sg, H2S_frac=0.0, CO2_frac=0.0):
@@ -118,7 +119,7 @@ def hydrate_curve(gas_sg, H2S_frac=0.0, CO2_frac=0.0, n_points=40):
 
 
 def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
-                        safety_margin_psia=200.0):
+                        safety_margin_psia=200.0, unit_system="Field"):
     """
     Assess the hydrate-formation risk at a single operating point.
 
@@ -131,6 +132,8 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
         risk_level      : 'safe' / 'marginal' / 'in_zone' / 'unknown'
         message         : descriptive text
     """
+    import units as _U
+    _f = lambda k, v: _U.fmt(k, v, unit_system)
     P_hyd = hydrate_pressure_makogon(T_F, gas_sg, H2S_frac, CO2_frac)
     T_hyd = hydrate_temperature_makogon(P_psia, gas_sg, H2S_frac, CO2_frac)
 
@@ -146,8 +149,8 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
 
     if np.isnan(P_hyd):
         result["risk_level"] = "unknown"
-        result["message"] = (f"T = {T_F:.1f} °F is outside the Makogon "
-                              f"correlation's valid range (32–80 °F). "
+        result["message"] = (f"T = {_f('T', T_F)} is outside the Makogon "
+                              f"correlation's valid range ({_f('T', 32.0)} – {_f('T', 80.0)}). "
                               f"Use a more rigorous flash-based hydrate model.")
         return result
 
@@ -161,8 +164,8 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
     if P_hyd > 12000:
         result["risk_level"] = "safe"
         result["message"] = (
-            f"✓ Hydrate formation pressure at T = {T_F:.1f} °F exceeds the "
-            f"Makogon correlation's reliable range (~12,000 psia limit). "
+            f"✓ Hydrate formation pressure at T = {_f('T', T_F)} exceeds the "
+            f"Makogon correlation's reliable range (~{_f('P', 12000.0)} limit). "
             f"At normal operating pressures, hydrate formation is not expected "
             f"at this temperature. For high-P sour-gas systems consider a "
             f"rigorous flash-based hydrate model."
@@ -179,19 +182,19 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
             result["risk_level"] = "marginal"
             result["message"] = (
                 f"⚠️ Operating just inside the hydrate zone. "
-                f"P = {P_psia:.0f} psia is {margin_P:.0f} psia above the "
-                f"hydrate formation pressure ({P_hyd:.0f} psia) at this T. "
-                f"To exit the hydrate zone: warm to T > {T_hyd:.1f} °F "
-                f"or reduce P below {P_hyd:.0f} psia, or inject inhibitor "
+                f"P = {_f('P', P_psia)} is {_f('dP', margin_P)} above the "
+                f"hydrate formation pressure ({_f('P', P_hyd)}) at this T. "
+                f"To exit the hydrate zone: warm to T > {_f('T', T_hyd)} "
+                f"or reduce P below {_f('P', P_hyd)}, or inject inhibitor "
                 f"(methanol / MEG)."
             )
         else:
             result["risk_level"] = "in_zone"
             result["message"] = (
                 f"🛑 Deep in the hydrate-forming zone. "
-                f"P = {P_psia:.0f} psia is {margin_P:.0f} psia above the "
-                f"hydrate formation pressure ({P_hyd:.0f} psia) at T = "
-                f"{T_F:.1f} °F. Hydrate plugging is likely. "
+                f"P = {_f('P', P_psia)} is {_f('dP', margin_P)} above the "
+                f"hydrate formation pressure ({_f('P', P_hyd)}) at T = "
+                f"{_f('T', T_F)}. Hydrate plugging is likely. "
                 f"Mitigation: inhibitor injection (methanol or MEG), "
                 f"heating, depressurization, or insulation upgrade."
             )
@@ -200,8 +203,8 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
             result["risk_level"] = "marginal"
             result["message"] = (
                 f"⚠️ Operating just outside the hydrate zone. "
-                f"P = {P_psia:.0f} psia is only {-margin_P:.0f} psia below "
-                f"the hydrate formation pressure ({P_hyd:.0f} psia). "
+                f"P = {_f('P', P_psia)} is only {_f('dP', -margin_P)} below "
+                f"the hydrate formation pressure ({_f('P', P_hyd)}). "
                 f"A modest pressure increase or temperature drop could "
                 f"initiate hydrate formation."
             )
@@ -209,10 +212,10 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
             result["risk_level"] = "safe"
             result["message"] = (
                 f"✓ Outside hydrate-forming conditions. "
-                f"P = {P_psia:.0f} psia is {-margin_P:.0f} psia below the "
-                f"hydrate formation pressure ({P_hyd:.0f} psia) at this T. "
+                f"P = {_f('P', P_psia)} is {_f('dP', -margin_P)} below the "
+                f"hydrate formation pressure ({_f('P', P_hyd)}) at this T. "
                 f"To enter the hydrate zone would require pressuring up by "
-                f"≥ {-margin_P:.0f} psia or cooling to T < {T_hyd:.1f} °F."
+                f"≥ {_f('dP', -margin_P)} or cooling to T < {_f('T', T_hyd)}."
             )
 
     return result
@@ -221,7 +224,7 @@ def assess_hydrate_risk(T_F, P_psia, gas_sg, H2S_frac=0.0, CO2_frac=0.0,
 def cooldown_time_to_hydrate(T_op_F, P_op_psia, T_ambient_F,
                                 gas_sg, H2S_frac=0.0, CO2_frac=0.0,
                                 U_pipe=2.0, D_outer_ft=0.667,
-                                rho_fluid=50.0, cp_fluid=0.5):
+                                rho_fluid=50.0, cp_fluid=0.5, unit_system="Field"):
     """
     Estimate the time for a subsea flowline to cool from operating T to the
     hydrate-formation T at the operating P after shutdown.
@@ -295,8 +298,8 @@ def cooldown_time_to_hydrate(T_op_F, P_op_psia, T_ambient_F,
             "delta_T_F":   T_op_F - T_hyd_F,
             "time_hours":  float('inf'),
             "time_minutes": float('inf'),
-            "message": (f"Hydrate T ({T_hyd_F:.1f}°F) is below ambient "
-                         f"({T_ambient_F:.1f}°F). Pipe cannot cool below ambient — "
+            "message": (f"Hydrate T ({_U.fmt('T', T_hyd_F, unit_system)}) is below ambient "
+                         f"({_U.fmt('T', T_ambient_F, unit_system)}). Pipe cannot cool below ambient — "
                          f"no hydrate risk from cooldown alone."),
         }
 

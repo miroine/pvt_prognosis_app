@@ -17,7 +17,7 @@ Validity: typical reservoir conditions, porosities 0.05-0.30.
 For unconsolidated / loose sands, expect Cf values one order of magnitude higher.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 

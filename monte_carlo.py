@@ -10,7 +10,7 @@ Distributions are summarized by mean, P10, P50, P90 and rendered as histograms
 plus a tornado plot showing parameter sensitivity.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 

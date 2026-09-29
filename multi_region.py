@@ -18,7 +18,7 @@ Example PVTO with 2 regions:
 Note the double trailing `/`: one closes the last region, one closes the keyword.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 
 def build_multi_region_pvto(region_texts):

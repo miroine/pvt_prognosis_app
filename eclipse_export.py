@@ -18,7 +18,7 @@ PVTG format (the dual of PVTO):
   /
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 
@@ -386,7 +386,8 @@ def build_full_deck(pvto="", pvdg="", pvtg="", pvtw="", density="", units="FIELD
     if pvdg:    parts.append(pvdg + "\n")
     if pvtg:    parts.append(pvtg + "\n")
     if pvtw:    parts.append(pvtw + "\n")
-    return "".join(parts)
+    from units import to_ascii
+    return to_ascii("".join(parts))
 
 
 # ---------- METRIC conversion of pre-built FIELD keyword bodies ----------
@@ -614,7 +615,7 @@ def build_rvvd(depth_rv_pairs, units="FIELD"):
     label = "ft, STB/Mscf" if units == "FIELD" else "m, Sm3/Sm3"
     lines = ["RVVD", f"-- Depth   Rv    ({label})"]
     for d, rv in depth_rv_pairs:
-        lines.append(f"  {d:9.2f}   {rv:8.5f}")
+        lines.append(f"  {d:9.2f}   {rv:13.6e}")
     lines.append("/")
     return "\n".join(lines) + "\n"
 

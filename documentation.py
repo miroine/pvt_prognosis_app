@@ -10,7 +10,7 @@ Keeping this in one module means the equations live in exactly one place and
 every branch shows a consistent, citable reference.
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import streamlit as st
 
@@ -226,7 +226,7 @@ def _doc_water():
     st.latex(r"c_w = \frac{1}{A_1 + A_2 T + A_3 T^2}")
     st.markdown(
         "Dissolved gas increases $c_w$; salinity decreases it slightly. "
-        "Typical reservoir values are $3$–$6\\times10^{-6}$ psi⁻¹.")
+        "Typical reservoir values are $3$–$6\\times10^{-6}$ psi⁻¹ ($4$–$9\\times10^{-5}$ bar⁻¹).")
 
     st.markdown("##### Solution gas in brine — and viscosity")
     st.markdown(
@@ -491,7 +491,7 @@ def _doc_rock():
              r"\left(\frac{\partial \phi}{\partial P}\right)_T")
     st.markdown(
         "with $\\phi$ the porosity. Typical consolidated-sandstone "
-        "values are $3$–$6\\times10^{-6}$ psi⁻¹; unconsolidated rock "
+        "values are $3$–$6\\times10^{-6}$ psi⁻¹ ($4$–$9\\times10^{-5}$ bar⁻¹); unconsolidated rock "
         "can be an order of magnitude higher.")
 
     st.markdown("##### Correlations")

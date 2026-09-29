@@ -10,7 +10,7 @@ Output:
   viscosity  [cP]
 """
 
-APP_VERSION = "1.4.1"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from components import get_props
