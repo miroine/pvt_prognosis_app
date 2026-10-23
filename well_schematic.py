@@ -13,7 +13,7 @@ Pure Python builds a JSON spec; the HTML page renders it with plain JS +
 SVG (no CDN, no extra package), shown with streamlit.components.v1.html.
 """
 
-APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
 
 import json
 import numpy as np

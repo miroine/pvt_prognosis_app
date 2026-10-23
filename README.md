@@ -49,6 +49,27 @@ reference).
 
 ## Change history
 
+## v1.4.6 — Imported ECLIPSE PVT for the nodal analysis
+
+- New `eclipse_pvt_import.py`: reads PVTO, PVDO, PVTG, PVDG, PVTW,
+  DENSITY and GRAVITY (FIELD or METRIC, auto-detected; any number of
+  PVTNUM regions, repeat counts / defaults such as `1*`).
+- Lift curves: "PVT model for the VLP / IPR" — built-in correlations or
+  imported ECLIPSE tables (upload, paste, or load an example deck).
+  The march uses a black-oil split with dissolved gas (Rs) and vaporised
+  oil (Rv): undersaturated oil below the producing GOR (undersaturated
+  branches interpolated ECLIPSE-style), condensate drop-out from PVTG,
+  table FVFs, viscosities and in-situ densities from DENSITY; PVTW for
+  water. Tables are isothermal; gas FVF optionally corrected to the local
+  tubing temperature. Missing tables fall back to the correlations.
+- IPR: Darcy oil Bo / mu_o at Pr from the tables, Darcy gas mu*z from the
+  gas table, and Pb at the producing GOR for the composite / Darcy-oil IPR.
+- Applies to the lift curve, comparison curves, traverse, schematic hover,
+  correlation ranking / VLP tuning and the VFP export.
+- QC expander: table Rs, Bo (saturated and at the producing GOR), mu_o,
+  Bg, mu_g, Rv vs pressure against the built-in correlations, plus a
+  summary of what was read.
+
 ## v1.4.5 — More flow correlations, Darcy IPR, calibration
 
 **Multiphase-flow correlations (7)**

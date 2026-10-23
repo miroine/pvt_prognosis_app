@@ -51,7 +51,7 @@ limit, find a stable operating point, or compare lift options, not as
 the final design number.
 """
 
-APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
 
 import math
 import numpy as np
@@ -865,7 +865,7 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                     api, gas_sg, water_cut_frac, salinity_wt_pct,
                     D_in_inch, rel_roughness, method,
                     n_seg_inner=10, sigma=30.0,
-                    hold_mult=1.0, fric_mult=1.0):
+                    hold_mult=1.0, fric_mult=1.0, pvt=None):
     """March from outlet (known P) to inlet, returning the full
     pressure profile.
 
@@ -925,15 +925,38 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                         * mu_od ** (5.44 * (Rs + 150.0) ** -0.338))
                 rho_o = _oil_density(api, gas_sg, P_here, Rs, Bo)
                 rho_w = _water_density(salinity_wt_pct, T_here)
+                mu_w = max(0.3 + 0.005 * (T_here - 60.0), 0.1)
+                q_oil_free, Bw, gas_rb = q_oil, 1.0, None
+                if pvt is not None:
+                    # Imported ECLIPSE tables: black-oil split with Rs and
+                    # Rv, table FVFs / viscosities / densities. Missing
+                    # tables keep the correlation values above.
+                    fl = pvt.flash(P_here, T_here, q_oil, q_gas_mscf_d)
+                    q_oil_free, q_gas_free = fl["O_f"], fl["G_f"]
+                    if fl["Bo"] is not None:
+                        Bo, mu_o = fl["Bo"], fl["mu_o"]
+                        if fl["rho_o"] is not None:
+                            rho_o = fl["rho_o"]
+                    if fl["Bg"] is not None:
+                        gas_rb = q_gas_free * fl["Bg"]
+                        mu_g = fl["mu_g"]
+                        if fl["rho_g"] is not None:
+                            rho_g = fl["rho_g"]
+                    if pvt.water is not None:
+                        Bw, mu_w = pvt.water_props(P_here)
+                        if pvt.rho_sc:
+                            rho_w = pvt.rho_sc[1] / Bw
                 # Liquid mixture weighted by IN-SITU volumes
-                v_o, v_w = q_oil * Bo, q_wat * 1.0
+                v_o, v_w = q_oil_free * Bo, q_wat * Bw
                 f_o = v_o / (v_o + v_w) if (v_o + v_w) > 0 else 1.0
                 rho_l = rho_o * f_o + rho_w * (1.0 - f_o)
-                mu_w = max(0.3 + 0.005 * (T_here - 60.0), 0.1)
                 mu_l = mu_o * f_o + mu_w * (1.0 - f_o)
                 # In-situ liquid volume already includes Bo -> pass Bo = 1
                 v_sl, v_sg = _superficial_velocities(
                     v_o + v_w, q_gas_free, D_in_inch, P_here, T_here, Z, 1.0)
+                if gas_rb is not None:
+                    _area = math.pi * (D_in_inch / 12.0) ** 2 / 4.0
+                    v_sg = gas_rb * 5.614583 / 86400.0 / _area
                 dpdL = _select_dpdL(method, v_sl, v_sg, rho_l, rho_g,
                                       mu_l, mu_g, D_in_inch, theta,
                                       rel_roughness, P_here, sigma,
@@ -986,7 +1009,7 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                 P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                 api, gas_sg, water_cut_frac, salinity_wt_pct,
                 D_in_inch, rel_roughness, method,
-                hold_mult=1.0, fric_mult=1.0):
+                hold_mult=1.0, fric_mult=1.0, pvt=None):
     """Build a Tubing/Flowline Performance Curve.
 
     Returns a list of dicts, one per rate:
@@ -1003,7 +1026,8 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                 gas_sg=gas_sg, water_cut_frac=water_cut_frac,
                 salinity_wt_pct=salinity_wt_pct,
                 D_in_inch=D_in_inch, rel_roughness=rel_roughness,
-                method=method, hold_mult=hold_mult, fric_mult=fric_mult)
+                method=method, hold_mult=hold_mult, fric_mult=fric_mult,
+                pvt=pvt)
         except Exception as e:
             out.append({"q_liq_bbl_d": q, "q_gas_mscf_d": q_gas,
                         "P_inlet_psia": np.nan,
@@ -1100,13 +1124,15 @@ def make_darcy_oil(Pr, k_md, h_ft, mu_cp, Bo, re_ft, rw_ft, skin, Pb=None):
     return p
 
 
-def _mu_z(P, T_F, gas_sg):
+def _mu_z(P, T_F, gas_sg, pvt=None):
+    if pvt is not None and getattr(pvt, "gas", None):
+        return pvt.mu_z(max(P, 14.7), T_F)
     Z = _gas_z_simple(max(P, 14.7), T_F, gas_sg)
     return _gas_viscosity_lee(max(P, 14.7), T_F, gas_sg, Z) * Z
 
 
 def make_darcy_gas(Pr, k_md, h_ft, T_F, gas_sg, re_ft, rw_ft, skin,
-                   D_nd=0.0):
+                   D_nd=0.0, pvt=None):
     """Darcy radial gas IPR (pressure-squared form, mu*z at the average
     pressure) with rate-dependent skin D (1 / (Mscf/d)):
         Pr^2 - Pwf^2 = a mu z q + b mu z q^2,
@@ -1119,7 +1145,8 @@ def make_darcy_gas(Pr, k_md, h_ft, T_F, gas_sg, re_ft, rw_ft, skin,
          "a": 1422.0 * T_R * lnr / (k_md * h_ft),
          "b": 1422.0 * T_R * max(D_nd, 0.0) / (k_md * h_ft),
          "T_F": T_F, "gas_sg": gas_sg, "k": k_md, "h": h_ft,
-         "re": re_ft, "rw": rw_ft, "S": skin, "D": max(D_nd, 0.0)}
+         "re": re_ft, "rw": rw_ft, "S": skin, "D": max(D_nd, 0.0),
+         "pvt": pvt}
     p["aof"] = ipr_rate(p, 0.0)
     p["J"] = ipr_rate(p, 0.9 * Pr) / (0.1 * Pr)
     return p
@@ -1139,7 +1166,7 @@ def ipr_rate(p, pwf):
     if kd == "backpressure":
         return p["C"] * (Pr ** 2 - pwf ** 2) ** p["n"]
     if kd == "darcy_gas":
-        mz = _mu_z(0.5 * (Pr + pwf), p["T_F"], p["gas_sg"])
+        mz = _mu_z(0.5 * (Pr + pwf), p["T_F"], p["gas_sg"], p.get("pvt"))
         dp2 = Pr ** 2 - pwf ** 2
         A, B = p["a"] * mz, p["b"] * mz
         if B <= 1e-15:
@@ -1239,8 +1266,8 @@ def fit_ipr(model, Pr, points, Pb=None, n=1.0, darcy=None):
     elif model == IPR_MODELS[5]:
         d = darcy
         T_R = d["T_F"] + 459.67
-        mz = np.array([_mu_z(0.5 * (Pr + v), d["T_F"], d["gas_sg"])
-                       for v in w])
+        mz = np.array([_mu_z(0.5 * (Pr + v), d["T_F"], d["gas_sg"],
+                             d.get("pvt")) for v in w])
         y = (Pr ** 2 - w ** 2) / mz              # = a q + b q^2
         kh = d["k"] * d["h"]
         if len(pts) >= 2 and np.ptp(q) > 1e-6 * q.max():
@@ -1256,7 +1283,7 @@ def fit_ipr(model, Pr, points, Pb=None, n=1.0, darcy=None):
             Dn = d.get("D", 0.0)
         S = a * kh / (1422.0 * T_R) - math.log(d["re"] / d["rw"]) + 0.75
         p = make_darcy_gas(Pr, d["k"], d["h"], d["T_F"], d["gas_sg"],
-                           d["re"], d["rw"], S, Dn)
+                           d["re"], d["rw"], S, Dn, pvt=d.get("pvt"))
         fitted["S"] = S
     else:
         raise ValueError(f"Unknown IPR model {model!r}")
@@ -1280,7 +1307,8 @@ def _vlp_at_tests(tests, common, method, hold_mult=1.0, fric_mult=1.0):
                 common["api"], common["gas_sg"], t["wc"],
                 common["salinity_wt_pct"], common["D_in_inch"],
                 common["rel_roughness"], method,
-                hold_mult=hold_mult, fric_mult=fric_mult)
+                hold_mult=hold_mult, fric_mult=fric_mult,
+                pvt=common.get("pvt"))
             out.append(float(r["P_inlet_psia"]))
         except Exception:
             out.append(float("nan"))

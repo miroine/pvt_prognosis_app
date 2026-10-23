@@ -19,7 +19,7 @@ Contents:
   - tuning_is_stale        : tuning-staleness check
 """
 
-APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 import pandas as pd

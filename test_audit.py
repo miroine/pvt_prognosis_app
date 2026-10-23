@@ -387,6 +387,44 @@ rk = N.rank_correlations(truth, common)
 check("Correlation ranking puts the generating correlation's family on top",
       rk[0]["mape"] <= min(r["mape"] for r in rk) and len(rk) == len(N.CORRELATIONS))
 
+# 9e. ECLIPSE PVT import for the nodal analysis ------------------------------
+print("\n9e. ECLIPSE PVT import")
+import eclipse_pvt_import as EPI
+_pf, _ = EPI.load_pvt(EPI.example_deck("FIELD"), T_table_F=180.0)
+_pm, _im = EPI.load_pvt(EPI.example_deck("METRIC").replace("METRIC\n", "", 1), T_table_F=180.0)
+check("Units auto-detected without the keyword (METRIC deck)", _im["units_used"] == "METRIC", _im["units_reason"])
+check("METRIC and FIELD imports agree (Bo, Rs, Bg at 2000 psia)",
+      close(_pm.oil_props(2000.0)[0], _pf.oil_props(2000.0)[0], 1e-4)
+      and close(_pm.rs_sat(2000.0), _pf.rs_sat(2000.0), 1e-4)
+      and close(_pm.gas_props(2000.0)[0], _pf.gas_props(2000.0)[0], 1e-3))
+_oc = C.OilCorrelations(35.0, 0.75, 180.0)
+check("Imported PVTO reproduces the generating correlation (Pb at Rs 600)",
+      close(_pf.pb_of_rs(600.0), _oc.bubble_point(600.0), 2e-3))
+_bo_u, _, _ = _pf.oil_props(4000.0, 600.0)
+_bo_b, _, _ = _pf.oil_props(_pf.pb_of_rs(600.0), 600.0)
+check("Undersaturated Bo falls above Pb (oil compressibility)", _bo_u < _bo_b)
+check("Surface densities -> API 35, gas SG 0.75", close(_pf.api, 35.0, 1e-3) and close(_pf.gas_sg, 0.75, 1e-3))
+fl = _pf.flash(1500.0, 180.0, 1000.0, 1000.0)
+check("Black-oil split conserves surface gas (G_f + O_f Rs = q_g)",
+      close(fl["G_f"] + fl["O_f"] * fl["Rs"] / 1000.0, 1000.0, 1e-9))
+_wg = C.WetGasCorrelations(0.7, 55.0, 80.0, 220.0, Pdew=4500.0)
+_pg, _ = EPI.load_pvt("FIELD\n" + E.build_density(55.0, 0.7)
+                      + E.build_pvtg(list(np.linspace(500, 6000, 12)), _wg), T_table_F=220.0)
+fl = _pg.flash(3000.0, 220.0, 400.0, 5000.0)
+check("PVTG: condensate drops out below saturated Rv (q_o = O_f + G_f Rv)",
+      fl["O_f"] > 0 and close(fl["O_f"] + fl["G_f"] * fl["Rv"], 400.0, 1e-9))
+_two = ("FIELD\nPVTO\n" + "\n".join(E.build_pvto(None, _oc.bubble_point(600), _oc, 600, 5000).splitlines()[1:])
+        + "\n" + "\n".join(E.build_pvto(None, _oc.bubble_point(300), _oc, 300, 5000).splitlines()[1:]))
+_r2, _i2 = EPI.load_pvt(_two, region=2)
+check("Two PVTNUM regions found; region 2 selected", _i2["n_regions"] == 2 and _r2.region == 2)
+_a = N.lift_curve([1000, 3000], 500, 200, 80, 180, [(8000, 90)], 35, 0.75, 0.1, 2.0, 2.992, 6e-4, "Hagedorn & Brown")
+_b = N.lift_curve([1000, 3000], 500, 200, 80, 180, [(8000, 90)], 35, 0.75, 0.1, 2.0, 2.992, 6e-4, "Hagedorn & Brown", pvt=_pf)
+check("VLP with the imported tables within 15 % of the correlation VLP (same fluid)",
+      all(abs(x["P_inlet_psia"] / y["P_inlet_psia"] - 1) < 0.15 for x, y in zip(_b, _a)),
+      str([round(x["P_inlet_psia"]) for x in _b]) + " vs " + str([round(y["P_inlet_psia"]) for y in _a]))
+_pgd = N.make_darcy_gas(4000.0, 10.0, 60.0, 220.0, 0.7, 1490.0, 0.354, 0.0, 0.0, pvt=_pg)
+check("Darcy gas IPR runs on mu*z from the imported gas table", _pgd["aof"] > 0)
+
 # 10. Deployment stamp ------------------------------------------------------
 print("\n10. Deployment")
 import os, re

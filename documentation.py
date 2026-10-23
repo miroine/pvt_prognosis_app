@@ -10,7 +10,7 @@ Keeping this in one module means the equations live in exactly one place and
 every branch shows a consistent, citable reference.
 """
 
-APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
 
 import streamlit as st
 

@@ -7,7 +7,7 @@ This is a *guess* for initial EOS work — not a substitute for a measured
 chromatograph.
 """
 
-APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 
