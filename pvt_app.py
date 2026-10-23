@@ -14,10 +14,10 @@ import numpy as np
 # deep inside a page with a cryptic AttributeError/ImportError. The stamp
 # is read from the file TEXT, so it works even if a stale module would
 # itself fail to import.
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.5"
 import os as _os, re as _re
 _here = _os.path.dirname(_os.path.abspath(__file__))
-_REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'e300_export', 'eclipse_export', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export']
+_REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'e300_export', 'eclipse_export', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export', 'well_schematic']
 _stale = []
 for _m in _REQUIRED:
     try:
@@ -266,6 +266,8 @@ with st.sidebar:
             "env_meas_T", "env_meas_P", "flash_T", "flash_P",
             "nd_id", "nd_len", "nd_segs", "nd_pout", "nd_tout", "nd_tin",
             "nd_glr", "nd_qmin", "nd_qmax", "nd_traverse_idx",
+            "nd_pr", "nd_datum", "nd_grad", "nd_qtest", "nd_pwftest",
+            "nd_ipr_pb", "nd_ipr_pb_d", "nd_dre", "nd_dh", "nd_drw", "nd_dD",
             "vfp_thp", "vfp_glr",
         ]
         # Per-row widgets (separator stages, lab rows, region tables)
@@ -7857,6 +7859,130 @@ elif fluid == "🧊 Wax & Asphaltene Risk":
 # ================================================================
 elif fluid == "📈 Nodal Analysis / Lift Curves":
     import nodal as ND
+    import well_schematic as WS
+
+    def _render_html_component(html, height):
+        """Render a self-contained HTML/JS page (the well schematic)."""
+        try:
+            import streamlit.components.v1 as _cv1
+            _cv1.html(html, height=height, scrolling=False)
+        except Exception:
+            st.info("Interactive schematic needs streamlit.components "
+                    "(Streamlit >= 1.0).")
+
+    def _nd_completion_and_schematic(segments, unit_system, node_md_ft,
+                                     node_tvd_ft, ID_in, nd_fluid,
+                                     outlet_txt, T_top, T_bot, T_unit,
+                                     P_unit, datum_ft, sig):
+        """Completion inputs (drawing only) + the JS schematic HTML."""
+        _f = unit_system == "Field"
+        lf, lu = (1.0, "ft") if _f else (0.3048, "m")
+        node_md, node_tvd = node_md_ft * lf, node_tvd_ft * lf
+        sigk = f"{unit_system}_{int(round(node_md))}"
+        with st.expander("🔧 Completion details (schematic)", expanded=False):
+            st.caption(
+                "Drawing only. The VLP uses the tubing ID from the "
+                "geometry inputs all the way to the solution node; the "
+                "short cased section between the tubing shoe and the "
+                "node is not modelled separately.")
+            loc = st.radio("Surface location",
+                           ["Offshore platform", "Onshore"],
+                           horizontal=True, key="nd_ws_loc")
+            c1, c2 = st.columns(2)
+            if loc == "Offshore platform":
+                with c1:
+                    wd = st.number_input(
+                        f"Water depth ({lu})",
+                        value=float(round(min(300.0 / 0.3048 * lf,
+                                              0.25 * node_tvd))),
+                        min_value=0.0,
+                        max_value=float(max(0.6 * node_tvd, 1.0)),
+                        key=f"nd_ws_wd_{sigk}")
+                air = 25.0 / 0.3048 * lf
+            else:
+                wd, air = 0.0, 0.0
+            with c2:
+                perf_len = st.number_input(
+                    f"Perforated interval, MD ({lu})",
+                    value=float(round(30.0 / 0.3048 * lf)), min_value=1.0,
+                    key=f"nd_ws_perf_{sigk}")
+            with c1:
+                rathole = st.number_input(
+                    f"Rathole below perforations ({lu})",
+                    value=float(round(25.0 / 0.3048 * lf)), min_value=0.0,
+                    key=f"nd_ws_rat_{sigk}")
+            with c2:
+                res_th = st.number_input(
+                    f"Reservoir thickness, TVD ({lu})",
+                    value=float(round(60.0 / 0.3048 * lf)), min_value=1.0,
+                    key=f"nd_ws_res_{sigk}")
+            pk_default = max(node_md - perf_len / 2 - 0.04 * node_md,
+                             0.5 * node_md)
+            packer = st.number_input(
+                f"Production packer MD ({lu})",
+                value=float(round(pk_default)), min_value=0.0,
+                max_value=float(node_md), key=f"nd_ws_pk_{sigk}")
+            td = node_md + perf_len / 2 + rathole
+            df0 = pd.DataFrame(WS.default_casing_program(td, air + wd))
+            st.caption(f"Casing programme (MD in {lu}; edit, add or "
+                       f"delete rows):")
+            try:
+                df = st.data_editor(
+                    df0, key=f"nd_ws_cas_{sigk}_{int(wd)}",
+                    num_rows="dynamic", hide_index=True, width='stretch')
+            except Exception:
+                df = df0
+            if not isinstance(df, pd.DataFrame):
+                df = df0
+        strings = []
+        for _, r in df.iterrows():
+            try:
+                od, top_, shoe = (float(r["OD (in)"]), float(r["Top MD"]),
+                                  float(r["Shoe MD"]))
+                cem = float(r.get("Cement top MD", top_))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not (od > 0 and shoe > top_ >= 0) or od != od:
+                continue
+            strings.append({"name": str(r["String"]), "od": od,
+                            "top": top_, "shoe": min(shoe, td),
+                            "cem_top": min(max(cem, top_), shoe),
+                            "label": WS.size_label(od)})
+        tub_od = WS.tubing_od_for_id(ID_in)
+        at_pk = [c["od"] for c in strings if c["top"] <= packer <= c["shoe"]]
+        if at_pk and min(at_pk) <= tub_od + 0.5:
+            st.warning(f"Tubing OD {tub_od:.2f} in does not fit the "
+                       f"{min(at_pk):.3g} in casing at the packer — check "
+                       f"the tubing ID or the casing programme.")
+        perf = [node_md - perf_len / 2, node_md + perf_len / 2]
+        tub_bot = max(perf[0] - 5.0 / 0.3048 * lf, packer + 1.0)
+        traj = WS.trajectory_points([(L * lf, th) for L, th in segments],
+                                    rathole=perf_len / 2 + rathole)
+        fl = ("gas" if nd_fluid in ("Dry Gas", "Wet Gas", "Gas-Condensate")
+              else "water" if nd_fluid == "Water" else "oil")
+        prof = st.session_state.get("_nd_schem_P")
+        prof = prof if (prof and prof.get("sig") == sig) else None
+        spec = {
+            "traj": traj, "unit": lu, "strings": strings,
+            "tubing": {"od": tub_od, "id": ID_in, "bottom": tub_bot,
+                       "label": WS.size_label(tub_od)},
+            "packer_md": packer, "perf": perf,
+            "node": {"md": node_md, "tvd": node_tvd},
+            "datum_tvd": (datum_ft * lf if datum_ft is not None else None),
+            "water_depth": wd, "air_gap": air,
+            "res_top_tvd": node_tvd - 0.4 * res_th,
+            "res_bot_tvd": node_tvd + 0.6 * res_th,
+            "fluid": fl, "outlet_txt": outlet_txt,
+            "T_top": T_top, "T_bot": T_bot, "T_unit": T_unit,
+            "P_profile": prof["profile"] if prof else None,
+            "P_label": prof["label"] if prof else None, "P_unit": P_unit,
+            "title": (f"Well schematic — {nd_fluid}, "
+                      f"{'offshore' if wd > 0 else 'onshore'}"),
+        }
+        if not prof:
+            st.caption("Run the nodal analysis to add the pressure "
+                       "traverse to the schematic's hover readout.")
+        return WS.build_schematic_html(spec, height=800)
 
     st.markdown("## Nodal Analysis & Lift Curves")
     st.markdown(
@@ -7997,6 +8123,226 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
         nd_npts = st.slider("Number of rate points", 5, 20, 10,
                              key="nd_npts")
 
+        # ---- Reservoir inflow (IPR) at the solution node ----
+        nd_ipr = None
+        nd_tests, nd_fit_ipr_tests = [], False
+        nd_is_gas = nd_fluid in ("Dry Gas", "Wet Gas", "Gas-Condensate")
+        if nd_geom_kind != "Horizontal flowline":
+            st.markdown("### Reservoir inflow (IPR)")
+            nd_ipr_on = st.checkbox(
+                "Overlay the IPR on the lift curve (IPR / VLP QC)",
+                value=True, key="nd_ipr_on",
+                help="Inflow and outflow are both evaluated at the "
+                     "solution node = bottom of the last pipe segment "
+                     "(see the well schematic).")
+            if nd_ipr_on:
+                _models = list(ND.IPR_MODELS)
+                nd_ipr_model = st.selectbox(
+                    "IPR model", _models,
+                    **({} if "nd_ipr_model" in st.session_state else
+                       {"index": 3 if nd_is_gas else 0}),
+                    help="Empirical (fitted to a test) or Darcy radial "
+                         "inflow from reservoir properties.",
+                    key="nd_ipr_model")
+                _gas_ipr = nd_ipr_model in ND.IPR_GAS_MODELS
+                nd_pr_user = st.number_input(
+                    f"Static reservoir pressure Pr ({L['P']})",
+                    value=U.to_user_P(3500.0, unit_system),
+                    min_value=U.to_user_P(14.7, unit_system),
+                    key="nd_pr")
+                nd_pr_datum_on = st.checkbox(
+                    "Pr is given at a datum depth (not at the node)",
+                    value=False, key="nd_pr_datum_on",
+                    help="Pr is shifted from the datum to the node TVD "
+                         "with the static reservoir-fluid gradient.")
+                nd_datum_ft, nd_grad_psi_ft = None, None
+                if nd_pr_datum_on:
+                    _dat = st.number_input(
+                        f"Pr datum depth, TVD ({nd_len_unit})",
+                        value=nd_len_default, min_value=0.0,
+                        key="nd_datum")
+                    nd_datum_ft = _dat if nd_len_unit == "ft" else _dat / 0.3048
+                    if unit_system == "Field":
+                        _g = st.number_input(
+                            "Reservoir-fluid gradient (psi/ft)",
+                            value=(0.10 if _gas_ipr else 0.35),
+                            min_value=0.0, max_value=1.0, format="%.3f",
+                            key="nd_grad")
+                        nd_grad_psi_ft = _g
+                    else:
+                        _g = st.number_input(
+                            "Reservoir-fluid gradient (bar/m)",
+                            value=(0.023 if _gas_ipr else 0.079),
+                            min_value=0.0, max_value=0.25, format="%.4f",
+                            key="nd_grad")
+                        nd_grad_psi_ft = _g * 14.50377 * 0.3048
+                _darcy = nd_ipr_model in ND.IPR_DARCY_MODELS
+                _f = unit_system == "Field"
+                _lf_in = 1.0 if _f else 0.3048       # ft -> display length
+                nd_darcy = None
+                if _darcy:
+                    st.caption("Darcy radial inflow, pseudo-steady state "
+                               "(average Pr, closed circular drainage area).")
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        _k = st.number_input("Permeability k (mD)",
+                                             value=(10.0 if _gas_ipr else 100.0),
+                                             min_value=0.001, key="nd_dk")
+                        _re = st.number_input(f"Drainage radius re ({nd_len_unit})",
+                                              value=(1490.0 if _f else 454.0),
+                                              min_value=1.0, key="nd_dre")
+                        _S = st.number_input("Skin S", value=0.0,
+                                             min_value=-6.0, max_value=200.0,
+                                             key="nd_dskin")
+                    with d2:
+                        _h = st.number_input(f"Net thickness h ({nd_len_unit})",
+                                             value=(50.0 if _f else 15.0),
+                                             min_value=0.01, key="nd_dh")
+                        _rw = st.number_input(f"Wellbore radius rw ({nd_len_unit})",
+                                              value=(0.354 if _f else 0.108),
+                                              min_value=0.01, format="%.3f",
+                                              key="nd_drw")
+                    nd_darcy = {"k": _k, "h": _h / _lf_in, "re": _re / _lf_in,
+                                "rw": _rw / _lf_in, "S": _S}
+                    if _gas_ipr:
+                        _Dlbl = ("Non-Darcy coefficient D (1/(Mscf/d))" if _f
+                                 else "Non-Darcy coefficient D (1/(Sm³/d))")
+                        _D = st.number_input(_Dlbl, value=0.0, min_value=0.0,
+                                             format="%.3e", key="nd_dD",
+                                             help="Rate-dependent skin S' = S + D·q.")
+                        nd_darcy.update(D=(_D if _f else _D * 28.3168),
+                                        T_F=nd_Tin_F, gas_sg=nd_gas_sg)
+                    else:
+                        with d1:
+                            _mu = st.number_input("Oil viscosity μo (cP)",
+                                                  value=1.0, min_value=0.01,
+                                                  key="nd_dmu")
+                        with d2:
+                            _bo = st.number_input(f"Bo ({L['Bo']})", value=1.2,
+                                                  min_value=1.0, key="nd_dbo")
+                        nd_darcy.update(mu=_mu, Bo=_bo)
+                    nd_use_test = st.checkbox(
+                        "Calibrate the skin to the well-test point below",
+                        value=False, key="nd_darcy_cal")
+                else:
+                    nd_use_test = True
+                st.caption("Well-test point (flowing pressure at the node)"
+                           + (" — used for the skin calibration." if _darcy
+                              else " — fits the IPR."))
+                if _gas_ipr:
+                    _qt_lbl = ("Test gas rate (Mscf/d)" if unit_system == "Field"
+                               else "Test gas rate (Sm³/d)")
+                    _qt = st.number_input(
+                        _qt_lbl,
+                        value=(5000.0 if unit_system == "Field" else 141584.0),
+                        min_value=0.001, key="nd_qtest")
+                    nd_qtest = _qt if unit_system == "Field" else _qt / 28.3168
+                else:
+                    _qt = st.number_input(
+                        f"Test liquid rate ({'STB/d' if unit_system == 'Field' else 'Sm³/d'})",
+                        value=(2000.0 if unit_system == "Field" else 318.0),
+                        min_value=0.001, key="nd_qtest")
+                    nd_qtest = _qt if unit_system == "Field" else _qt / 0.158987
+                _pt = st.number_input(
+                    f"Test flowing pressure at node, Pwf ({L['P']})",
+                    value=U.to_user_P(2500.0, unit_system),
+                    min_value=0.0, key="nd_pwftest")
+                nd_pwftest = U.to_field_P(_pt, unit_system)
+                nd_ipr_pb, nd_ipr_n = None, 1.0
+                if nd_ipr_model == ND.IPR_MODELS[2]:
+                    nd_ipr_pb = U.to_field_P(st.number_input(
+                        f"Bubble point Pb ({L['P']})",
+                        value=U.to_user_P(3000.0, unit_system),
+                        min_value=U.to_user_P(14.7, unit_system),
+                        key="nd_ipr_pb"), unit_system)
+                elif nd_ipr_model == ND.IPR_MODELS[4]:
+                    _pbu = st.number_input(
+                        f"Bubble point Pb ({L['P']}, 0 = undersaturated)",
+                        value=0.0, min_value=0.0, key="nd_ipr_pb_d",
+                        help="Below Pb the Darcy line continues as Vogel.")
+                    nd_ipr_pb = U.to_field_P(_pbu, unit_system) if _pbu > 0 else None
+                if nd_ipr_model == ND.IPR_MODELS[3]:
+                    nd_ipr_n = st.number_input(
+                        "Back-pressure exponent n", value=0.85,
+                        min_value=0.5, max_value=1.0, step=0.05,
+                        key="nd_ipr_n",
+                        help="1.0 = laminar (Darcy); 0.5 = fully turbulent. "
+                             "Fitted when two or more well tests are used.")
+                nd_ipr = {"model": nd_ipr_model, "gas": _gas_ipr,
+                          "darcy": nd_darcy, "use_test": nd_use_test,
+                          "Pr_input_psia": U.to_field_P(nd_pr_user, unit_system),
+                          "datum_ft": nd_datum_ft, "grad": nd_grad_psi_ft,
+                          "q_test": nd_qtest, "pwf_test": nd_pwftest,
+                          "Pb": nd_ipr_pb, "n": nd_ipr_n}
+
+            # ---- Well tests for calibration (IPR and VLP) ----
+            st.markdown("### 🎯 Well tests (calibration)")
+            st.caption("Measured rate, wellhead pressure and flowing "
+                       "pressure at the solution node (gauge pressure "
+                       "corrected to the node depth). Blank GLR / WC use "
+                       "the case values. The rows below are an EXAMPLE — "
+                       "replace them with your tests.")
+            _qu = "STB/d" if unit_system == "Field" else "Sm³/d"
+            _gu = "scf/STB" if unit_system == "Field" else "Sm³/Sm³"
+            _ex = [("Example 1", 1200.0, 565.0, 2900.0),
+                   ("Example 2", 1800.0, 404.0, 2600.0),
+                   ("Example 3", 2400.0, 238.0, 2300.0)]
+            _qf_in = 1.0 if unit_system == "Field" else 0.158987
+            _tdf0 = pd.DataFrame([{
+                "Test": lab, f"Liquid rate ({_qu})": round(q_ * _qf_in, 1),
+                f"THP ({L['P']})": round(U.to_user_P(thp_, unit_system), 2),
+                f"Pwf at node ({L['P']})": round(U.to_user_P(pw_, unit_system), 2),
+                f"GLR ({_gu})": None, "WC (frac)": None}
+                for lab, q_, thp_, pw_ in _ex])
+            try:
+                _tdf = st.data_editor(_tdf0, key=f"nd_tests_{unit_system}",
+                                      num_rows="dynamic", hide_index=True,
+                                      width='stretch')
+            except Exception:
+                _tdf = _tdf0
+            if not isinstance(_tdf, pd.DataFrame):
+                _tdf = _tdf0
+            nd_tests = []
+            for _, r in _tdf.iterrows():
+                try:
+                    q_ = float(r[f"Liquid rate ({_qu})"]) / _qf_in
+                    thp_ = U.to_field_P(float(r[f"THP ({L['P']})"]), unit_system)
+                    pw_ = U.to_field_P(float(r[f"Pwf at node ({L['P']})"]),
+                                       unit_system)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if not (q_ > 0 and thp_ > 0 and pw_ > thp_) or q_ != q_ or pw_ != pw_:
+                    continue
+                _g = r.get(f"GLR ({_gu})")
+                _w = r.get("WC (frac)")
+                try:
+                    glr_ = float(_g) * (1.0 if unit_system == "Field" else 5.6146)
+                    if glr_ != glr_:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    glr_ = nd_GLR
+                try:
+                    wc_ = float(_w)
+                    if wc_ != wc_:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    wc_ = nd_wc
+                nd_tests.append({"label": str(r.get("Test", "")), "q": q_,
+                                 "thp": thp_, "pwf": pw_, "glr": glr_,
+                                 "wc": min(max(wc_, 0.0), 1.0)})
+            nd_fit_ipr_tests = False
+            if nd_ipr is not None:
+                nd_fit_ipr_tests = st.checkbox(
+                    f"Fit the IPR to these {len(nd_tests)} well test(s)",
+                    value=False, key="nd_fit_ipr_tests",
+                    help="Least squares on all tests: J (PI / composite), "
+                         "qmax (Vogel), C and n (back-pressure), skin "
+                         "(Darcy oil), skin and D (Darcy gas). Overrides "
+                         "the single test point.")
+        else:
+            st.caption("IPR overlay is available for wells (not for a "
+                       "horizontal flowline).")
+
     # ---- Build segment list ----
     segments = None
     seg_error = None
@@ -8048,8 +8394,43 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
 
             chosen = st.selectbox(
                 "Correlation to run", list(ND.CORRELATIONS),
-                index=list(ND.CORRELATIONS).index(rec["recommended"]),
+                **({} if "nd_method" in st.session_state else
+                   {"index": list(ND.CORRELATIONS).index(rec["recommended"])}),
                 key="nd_method")
+            with st.expander("📖 Correlations & IPR models — reference"):
+                st.dataframe(pd.DataFrame(
+                    [{"Correlation": k_, "Use": v_}
+                     for k_, v_ in ND.CORRELATION_NOTES.items()]),
+                    hide_index=True, width='stretch')
+                st.markdown(
+                    "- **Beggs & Brill (1973)**, **Mukherjee & Brill (1985)** "
+                    "— empirical, all inclinations.\n"
+                    "- **Hagedorn & Brown (1965)** with Griffith bubble flow; "
+                    "chart fits after Trick (2003).\n"
+                    "- **Orkiszewski (1967)** — Griffith bubble, slug with "
+                    "liquid-distribution coefficient Γ, Duns & Ros mist "
+                    "(bubble rise 0.35√(gD) used instead of the "
+                    "Griffith-Wallis chart).\n"
+                    "- **Hasan & Kabir (1988)** — drift-flux "
+                    "(C₀ = 1.2, Harmathy / Taylor-bubble rise velocities, "
+                    "deviation correction).\n"
+                    "- **Gray (1974)** — vertical wet-gas wells.\n"
+                    "- **No-slip homogeneous** — lower bound.\n"
+                    "\nNon-vertical pipe: H-B, Orkiszewski and Gray defer to "
+                    "Beggs & Brill beyond 30° from vertical; Hasan & Kabir "
+                    "below 15° from horizontal.")
+                st.markdown("**Darcy radial inflow (pseudo-steady state, field units)**")
+                st.latex(r"q_o = \frac{k\,h\,(\bar p_r - p_{wf})}"
+                         r"{141.2\,B_o\,\mu_o\left[\ln\frac{r_e}{r_w} - 0.75 + S\right]}")
+                st.latex(r"\bar p_r^2 - p_{wf}^2 = \frac{1422\,T\,\bar\mu\,\bar z}{k\,h}"
+                         r"\left[\left(\ln\frac{r_e}{r_w} - 0.75 + S\right) q_g + D\,q_g^2\right]")
+                st.markdown(
+                    "**Calibration.** IPR: least squares on all well tests "
+                    "(J, qmax, C & n, skin, or skin & D). VLP: gravity and "
+                    "friction multipliers on the chosen correlation fitted "
+                    "to the measured node pressures (with one test only "
+                    "the gravity multiplier), like the parameter-1 / "
+                    "parameter-2 matching in commercial nodal tools.")
 
             st.markdown("### Assumptions & Fluid Properties")
             st.caption(
@@ -8071,6 +8452,401 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                             if unit_system == "Field"
                             else f"{ID_in*25.4:.0f} mm")
 
+            # ---- Well schematic, solution node and assumptions ----
+            _tx, _tz, _tmd = ND.well_trajectory(segments)
+            node_md_ft, node_tvd_ft = float(_tmd[-1]), float(_tz[-1])
+            _lf = 1.0 if unit_system == "Field" else 0.3048
+            _lu = "ft" if unit_system == "Field" else "m"
+            _is_flowline = nd_geom_kind == "Horizontal flowline"
+
+            # IPR at the node (calibrated from the test point)
+            nd_ipr_p, nd_ipr_err, nd_pr_node = None, None, None
+            nd_ipr_fit = None
+            if nd_ipr is not None:
+                nd_pr_node = nd_ipr["Pr_input_psia"]
+                if nd_ipr["datum_ft"] is not None:
+                    nd_pr_node = ND.correct_pressure_to_node(
+                        nd_pr_node, nd_ipr["datum_ft"], node_tvd_ft,
+                        nd_ipr["grad"])
+                nd_ipr_fit = None
+                try:
+                    _m = nd_ipr["model"]
+                    _d = nd_ipr["darcy"]
+                    if nd_fit_ipr_tests and nd_tests:
+                        _pts = [((t["q"] * t["glr"] / 1000.0) if nd_ipr["gas"]
+                                 else t["q"], t["pwf"]) for t in nd_tests]
+                        nd_ipr_fit = ND.fit_ipr(_m, nd_pr_node, _pts,
+                                                Pb=nd_ipr["Pb"], n=nd_ipr["n"],
+                                                darcy=_d)
+                        nd_ipr_p = nd_ipr_fit["params"]
+                    elif _m == ND.IPR_MODELS[4]:
+                        if nd_ipr["use_test"]:
+                            nd_ipr_fit = ND.fit_ipr(
+                                _m, nd_pr_node,
+                                [(nd_ipr["q_test"], nd_ipr["pwf_test"])],
+                                Pb=nd_ipr["Pb"], darcy=_d)
+                            nd_ipr_p = nd_ipr_fit["params"]
+                        else:
+                            nd_ipr_p = ND.make_darcy_oil(
+                                nd_pr_node, _d["k"], _d["h"], _d["mu"],
+                                _d["Bo"], _d["re"], _d["rw"], _d["S"],
+                                nd_ipr["Pb"])
+                    elif _m == ND.IPR_MODELS[5]:
+                        if nd_ipr["use_test"]:
+                            nd_ipr_fit = ND.fit_ipr(
+                                _m, nd_pr_node,
+                                [(nd_ipr["q_test"], nd_ipr["pwf_test"])],
+                                darcy=_d)
+                            nd_ipr_p = nd_ipr_fit["params"]
+                        else:
+                            nd_ipr_p = ND.make_darcy_gas(
+                                nd_pr_node, _d["k"], _d["h"], _d["T_F"],
+                                _d["gas_sg"], _d["re"], _d["rw"], _d["S"],
+                                _d.get("D", 0.0))
+                    else:
+                        nd_ipr_p = ND.calibrate_ipr(
+                            _m, nd_pr_node, nd_ipr["q_test"],
+                            nd_ipr["pwf_test"], Pb=nd_ipr["Pb"],
+                            n=nd_ipr["n"])
+                except ValueError as _e:
+                    nd_ipr_err = str(_e)
+                if nd_ipr["gas"] and nd_GLR <= 0:
+                    nd_ipr_p, nd_ipr_err = None, (
+                        "A gas IPR needs GLR > 0 to place the gas rate on "
+                        "the liquid-rate axis of the lift curve.")
+
+            def _gas_to_liq(qg_mscf):
+                return qg_mscf * 1000.0 / nd_GLR
+
+            def _ipr_pwf_liq(q_liq):
+                """IPR Pwf (psia) for a LIQUID rate (STB/d)."""
+                if nd_ipr_p is None:
+                    return float("nan")
+                if nd_ipr["gas"]:
+                    return ND.ipr_pwf(nd_ipr_p, q_liq * nd_GLR / 1000.0)
+                return ND.ipr_pwf(nd_ipr_p, q_liq)
+
+            _nd_sig = repr((tuple(segments), nd_Pout_psia, nd_Tout_F,
+                            nd_Tin_F, nd_GLR, nd_api, nd_gas_sg, nd_wc,
+                            nd_sal, ID_in, nd_roughness, chosen, unit_system,
+                            repr(sorted((nd_ipr or {}).items())),
+                            repr(nd_tests), nd_fit_ipr_tests,
+                            repr(st.session_state.get("_nd_vlp_tune")),
+                            st.session_state.get("nd_apply_tune"),
+                            qmin_bbl, qmax_bbl, nd_npts))
+            st.markdown("### Well schematic & reference depth")
+            # Schematic full width (it needs room for the callouts), the
+            # assumptions table and completion inputs below it.
+            sc1 = st.container()
+            sc2 = st.container()
+            _sc2_top, _sc2_bot = sc2.container(), sc2.container()
+            nd_schem_html = None
+            if not _is_flowline:
+                with _sc2_bot:
+                    nd_schem_html = _nd_completion_and_schematic(
+                        segments=segments, unit_system=unit_system,
+                        node_md_ft=node_md_ft, node_tvd_ft=node_tvd_ft,
+                        ID_in=ID_in, nd_fluid=nd_fluid,
+                        outlet_txt=(f"P {nd_Pout_user:.1f} {L['P']} · "
+                                    f"T {nd_Tout_user:.1f} {L['T']}"),
+                        T_top=nd_Tout_user, T_bot=nd_Tin_user,
+                        T_unit=L['T'], P_unit=L['P'],
+                        datum_ft=(nd_ipr["datum_ft"] if nd_ipr is not None
+                                  else None),
+                        sig=_nd_sig)
+            with sc1:
+              if nd_schem_html is not None:
+                _render_html_component(nd_schem_html, height=800)
+              else:
+                    _sx, _sz = _tx * _lf, _tz * _lf
+                    figw = go.Figure()
+                    if not _is_flowline:
+                        figw.add_hline(y=0, line=dict(color="#8B6F47", width=2))
+                        figw.add_annotation(x=0, y=0, text="Surface",
+                                            showarrow=False, yshift=10,
+                                            xanchor="left",
+                                            font=dict(size=10, color="#8B6F47"))
+                    # casing (wide, light) + tubing (narrow, dark)
+                    figw.add_trace(go.Scatter(
+                        x=_sx, y=_sz, mode="lines", name="Casing",
+                        line=dict(color="#C9CED6", width=16),
+                        hoverinfo="skip", showlegend=False))
+                    figw.add_trace(go.Scatter(
+                        x=_sx, y=_sz, mode="lines",
+                        name=f"Tubing ID {ID_in:.3f} in" if unit_system == "Field"
+                             else f"Tubing ID {ID_in*25.4:.0f} mm",
+                        line=dict(color=TH.DARK_NAVY, width=5),
+                        customdata=np.c_[_tmd * _lf],
+                        hovertemplate=f"MD %{{customdata[0]:.0f}} {_lu}<br>"
+                                      f"TVD %{{y:.0f}} {_lu}<extra></extra>"))
+                    # outlet node (wellhead) and solution node (bottom)
+                    figw.add_trace(go.Scatter(
+                        x=[_sx[0]], y=[_sz[0]], mode="markers+text",
+                        marker=dict(symbol="square", size=16, color=TH.PISTACHIO,
+                                    line=dict(color=TH.DARK_NAVY, width=1)),
+                        text=["Outlet node"], textposition="middle right",
+                        name=f"Outlet: P = {nd_Pout_user:.1f} {L['P']}, "
+                             f"T = {nd_Tout_user:.1f} {L['T']}"))
+                    figw.add_trace(go.Scatter(
+                        x=[_sx[-1]], y=[_sz[-1]], mode="markers+text",
+                        marker=dict(symbol="diamond", size=18, color=TH.TORCH_RED,
+                                    line=dict(color=TH.DARK_NAVY, width=1)),
+                        text=["Solution node"], textposition="middle right",
+                        name=f"Solution node (Pwf): MD {node_md_ft*_lf:.0f} / "
+                             f"TVD {node_tvd_ft*_lf:.0f} {_lu}, "
+                             f"T = {nd_Tin_user:.1f} {L['T']}"))
+                    if not _is_flowline:
+                        # perforations: short red ticks around the node
+                        _dx = max(abs(_sx).max(), abs(_sz).max(), 1.0) * 0.03
+                        for _k in (-1, 0, 1):
+                            _yy = _sz[-1] + _k * _dx * 0.6
+                            figw.add_shape(type="line", x0=_sx[-1] - 2 * _dx,
+                                           x1=_sx[-1] + 2 * _dx, y0=_yy, y1=_yy,
+                                           line=dict(color=TH.TORCH_RED, width=2,
+                                                     dash="dot"))
+                        if nd_ipr is not None and nd_ipr["datum_ft"] is not None:
+                            figw.add_hline(
+                                y=nd_ipr["datum_ft"] * _lf,
+                                line=dict(color="#7A5195", width=1.5, dash="dash"),
+                                annotation_text="Pr datum",
+                                annotation_position="bottom right")
+                    figw.update_layout(**TH.plotly_layout(
+                        title=("Flowline schematic" if _is_flowline
+                               else "Well schematic"),
+                        xtitle=(f"Distance along line ({_lu})" if _is_flowline
+                                else f"Horizontal displacement ({_lu})"),
+                        ytitle=(f"Elevation ({_lu})" if _is_flowline
+                                else f"TVD below wellhead ({_lu})"),
+                        height=460))
+                    figw.update_layout(legend=dict(orientation="h", y=-0.25,
+                                                   font=dict(size=10)))
+                    if not _is_flowline:
+                        # keep a vertical well readable: give x some width
+                        _span = max(float(np.abs(_sz).max()), 1.0)
+                        _xm = max(float(np.abs(_sx).max()), 0.35 * _span)
+                        figw.update_xaxes(range=[-0.3 * _xm, 1.6 * _xm])
+                        figw.update_yaxes(autorange="reversed")
+                    st.plotly_chart(figw, width='stretch', key="nd_schematic")
+            with _sc2_top:
+                _q_unit = "STB/d" if unit_system == "Field" else "Sm³/d"
+                _assm = [
+                    ("Solution node / reference depth",
+                     "Bottom of the last segment (tubing inlet ≈ "
+                     "mid-perforation): MD "
+                     f"{node_md_ft*_lf:,.0f} {_lu}, TVD {node_tvd_ft*_lf:,.0f} {_lu}. "
+                     "VLP pressure and IPR Pwf are both evaluated here."),
+                    ("Outlet node (fixed)",
+                     f"Wellhead / separator: {nd_Pout_user:.1f} {L['P']}, "
+                     f"{nd_Tout_user:.1f} {L['T']}"),
+                    ("Temperature profile",
+                     f"Linear in MD from {nd_Tout_user:.1f} to "
+                     f"{nd_Tin_user:.1f} {L['T']}; no heat-transfer coupling."),
+                    ("Pipe", f"ID {ID_in:.3f} in, ε/D {nd_roughness:.5f}, "
+                             f"{len(segments)} segment(s), effective "
+                             f"inclination {theta_eff:.1f}°"),
+                    ("Multiphase correlation", chosen),
+                    ("Fluid / PVT",
+                     f"{nd_fluid}; API {nd_api:.1f}, γg {nd_gas_sg:.3f}, "
+                     f"WC {nd_wc:.2f}, salinity {nd_sal:.1f} wt%; black-oil "
+                     "screening properties at local P, T."),
+                    ("Rate basis",
+                     f"Liquid rate at stock-tank conditions ({_q_unit}); "
+                     "gas = liquid × GLR."),
+                ]
+                if nd_ipr is not None:
+                    _pr_txt = (f"{U.to_user_P(nd_pr_node, unit_system):.1f} "
+                               f"{L['P']} at the node")
+                    if nd_ipr["datum_ft"] is not None:
+                        _pr_txt += (
+                            f" (input {U.to_user_P(nd_ipr['Pr_input_psia'], unit_system):.1f}"
+                            f" {L['P']} at datum TVD "
+                            f"{nd_ipr['datum_ft']*_lf:,.0f} {_lu}, shifted "
+                            "by the static fluid gradient)")
+                    _assm.append(("Static reservoir pressure", _pr_txt))
+                    if nd_ipr_p is not None:
+                        _parts = [nd_ipr["model"]]
+                        if nd_ipr["gas"]:
+                            _parts.append(f"AOF {nd_ipr_p['aof']:,.0f} Mscf/d"
+                                          if unit_system == "Field" else
+                                          f"AOF {nd_ipr_p['aof']*28.3168:,.0f} Sm³/d")
+                            if "n" in nd_ipr_p:
+                                _parts.append(f"n = {nd_ipr_p['n']:.2f}")
+                            if "D" in nd_ipr_p:
+                                _Dd = (nd_ipr_p["D"] if unit_system == "Field"
+                                       else nd_ipr_p["D"] / 28.3168)
+                                _parts.append(f"D = {_Dd:.3g} 1/({'Mscf/d' if unit_system == 'Field' else 'Sm³/d'})")
+                        else:
+                            _J = (nd_ipr_p["J"] if unit_system == "Field"
+                                  else nd_ipr_p["J"] * 0.158987 * 14.50377)
+                            _J_u = ("STB/d/psi" if unit_system == "Field"
+                                    else "Sm³/d/bar")
+                            _aof = (nd_ipr_p["aof"] if unit_system == "Field"
+                                    else nd_ipr_p["aof"] * 0.158987)
+                            _parts.append(f"J = {_J:.3g} {_J_u}, AOF {_aof:,.0f} {_q_unit}")
+                        if "S" in nd_ipr_p:
+                            _parts.append(f"skin S = {nd_ipr_p['S']:.2f}"
+                                          f", k = {nd_ipr_p['k']:g} mD")
+                        if nd_ipr_fit is not None:
+                            _src = (f"fitted to {nd_ipr_fit['n_points']} well "
+                                    f"test(s), RMSE Pwf "
+                                    f"{(nd_ipr_fit['rmse_pwf'] if unit_system == 'Field' else nd_ipr_fit['rmse_pwf'] / 14.50377):.2f} {L['P']}")
+                        elif nd_ipr["model"] in ND.IPR_DARCY_MODELS:
+                            _src = "from reservoir properties"
+                        else:
+                            _src = "fitted to the single test point"
+                        _parts.append(_src)
+                        if nd_ipr["gas"]:
+                            _parts.append("gas rate → liquid axis via GLR")
+                        else:
+                            _parts.append("applied to total liquid")
+                        _ipr_txt = "; ".join(_parts) + "."
+                        _assm.append(("IPR", _ipr_txt))
+                    elif nd_ipr_err:
+                        _assm.append(("IPR", f"⚠️ {nd_ipr_err}"))
+                st.dataframe(pd.DataFrame(_assm, columns=["Item", "Assumption"]),
+                             hide_index=True, width='stretch',
+                             height=min(42 + 36 * len(_assm), 520))
+            if nd_ipr_err:
+                st.warning(f"IPR not drawn: {nd_ipr_err}")
+
+            # ---- VLP calibration against the well tests ----
+            _nd_common = dict(T_outlet_F=nd_Tout_F, T_inlet_F=nd_Tin_F,
+                              segments=segments, api=nd_api,
+                              gas_sg=nd_gas_sg, salinity_wt_pct=nd_sal,
+                              D_in_inch=ID_in, rel_roughness=nd_roughness)
+            _cal_sig = repr((sorted((k, repr(v)) for k, v in _nd_common.items()),
+                             repr(nd_tests)))
+            nd_hold_mult, nd_fric_mult = 1.0, 1.0
+            if not _is_flowline:
+                st.markdown("### 🎯 VLP calibration (well tests)")
+                if not nd_tests:
+                    st.caption("Enter well tests (rate, THP, Pwf at the node) "
+                               "in the left panel to rank the correlations "
+                               "and tune the VLP.")
+                else:
+                    def _use_best():
+                        _rk_ = st.session_state.get("_nd_rank")
+                        if _rk_ and _rk_.get("rows"):
+                            st.session_state["nd_method"] = _rk_["rows"][0]["method"]
+                    cb1, cb2 = st.columns(2)
+                    with cb1:
+                        if st.button(f"Rank all {len(ND.CORRELATIONS)} "
+                                     f"correlations on {len(nd_tests)} test(s)",
+                                     key="nd_rank_btn", width='stretch'):
+                            with st.spinner("Scoring correlations..."):
+                                st.session_state["_nd_rank"] = {
+                                    "sig": _cal_sig,
+                                    "rows": ND.rank_correlations(nd_tests, _nd_common)}
+                    with cb2:
+                        if st.button(f"Tune {chosen} to the tests",
+                                     key="nd_tune_btn", type="primary",
+                                     width='stretch'):
+                            with st.spinner("Fitting gravity / friction "
+                                            "multipliers..."):
+                                try:
+                                    _tv = ND.tune_vlp(nd_tests, _nd_common, chosen)
+                                    _tv["sig"] = _cal_sig
+                                    st.session_state["_nd_vlp_tune"] = _tv
+                                except Exception as _e:
+                                    st.error(f"Tuning failed: {_e}")
+                    _du = (lambda v: v) if unit_system == "Field" else \
+                        (lambda v: v / 14.50377)
+                    _rk = st.session_state.get("_nd_rank")
+                    if _rk and _rk.get("sig") == _cal_sig and _rk["rows"]:
+                        st.markdown("**Correlation ranking** (lower error = "
+                                    "better match to measured Pwf)")
+                        st.dataframe(pd.DataFrame([{
+                            "Rank": i + 1, "Correlation": r["method"],
+                            "Mean abs error (%)": round(r["mape"], 2),
+                            f"Mean abs error ({L['P']})": round(_du(r["mae"]), 2),
+                            f"Bias ({L['P']})": round(_du(r["bias"]), 2),
+                            "Tests converged": f"{r['n_ok']}/{len(nd_tests)}"}
+                            for i, r in enumerate(_rk["rows"])]),
+                            hide_index=True, width='stretch')
+                        if _rk["rows"][0]["method"] != chosen:
+                            st.button(f"Use the best match: "
+                                      f"{_rk['rows'][0]['method']}",
+                                      key="nd_use_best", on_click=_use_best)
+                    elif _rk:
+                        st.caption("Ranking is out of date (inputs or tests "
+                                   "changed) — rank again.")
+                    _tv = st.session_state.get("_nd_vlp_tune")
+                    if _tv and _tv.get("sig") == _cal_sig and _tv["method"] == chosen:
+                        nd_apply_tune = st.checkbox(
+                            f"Apply tuned multipliers to {chosen}: gravity × "
+                            f"{_tv['hold_mult']:.3f}, friction × "
+                            f"{_tv['fric_mult']:.3f}",
+                            value=True, key="nd_apply_tune")
+                        if nd_apply_tune:
+                            nd_hold_mult = _tv["hold_mult"]
+                            nd_fric_mult = _tv["fric_mult"]
+                        k_ = st.columns(3)
+                        k_[0].metric("Error before", f"{_tv['mape_before']:.2f} %")
+                        k_[1].metric("Error after", f"{_tv['mape_after']:.2f} %")
+                        k_[2].metric("Parameters fitted",
+                                     "gravity + friction" if _tv["tuned_friction"]
+                                     else "gravity only")
+                        if not _tv["tuned_friction"]:
+                            st.caption("One test only: the friction multiplier "
+                                       "is held at 1 (two unknowns cannot be "
+                                       "identified from one point). Add tests "
+                                       "at different rates to tune both.")
+                        if _tv["at_bound"]:
+                            st.warning("A multiplier hit its bound (gravity "
+                                       "0.5–1.5, friction 0.3–3). The "
+                                       "correlation may not suit this well, or "
+                                       "the test data (gauge depth, rates) "
+                                       "need checking — compare the ranking.")
+                        _ct = pd.DataFrame({
+                            "Test": [t["label"] for t in nd_tests],
+                            f"Rate ({'STB/d' if unit_system == 'Field' else 'Sm³/d'})":
+                                [t["q"] * (1 if unit_system == "Field" else 0.158987)
+                                 for t in nd_tests],
+                            f"Measured Pwf ({L['P']})": [U.to_user_P(v, unit_system) for v in _tv["meas"]],
+                            f"Before ({L['P']})": [U.to_user_P(v, unit_system) for v in _tv["pred_before"]],
+                            f"After ({L['P']})": [U.to_user_P(v, unit_system) for v in _tv["pred_after"]]})
+                        styled_dataframe(_ct, height=min(60 + 36 * len(_ct), 300))
+                        _mm = [U.to_user_P(v, unit_system) for v in _tv["meas"]]
+                        figc = go.Figure()
+                        _lo, _hi = min(_mm) * 0.9, max(_mm) * 1.1
+                        figc.add_trace(go.Scatter(x=[_lo, _hi], y=[_lo, _hi],
+                                                  mode="lines", name="1:1",
+                                                  line=dict(color="#8796a3", dash="dash")))
+                        figc.add_trace(go.Scatter(
+                            x=_mm, y=[U.to_user_P(v, unit_system) for v in _tv["pred_before"]],
+                            mode="markers", name=f"{chosen} — before",
+                            marker=dict(size=10, color=TH.TORCH_RED, symbol="circle-open",
+                                        line=dict(width=2))))
+                        figc.add_trace(go.Scatter(
+                            x=_mm, y=[U.to_user_P(v, unit_system) for v in _tv["pred_after"]],
+                            mode="markers", name=f"{chosen} — tuned",
+                            marker=dict(size=10, color=TH.PISTACHIO,
+                                        line=dict(color=TH.DARK_NAVY, width=1))))
+                        figc.update_layout(**TH.plotly_layout(
+                            title="VLP calibration — predicted vs measured Pwf at the node",
+                            xtitle=f"Measured Pwf ({L['P']})",
+                            ytitle=f"Predicted Pwf ({L['P']})", height=360))
+                        st.plotly_chart(figc, width='stretch', key="nd_cal_plot")
+                    elif _tv and _tv.get("sig") == _cal_sig:
+                        st.caption(f"Saved tuning is for {_tv['method']}; "
+                                   f"tune {chosen} or switch back to apply it.")
+                    elif _tv:
+                        st.caption("Saved tuning is out of date (inputs or "
+                                   "tests changed) — tune again.")
+                if nd_ipr_fit is not None and nd_fit_ipr_tests:
+                    st.caption("IPR fitted to the well tests: " + ", ".join(
+                        f"{k_} = {v_:.4g}" for k_, v_ in nd_ipr_fit["fitted"].items())
+                        + (f" (RMSE Pwf "
+                           f"{(nd_ipr_fit['rmse_pwf'] if unit_system == 'Field' else nd_ipr_fit['rmse_pwf'] / 14.50377):.2f} {L['P']})"))
+
+            # ---- Compare correlations on the lift-curve plot ----
+            nd_compare = st.multiselect(
+                "Overlay other correlations on the lift curve",
+                [m for m in ND.CORRELATIONS if m != chosen], default=[],
+                key="nd_compare",
+                help="Untuned curves, same inputs — a quick sensitivity on "
+                     "the multiphase-flow correlation.")
+
             # Persist the "has run" state: a plain `if st.button()` block
             # vanishes on the next rerun, so touching the traverse slider
             # below used to wipe the whole result section.
@@ -8085,7 +8861,8 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         rates, nd_GLR,
                         nd_Pout_psia, nd_Tout_F, nd_Tin_F,
                         segments, nd_api, nd_gas_sg, nd_wc, nd_sal,
-                        ID_in, nd_roughness, chosen)
+                        ID_in, nd_roughness, chosen,
+                        hold_mult=nd_hold_mult, fric_mult=nd_fric_mult)
 
                 # ---- Results table ----
                 st.markdown("### Pressure Drop / Lift Curve Table")
@@ -8115,38 +8892,237 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                 tdf = pd.DataFrame(rows)
                 styled_dataframe(tdf)
 
-                # ---- Lift curve plot ----
-                st.markdown("### Lift curve")
+                # ---- Lift curve (VLP) + IPR at the solution node ----
+                _qf = 1.0 if unit_system == "Field" else 0.158987
+                st.markdown("### Lift curve" + (" — IPR / VLP at the "
+                            "solution node" if nd_ipr_p is not None else ""))
                 Ps_user = [U.to_user_P(r["P_inlet_psia"], unit_system)
                             for r in results]
-                qs_disp = ([r["q_liq_bbl_d"] for r in results]
-                            if unit_system == "Field"
-                            else [r["q_liq_bbl_d"] * 0.158987
-                                   for r in results])
+                qs_disp = [r["q_liq_bbl_d"] * _qf for r in results]
                 fig = go.Figure()
+                _tuned_lbl = (f", tuned ×{nd_hold_mult:.2f}/×{nd_fric_mult:.2f}"
+                              if (nd_hold_mult, nd_fric_mult) != (1.0, 1.0) else "")
                 fig.add_trace(go.Scatter(
                     x=qs_disp, y=Ps_user, mode="lines+markers",
-                    name=f"{chosen}",
+                    name=f"VLP — {chosen}{_tuned_lbl} (THP {nd_Pout_user:.1f} {L['P']})",
                     line=dict(color=TH.TORCH_RED, width=3),
                     marker=dict(size=9)))
-                # Find minimum (stable operating point)
+                # Other correlations for comparison (untuned)
+                _cmp_cols = ["#1f77b4", "#7a5195", "#ef8a17", "#2a9d8f",
+                             "#8d6e63", "#e76f51", "#6c757d"]
+                for _ci, _cm in enumerate(nd_compare or []):
+                    try:
+                        _rc = ND.lift_curve(rates, nd_GLR, nd_Pout_psia,
+                                            nd_Tout_F, nd_Tin_F, segments,
+                                            nd_api, nd_gas_sg, nd_wc, nd_sal,
+                                            ID_in, nd_roughness, _cm)
+                    except Exception:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=[r["q_liq_bbl_d"] * _qf for r in _rc],
+                        y=[U.to_user_P(r["P_inlet_psia"], unit_system) for r in _rc],
+                        mode="lines", name=f"VLP — {_cm}",
+                        line=dict(color=_cmp_cols[_ci % len(_cmp_cols)],
+                                  width=1.8, dash="dash")))
+                # Measured well tests (Pwf at the node)
+                if nd_tests:
+                    fig.add_trace(go.Scatter(
+                        x=[t["q"] * _qf for t in nd_tests],
+                        y=[U.to_user_P(t["pwf"], unit_system) for t in nd_tests],
+                        mode="markers+text",
+                        text=[t["label"] for t in nd_tests],
+                        textposition="top center", textfont=dict(size=9),
+                        name="Well tests — measured Pwf (own THP)",
+                        marker=dict(size=11, color="#2a9d8f", symbol="diamond",
+                                    line=dict(color=TH.DARK_NAVY, width=1))))
                 valid = [(q, p) for q, p in zip(qs_disp, Ps_user)
                           if p == p]
                 if valid:
                     q_min, p_min = min(valid, key=lambda x: x[1])
                     fig.add_trace(go.Scatter(
                         x=[q_min], y=[p_min], mode="markers",
-                        name="Stable point (P min)",
-                        marker=dict(size=16, color=TH.PISTACHIO,
-                                     symbol="star")))
+                        name="VLP minimum (stability limit)",
+                        marker=dict(size=14, color=TH.PISTACHIO,
+                                     symbol="triangle-up",
+                                     line=dict(color=TH.DARK_NAVY, width=1))))
+                nd_ops = []
+                if nd_ipr_p is not None:
+                    # IPR on the liquid-rate axis, 0 -> AOF
+                    _aof_liq = (_gas_to_liq(nd_ipr_p["aof"]) if nd_ipr["gas"]
+                                else nd_ipr_p["aof"])
+                    _qi = np.linspace(0.0, _aof_liq, 120)
+                    _pi = [_ipr_pwf_liq(q) for q in _qi]
+                    fig.add_trace(go.Scatter(
+                        x=_qi * _qf, y=[U.to_user_P(p, unit_system) for p in _pi],
+                        mode="lines", name=f"IPR — {nd_ipr['model'].split(' (')[0]}",
+                        line=dict(color=TH.DARK_NAVY, width=3)))
+                    if nd_ipr["use_test"] and not nd_fit_ipr_tests:
+                      fig.add_trace(go.Scatter(
+                        x=[nd_ipr["q_test"] * (1000.0 / nd_GLR if nd_ipr["gas"] else 1.0) * _qf],
+                        y=[U.to_user_P(nd_ipr["pwf_test"], unit_system)],
+                        mode="markers", name="Well-test point",
+                        marker=dict(size=11, color=TH.DARK_NAVY,
+                                    symbol="circle-open", line=dict(width=2))))
+                    fig.add_hline(
+                        y=U.to_user_P(nd_pr_node, unit_system),
+                        line=dict(color=TH.DARK_NAVY, width=1, dash="dot"),
+                        annotation_text=f"Pr at node "
+                                        f"{U.to_user_P(nd_pr_node, unit_system):.1f} {L['P']}",
+                        annotation_position="top right")
+                    # VLP vs IPR intersections (field units, liquid axis)
+                    _qv = [r["q_liq_bbl_d"] for r in results
+                           if r["P_inlet_psia"] == r["P_inlet_psia"]]
+                    _pv = [r["P_inlet_psia"] for r in results
+                           if r["P_inlet_psia"] == r["P_inlet_psia"]]
+                    nd_ops = ND.operating_points(_qv, _pv, _ipr_pwf_liq)
+                    for _op in nd_ops:
+                        fig.add_trace(go.Scatter(
+                            x=[_op["q"] * _qf],
+                            y=[U.to_user_P(_op["pwf"], unit_system)],
+                            mode="markers",
+                            name=("Operating point (stable)" if _op["stable"]
+                                  else "Intersection — unstable (left of "
+                                       "VLP minimum)"),
+                            marker=dict(size=18 if _op["stable"] else 13,
+                                        symbol="star" if _op["stable"] else "x",
+                                        color=("#F2A900" if _op["stable"]
+                                               else "#7A5195"),
+                                        line=dict(color=TH.DARK_NAVY, width=1))))
                 _qlbl = "Liquid rate (STB/d)" if unit_system == "Field" \
                          else "Liquid rate (Sm³/d)"
                 fig.update_layout(**TH.plotly_layout(
-                    title="Tubing / Flowline Performance Curve",
+                    title=("IPR / VLP at the solution node — MD "
+                           f"{node_md_ft*_lf:,.0f} / TVD {node_tvd_ft*_lf:,.0f} {_lu}"
+                           if nd_ipr_p is not None else
+                           "Tubing / Flowline Performance Curve"),
                     xtitle=_qlbl,
-                    ytitle=f"Required inlet pressure ({L['P']})",
-                    height=460))
+                    ytitle=(f"Pressure at the solution node ({L['P']})"
+                            if nd_ipr_p is not None else
+                            f"Required inlet pressure ({L['P']})"),
+                    height=480))
+                fig.update_yaxes(rangemode="tozero")
+                fig.update_xaxes(rangemode="tozero")
                 st.plotly_chart(fig, width='stretch')
+
+                # Pressure traverse for the schematic's hover readout
+                if not _is_flowline:
+                    _st_ops = [o for o in nd_ops if o["stable"]]
+                    _sq, _slbl = None, None
+                    if _st_ops:
+                        _sq = max(_st_ops, key=lambda o: o["q"])["q"]
+                        _slbl = (f"traverse at the operating point "
+                                 f"({_sq * _qf:,.0f} {q_lbl})")
+                    elif valid:
+                        _sq = q_min / _qf
+                        _slbl = (f"traverse at the VLP-minimum rate "
+                                 f"({q_min:,.0f} {q_lbl})")
+                    _need_rerun = False
+                    if _sq:
+                        try:
+                            _tr = ND.march_pressure(
+                                nd_Pout_psia, nd_Tout_F, nd_Tin_F, segments,
+                                _sq, _sq * nd_GLR / 1000.0, nd_api,
+                                nd_gas_sg, nd_wc, nd_sal, ID_in,
+                                nd_roughness, chosen,
+                                hold_mult=nd_hold_mult,
+                                fric_mult=nd_fric_mult)
+                            _new = {"sig": _nd_sig, "label": _slbl,
+                                    "profile": [[float(m * _lf),
+                                                 float(U.to_user_P(p, unit_system))]
+                                                for m, p in zip(_tr["stations_ft"],
+                                                                _tr["P_psia"])]}
+                            _old = st.session_state.get("_nd_schem_P")
+                            st.session_state["_nd_schem_P"] = _new
+                            _need_rerun = (not _old
+                                           or _old.get("sig") != _nd_sig)
+                        except Exception:
+                            pass
+                    if _need_rerun:
+                        st.rerun()   # redraw the schematic with P
+
+                # ---- IPR / VLP QC ----
+                if nd_ipr_p is not None:
+                    st.markdown("#### IPR / VLP quality check")
+                    _stable = [o for o in nd_ops if o["stable"]]
+                    _pr_u = U.to_user_P(nd_pr_node, unit_system)
+                    if _stable:
+                        _op = max(_stable, key=lambda o: o["q"])
+                        _qg = _op["q"] * nd_GLR / 1000.0
+                        _aof_liq = (_gas_to_liq(nd_ipr_p["aof"]) if nd_ipr["gas"]
+                                    else nd_ipr_p["aof"])
+                        k = st.columns(4)
+                        k[0].metric("Liquid rate", f"{_op['q']*_qf:,.0f} {q_lbl}")
+                        k[1].metric("Gas rate",
+                                    f"{_qg:,.0f} Mscf/d" if unit_system == "Field"
+                                    else f"{_qg*28.3168:,.0f} Sm³/d")
+                        k[2].metric("Pwf at node",
+                                    f"{U.to_user_P(_op['pwf'], unit_system):.1f} {L['P']}")
+                        k[3].metric("Drawdown",
+                                    f"{_pr_u - U.to_user_P(_op['pwf'], unit_system):.1f} {L['P']}",
+                                    f"{100 * _op['q'] / _aof_liq:.0f} % of AOF",
+                                    delta_color="off")
+                    _qc = []
+                    if not nd_ops:
+                        _vmin = min(_pv) if _pv else float("nan")
+                        if _pv and _vmin >= nd_pr_node:
+                            _qc.append(("❌", "The VLP never drops below Pr: the "
+                                        "well cannot flow naturally against "
+                                        f"{nd_Pout_user:.1f} {L['P']} — "
+                                        "artificial lift or a lower THP is "
+                                        "needed."))
+                        elif _pv and _pv[-1] < _ipr_pwf_liq(_qv[-1]):
+                            _qc.append(("⚠️", "IPR is still above the VLP at "
+                                        "the maximum rate: increase the max "
+                                        "liquid rate to find the operating "
+                                        "point."))
+                        else:
+                            _qc.append(("⚠️", "No intersection inside the "
+                                        "computed rate window — widen the "
+                                        "min / max liquid rate."))
+                    else:
+                        _qc.append(("✅", f"{len(nd_ops)} IPR / VLP "
+                                    "intersection(s) found at the same node "
+                                    "and in the same units."))
+                    if any(not o["stable"] for o in nd_ops):
+                        _qc.append(("⚠️", "An intersection on the "
+                                    "gravity-dominated (left) branch is "
+                                    "unstable: the well either loads up or "
+                                    "jumps to the stable point."))
+                    if nd_ops and not _stable:
+                        _qc.append(("❌", "Only unstable intersections: the "
+                                    "well will not flow steadily — consider "
+                                    "smaller tubing, lift or lower THP."))
+                    if _stable and valid and _op["q"] * _qf < q_min:
+                        _qc.append(("⚠️", "Operating point is left of the VLP "
+                                    "minimum — close to liquid loading."))
+                    if nd_Pout_psia >= nd_pr_node:
+                        _qc.append(("❌", "THP is above Pr at the node."))
+                    if nd_ipr["datum_ft"] is not None:
+                        _qc.append(("ℹ️", "Pr shifted from the datum to the "
+                                    "node with the static gradient: "
+                                    f"{U.to_user_P(nd_ipr['Pr_input_psia'], unit_system):.1f}"
+                                    f" → {_pr_u:.1f} {L['P']}."))
+                    if nd_ipr["gas"]:
+                        _qc.append(("ℹ️", "Gas IPR plotted on the liquid axis "
+                                    "via the constant GLR; check that the "
+                                    "GLR matches the test."))
+                    _qc.append(("ℹ️", "The well test is treated as measured "
+                                "at the solution node; if the gauge is "
+                                "elsewhere, correct the test Pwf to the node "
+                                "first."))
+                    st.dataframe(pd.DataFrame(_qc, columns=["", "Check"]),
+                                 hide_index=True, width='stretch')
+                    # Combined table for QC / download
+                    _tab = pd.DataFrame({
+                        _qlbl: [q * _qf for q in _qv],
+                        f"VLP P node ({L['P']})": [U.to_user_P(p, unit_system) for p in _pv],
+                        f"IPR Pwf ({L['P']})": [U.to_user_P(_ipr_pwf_liq(q), unit_system)
+                                               for q in _qv]})
+                    st.download_button(
+                        "⬇ Download IPR / VLP table (CSV)",
+                        _tab.to_csv(index=False).encode(),
+                        file_name="IPR_VLP_node.csv", mime="text/csv",
+                        key="nd_ipr_vlp_csv")
 
                 # ---- Engineering analysis ----
                 st.markdown("### Engineering analysis")
@@ -8173,10 +9149,11 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                             "branch.")
                     else:
                         msg.append(
-                            f"The stable operating point is near "
-                            f"**{q_star:.0f} {q_lbl}**, where the "
-                            f"required inlet pressure is at its "
-                            f"minimum (~{ps_v[i_min]:.0f} {L['P']}). "
+                            f"The VLP minimum is near "
+                            f"**{q_star:.0f} {q_lbl}** "
+                            f"(~{ps_v[i_min]:.0f} {L['P']}) — the "
+                            f"stability limit: an operating point must "
+                            f"lie to the right of it. "
                             f"Below this rate the curve is "
                             f"**gravity-dominated** (liquid loading, "
                             f"high holdup), above it the curve is "
@@ -8213,7 +9190,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     nd_Pout_psia, nd_Tout_F, nd_Tin_F, segments,
                     _q_bbl, _q_bbl * nd_GLR / 1000.0, nd_api,
                     nd_gas_sg, nd_wc, nd_sal, ID_in, nd_roughness,
-                    chosen)
+                    chosen, hold_mult=nd_hold_mult, fric_mult=nd_fric_mult)
                 _x = (trav["stations_ft"] if unit_system == "Field"
                        else trav["stations_ft"] * 0.3048)
                 _xlbl = ("Distance from outlet (ft)"
@@ -8261,6 +9238,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     "D_in_inch": ID_in,
                     "rel_roughness": nd_roughness,
                     "method": chosen,
+                    "hold_mult": nd_hold_mult, "fric_mult": nd_fric_mult,
                 }
 
         # ---- ECLIPSE VFP export ----
@@ -8353,6 +9331,11 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             else:
                 glr_field = [g * 5.6146 for g in glr_user]
 
+            if (_nd.get("hold_mult", 1.0), _nd.get("fric_mult", 1.0)) != (1.0, 1.0):
+                st.caption(f"Calibrated {_nd.get('method')} multipliers "
+                           f"(gravity × {_nd['hold_mult']:.3f}, friction × "
+                           f"{_nd['fric_mult']:.3f}) are applied when the VFP "
+                           f"correlation is {_nd.get('method')}.")
             # Estimate eval count
             n_rates = len(_nd["rates_bbl_d"])
             n_eval_est = (len(thp_psia) * max(len(wct_vals), 1)
@@ -8405,7 +9388,13 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         rel_roughness=_nd["rel_roughness"],
                         method=vfp_method, vfp_table_no=vfp_tno,
                         flo_kind=vfp_flo, units=vfp_units,
-                        progress_callback=_cb)
+                        progress_callback=_cb,
+                        # calibration multipliers apply to the tuned
+                        # correlation only
+                        hold_mult=(_nd.get("hold_mult", 1.0)
+                                   if vfp_method == _nd.get("method") else 1.0),
+                        fric_mult=(_nd.get("fric_mult", 1.0)
+                                   if vfp_method == _nd.get("method") else 1.0))
                 except Exception as e:
                     pbar.empty()
                     st.error(f"VFP build failed: {e}")

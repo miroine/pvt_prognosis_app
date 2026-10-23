@@ -18,7 +18,7 @@ No volume shift is used (no SSHIFT); LBC viscosity uses VCRIT with the
 standard LBC coefficients (E300 defaults), which match the app.
 """
 
-APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
 
 import datetime as _dt
 import numpy as np

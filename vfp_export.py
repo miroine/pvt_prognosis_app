@@ -31,7 +31,7 @@ References:
     OPM Flow keyword reference (open-source equivalent)
 """
 
-APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from nodal import lift_curve, march_pressure
@@ -107,6 +107,8 @@ def build_vfp_table(
     flo_kind="LIQ",
     units="FIELD",
     progress_callback=None,
+    hold_mult=1.0,
+    fric_mult=1.0,
 ):
     """Build a VFPPROD table from a sweep of nodal calculations.
 
@@ -158,6 +160,8 @@ def build_vfp_table(
                     D_in_inch=D_in_inch,
                     rel_roughness=rel_roughness,
                     method=method,
+                    hold_mult=hold_mult,
+                    fric_mult=fric_mult,
                 ) if ok else []
                 res = [{"P_inlet_psia": np.nan} for _ in flow_rates_bbl_d]
                 for i, r in zip(ok, res_ok):

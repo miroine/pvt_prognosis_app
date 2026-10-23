@@ -51,7 +51,7 @@ limit, find a stable operating point, or compare lift options, not as
 the final design number.
 """
 
-APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
 
 import math
 import numpy as np
@@ -191,10 +191,9 @@ def _beggs_brill_holdup(v_sl, v_sg, D_ft, theta_deg, rho_l, sigma=30.0):
     L2 = 0.0009252 * lambda_l ** -2.4684
     L3 = 0.10 * lambda_l ** -1.4516
     L4 = 0.5 * lambda_l ** -6.738
-    if lambda_l < 0.01:
-        # Very dry — segregated by default
-        pattern = "segregated"
-    elif (lambda_l < 0.01 and Fr < L1) or (lambda_l >= 0.01 and Fr < L2):
+    # (A blanket "lambda < 0.01 -> segregated" rule used to sit here; the
+    # published map makes very dry flow DISTRIBUTED once Fr >= L1.)
+    if (lambda_l < 0.01 and Fr < L1) or (lambda_l >= 0.01 and Fr < L2):
         pattern = "segregated"
     elif lambda_l >= 0.01 and L2 <= Fr <= L3:
         pattern = "transition"
@@ -276,15 +275,20 @@ def _beggs_brill_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
     f_n = _haaland_friction(Re_ns, rel_roughness)
     # Two-phase friction factor multiplier
     if H_L > lam > 0:
+        # Beggs & Brill (1973): S = ln(2.2y - 1.2) for 1 < y < 1.2
+        # (the general fit's denominator vanishes near y = 1.017), the
+        # general fit elsewhere. (The branches were swapped, and the
+        # max(denom, 1e-6) guard turned a negative denominator into
+        # exp(huge) -> "math range error" -> NaN points on the VLP.)
         y_term = lam / (H_L ** 2)
-        if y_term > 1.2:
+        if 1.0 < y_term < 1.2:
             s = math.log(2.2 * y_term - 1.2)
         else:
             x = math.log(max(y_term, 1e-6))
             denom = (-0.0523 + 3.182 * x - 0.8725 * x ** 2
                       + 0.01853 * x ** 4)
-            s = x / max(denom, 1e-6) if denom != 0 else 0.0
-        f_tp = f_n * math.exp(s)
+            s = x / denom if abs(denom) > 1e-9 else 0.0
+        f_tp = f_n * math.exp(min(s, 5.0))
     else:
         f_tp = f_n
     # Pressure-gradient components (psi/ft)
@@ -370,27 +374,28 @@ def _hagedorn_brown_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
         Ngv = 1.938 * v_sg * (rho_l / sigma) ** 0.25
         Nd = 120.872 * D_ft * (rho_l / sigma) ** 0.5
         Nl = 0.15726 * mu_l * (1.0 / (rho_l * sigma ** 3)) ** 0.25
-        # CNl from a curve fit (Brill-Mukherjee form)
-        log_Nl = math.log10(max(Nl, 1e-6))
-        CNl = 10 ** (-2.69851 + 0.15841 * log_Nl - 0.55100 * log_Nl ** 2
-                       + 0.54785 * log_Nl ** 3 - 0.12195 * log_Nl ** 4)
-        CNl = max(min(CNl, 0.1), 0.002)
-        # Holdup correlation: H_L/psi = f(group)
+        # Rational curve fits of the Hagedorn-Brown charts (Trick, 2003):
+        # CNL(NL), HL/psi(X) and psi(Y). The earlier quartic-in-log fit
+        # went negative below X ~ 1e-4 and clamped H_L to the no-slip
+        # value, so H-B collapsed onto the homogeneous model.
+        CNl = ((0.0019 + 0.0322 * Nl - 0.6642 * Nl ** 2 + 4.9951 * Nl ** 3)
+               / (1.0 - 10.0147 * Nl + 33.8696 * Nl ** 2
+                  + 277.2817 * Nl ** 3))
+        CNl = max(min(CNl, 0.02), 0.0019)
         group = Nlv / max(Ngv ** 0.575, 1e-6) * (P_psia / 14.7) ** 0.1 \
                 * CNl / max(Nd, 1e-6)
-        # Fit for H_L/psi
-        log_g = math.log10(max(group, 1e-12))
-        HL_psi = (0.10307 + 0.61777 * log_g - 0.63295 * log_g ** 2
-                   + 0.29598 * log_g ** 3 - 0.0401 * log_g ** 4)
+        X = max(group, 0.0)
+        HL_psi = math.sqrt(max((0.0047 + 1123.32 * X + 729489.64 * X ** 2)
+                               / (1.0 + 1097.1566 * X + 722153.97 * X ** 2),
+                               0.0))
         HL_psi = max(min(HL_psi, 1.0), 0.0)
-        # Secondary correction psi
         group2 = Ngv * Nl ** 0.380 / max(Nd ** 2.14, 1e-6)
-        if group2 > 0.012:
-            psi = (0.91163 - 4.82176 * group2 + 1232.25 * group2 ** 2
-                    - 22253.6 * group2 ** 3 + 116174.3 * group2 ** 4)
-            psi = max(min(psi, 1.8), 1.0)
-        else:
-            psi = 1.0
+        Yp = min(max(group2, 0.0), 0.09)
+        psi = ((1.0886 - 69.9473 * Yp + 2334.3497 * Yp ** 2
+                - 12896.683 * Yp ** 3)
+               / (1.0 - 53.4401 * Yp + 1517.9369 * Yp ** 2
+                  - 8419.8115 * Yp ** 3))
+        psi = max(min(psi, 1.82), 1.0)
         H_L = HL_psi * psi
         H_L = max(min(H_L, 1.0), v_sl / max(v_m, 1e-6))
         rho_s = rho_l * H_L + rho_g * (1.0 - H_L)
@@ -476,9 +481,302 @@ def _gray_dpdL(v_sl, v_sg, rho_l, rho_g, mu_g, D_in_inch, theta_deg,
 
 
 # ----------------------------------------------------------------------
+# NO-SLIP HOMOGENEOUS (Fancher & Brown lower bound)
+# ----------------------------------------------------------------------
+def _result(dpdL_fric, dpdL_hydro, Ek, H_L, lam, pattern, rho_s, v_m,
+            D_ft, Re=0.0, f=0.0):
+    Ek = min(max(Ek, 0.0), 0.95)
+    return {"dpdL_psi_ft": (dpdL_fric + dpdL_hydro) / max(1.0 - Ek, 0.05),
+            "dpdL_fric": dpdL_fric, "dpdL_hydro": dpdL_hydro, "Ek": Ek,
+            "H_L": H_L, "lambda_l": lam, "pattern": pattern,
+            "rho_s": rho_s, "v_m": v_m,
+            "Fr": v_m ** 2 / (G_C * D_ft) if D_ft > 0 else 0.0,
+            "Re_ns": Re, "f_tp": f}
+
+
+def _no_flow(rho_l, D_ft):
+    return _result(0.0, rho_l / PSI_TO_PSF, 0.0, 1.0, 1.0, "no-flow",
+                   rho_l, 0.0, D_ft)
+
+
+def _noslip_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D_in_inch,
+                 theta_deg, rel_roughness, P_psia, sigma=30.0):
+    """Homogeneous no-slip model: H_L = lambda_L, Moody friction on
+    no-slip mixture properties. Physically the LOWER bound of the
+    pressure drop in upward flow (Fancher & Brown use it the same way)."""
+    D_ft = D_in_inch / 12.0
+    v_m = v_sl + v_sg
+    if v_m <= 0:
+        return _no_flow(rho_l, D_ft)
+    lam = v_sl / v_m
+    rho_n = rho_l * lam + rho_g * (1 - lam)
+    mu_n = mu_l * lam + mu_g * (1 - lam)
+    Re = 1488.0 * rho_n * v_m * D_ft / max(mu_n, 1e-9)
+    f = _haaland_friction(Re, rel_roughness)
+    fric = f * rho_n * v_m ** 2 / (2 * G_C * D_ft) / PSI_TO_PSF
+    hydro = rho_n * math.sin(math.radians(theta_deg)) / PSI_TO_PSF
+    Ek = v_m * v_sg * rho_n / (G_C * max(P_psia, 1.0) * PSI_TO_PSF)
+    return _result(fric, hydro, Ek, lam, lam, "homogeneous (no-slip)",
+                   rho_n, v_m, D_ft, Re, f)
+
+
+# ----------------------------------------------------------------------
+# MUKHERJEE & BRILL (1985) — all inclinations
+# ----------------------------------------------------------------------
+_MB_UP = (-0.380113, 0.129875, -0.119788, 2.343227, 0.475686, 0.288657)
+_MB_DN_STRAT = (-1.330282, 4.808139, 4.171584, 56.262268, 0.079951, 0.504887)
+_MB_DN_OTHER = (-0.516644, 0.789805, 0.551627, 15.519214, 0.371771, 0.393952)
+_MB_FR = ((0.01, 1.00), (0.20, 0.98), (0.30, 1.20), (0.40, 1.25),
+          (0.50, 1.30), (0.70, 1.25), (1.00, 1.00), (10.0, 1.00))
+
+
+def _mukherjee_brill_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D_in_inch,
+                          theta_deg, rel_roughness, P_psia, sigma=30.0):
+    """Mukherjee & Brill (1985): explicit flow-pattern map and holdup
+    H_L = exp[(C1 + C2 sin + C3 sin^2 + C4 NL^2) NGV^C5 / NLV^C6].
+    Bubble / slug: gravity on slip density, Moody friction (no-slip Re).
+    Annular: friction-factor ratio table vs lambda/H_L. The stratified
+    (downhill) momentum balance is approximated with the slug form."""
+    D_ft = D_in_inch / 12.0
+    v_m = v_sl + v_sg
+    if v_m <= 0:
+        return _no_flow(rho_l, D_ft)
+    lam = v_sl / v_m
+    sg = max(sigma, 1e-3)
+    k4 = (rho_l / sg) ** 0.25
+    NLV, NGV = max(1.938 * v_sl * k4, 1e-9), max(1.938 * v_sg * k4, 1e-9)
+    NL = 0.15726 * mu_l * (1.0 / (rho_l * sg ** 3)) ** 0.25
+    th = math.radians(theta_deg)
+    st_, s2 = math.sin(th), math.sin(th) ** 2
+    lgv, llv = math.log10(NGV), math.log10(NLV)
+    # flow pattern
+    NGVSM = 10 ** (1.401 - 2.694 * NL + 0.521 * NLV ** 0.329)
+    if NGV > NGVSM:
+        pattern = "annular"
+    elif theta_deg >= 0:
+        NLVBS = 10 ** (lgv + 0.940 + 0.074 * st_ - 0.855 * s2 + 3.695 * NL)
+        pattern = "bubble" if NLV > NLVBS else "slug"
+    else:
+        NLVST = 10 ** (0.321 - 0.017 * NGV - 4.267 * st_ - 2.972 * NL
+                       - 0.033 * lgv ** 2 - 3.925 * s2)
+        if NLV < NLVST:
+            pattern = "stratified"
+        else:
+            NGVBS = 10 ** (llv + 0.431 - 3.003 * NL - 1.138 * llv * st_
+                           - 0.429 * llv ** 2 * st_ + 1.132 * st_)
+            pattern = "bubble" if NGV < NGVBS else "slug"
+    C = (_MB_UP if theta_deg >= 0 else
+         _MB_DN_STRAT if pattern == "stratified" else _MB_DN_OTHER)
+    expo = (C[0] + C[1] * st_ + C[2] * s2 + C[3] * NL ** 2) \
+        * NGV ** C[4] / NLV ** C[5]
+    H_L = math.exp(max(min(expo, 0.0), -50.0))
+    H_L = min(max(H_L, lam if theta_deg >= 0 else 0.0), 1.0)
+    rho_s = rho_l * H_L + rho_g * (1 - H_L)
+    rho_n = rho_l * lam + rho_g * (1 - lam)
+    mu_n = mu_l * lam + mu_g * (1 - lam)
+    Re = 1488.0 * rho_n * v_m * D_ft / max(mu_n, 1e-9)
+    f = _haaland_friction(Re, rel_roughness)
+    if pattern == "annular":
+        HR = lam / max(H_L, 1e-9)
+        xs, ys = zip(*_MB_FR)
+        f = f * float(np.interp(HR, xs, ys))
+        fric = f * rho_n * v_m ** 2 / (2 * G_C * D_ft) / PSI_TO_PSF
+    else:
+        fric = f * rho_s * v_m ** 2 / (2 * G_C * D_ft) / PSI_TO_PSF
+    hydro = rho_s * st_ / PSI_TO_PSF
+    Ek = rho_s * v_m * v_sg / (G_C * max(P_psia, 1.0) * PSI_TO_PSF)
+    return _result(fric, hydro, Ek, H_L, lam, pattern + " (M-B)", rho_s,
+                   v_m, D_ft, Re, f)
+
+
+# ----------------------------------------------------------------------
+# HASAN & KABIR (1988) — drift-flux, vertical and deviated wells
+# ----------------------------------------------------------------------
+def _hasan_kabir_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D_in_inch,
+                      theta_deg, rel_roughness, P_psia, sigma=30.0):
+    """Hasan & Kabir mechanistic drift-flux model.
+    Bubble: alpha = v_sg / (1.2 v_m + v_inf,b), Harmathy rise velocity.
+    Slug / churn: Taylor-bubble rise 0.35 sqrt(gD drho/rho_l), corrected
+    for deviation by sqrt(sin)(1 + cos)^1.2; C0 = 1.2 (slug), 1.15 (churn).
+    Annular (Kutateladze, v_sg > 3.1 [g sigma drho / rho_g^2]^0.25):
+    homogeneous core. Horizontal / downhill pipes defer to Beggs & Brill.
+    """
+    if theta_deg < 15.0:
+        return _beggs_brill_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                                 D_in_inch, theta_deg, rel_roughness,
+                                 P_psia, sigma)
+    D_ft = D_in_inch / 12.0
+    v_m = v_sl + v_sg
+    if v_m <= 0:
+        return _no_flow(rho_l, D_ft)
+    lam = v_sl / v_m
+    # SI for the mechanistic closures
+    g = 9.80665
+    rl, rg = rho_l * 16.0185, rho_g * 16.0185
+    drho = max(rl - rg, 1.0)
+    sg = max(sigma, 1e-3) * 1e-3
+    D = D_ft * 0.3048
+    vsl, vsg, vm = v_sl * 0.3048, v_sg * 0.3048, v_m * 0.3048
+    th = math.radians(theta_deg)
+    v_b = 1.53 * (g * sg * drho / rl ** 2) ** 0.25
+    v_T = 0.35 * math.sqrt(g * D * drho / rl) \
+        * math.sqrt(max(math.sin(th), 0.0)) * (1 + math.cos(th)) ** 1.2
+    v_ann = 3.1 * (g * sg * drho / max(rg, 1e-3) ** 2) ** 0.25
+    if vsg > v_ann:
+        alpha, pattern = 1 - lam, "annular"
+    else:
+        a_b = vsg / (1.2 * vm + v_b)
+        # dispersed bubble at high mixture velocity (Hasan-Kabir)
+        vm_disp = 4.68 * (D ** 0.48) * ((g * drho / sg) ** 0.5
+                                        * (sg / rl) ** 0.6
+                                        * (rl / max(mu_l * 1e-3, 1e-6)) ** 0.08)
+        if a_b < 0.25:
+            alpha, pattern = a_b, "bubble"
+        elif vm > vm_disp and a_b < 0.52:
+            alpha, pattern = vsg / (1.2 * vm), "dispersed bubble"
+        else:
+            a_s = vsg / (1.2 * vm + v_T)
+            if vm > vm_disp:          # churn
+                a_s = vsg / (1.15 * vm + v_T)
+                pattern = "churn"
+            else:
+                pattern = "slug"
+            alpha = a_s
+    alpha = min(max(alpha, 0.0), 1 - lam if pattern == "annular" else 0.999)
+    H_L = max(1 - alpha, lam)
+    rho_s = rho_l * H_L + rho_g * (1 - H_L)
+    mu_m = mu_l * H_L + mu_g * (1 - H_L)
+    Re = 1488.0 * rho_s * v_m * D_ft / max(mu_m, 1e-9)
+    f = _haaland_friction(Re, rel_roughness)
+    if pattern == "slug":
+        # friction acts on the liquid-slug part of the unit
+        fric = f * rho_s * v_m ** 2 / (2 * G_C * D_ft) / PSI_TO_PSF * H_L
+    else:
+        fric = f * rho_s * v_m ** 2 / (2 * G_C * D_ft) / PSI_TO_PSF
+    hydro = rho_s * math.sin(th) / PSI_TO_PSF
+    Ek = rho_s * v_m * v_sg / (G_C * max(P_psia, 1.0) * PSI_TO_PSF)
+    return _result(fric, hydro, Ek, H_L, lam, pattern + " (H-K)", rho_s,
+                   v_m, D_ft, Re, f)
+
+
+# ----------------------------------------------------------------------
+# ORKISZEWSKI (1967) — vertical wells
+# ----------------------------------------------------------------------
+def _orkiszewski_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D_in_inch,
+                      theta_deg, rel_roughness, P_psia, sigma=30.0,
+                      water_frac=0.0):
+    """Orkiszewski: Griffith bubble flow, Griffith-Wallis slug flow with
+    the liquid-distribution coefficient Gamma, Duns & Ros mist flow,
+    linear interpolation across the slug-mist transition.
+    Simplification: bubble-rise velocity in slug flow from the Nicklin /
+    Dumitrescu form 0.35 sqrt(gD) instead of the Griffith-Wallis chart.
+    Non-vertical pipes defer to Beggs & Brill."""
+    if abs(theta_deg - 90.0) > 30.0:
+        return _beggs_brill_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                                 D_in_inch, theta_deg, rel_roughness,
+                                 P_psia, sigma)
+    D = D_in_inch / 12.0
+    v_m = v_sl + v_sg
+    if v_m <= 0:
+        return _no_flow(rho_l, D)
+    lam = v_sl / v_m
+    sin_t = math.sin(math.radians(theta_deg))
+    k4 = (rho_l / max(sigma, 1e-3)) ** 0.25
+    NLV, NGV = 1.938 * v_sl * k4, 1.938 * v_sg * k4
+    L_B = max(1.071 - 0.2218 * v_m ** 2 / D, 0.13)
+    L_S = 50.0 + 36.0 * NLV
+    L_M = 75.0 + 84.0 * NLV ** 0.75
+
+    def _bubble():
+        v_s = 0.8
+        disc = (1 + v_m / v_s) ** 2 - 4 * v_sg / v_s
+        H_g = 0.5 * (1 + v_m / v_s - math.sqrt(max(disc, 0.0)))
+        H_L = min(max(1 - H_g, lam), 1.0)
+        rho_s = rho_l * H_L + rho_g * (1 - H_L)
+        v_L = v_sl / max(H_L, 1e-6)
+        Re = 1488.0 * rho_l * v_L * D / max(mu_l, 1e-9)
+        f = _haaland_friction(Re, rel_roughness)
+        fric = f * rho_l * v_L ** 2 / (2 * G_C * D) / PSI_TO_PSF
+        return fric, rho_s * sin_t / PSI_TO_PSF, H_L, rho_s, Re, f
+
+    def _slug():
+        v_b = 0.35 * math.sqrt(G_C * D)
+        lmu = math.log10(mu_l + 1.0)
+        lv, lD = math.log10(max(v_m, 1e-6)), math.log10(D)
+        if water_frac >= 0.75:      # water continuous
+            if v_m < 10:
+                G = 0.013 * math.log10(max(mu_l, 1e-6)) / D ** 1.38 - 0.681 \
+                    + 0.232 * lv - 0.428 * lD
+            else:
+                G = 0.045 * math.log10(max(mu_l, 1e-6)) / D ** 0.799 - 0.709 \
+                    - 0.162 * lv - 0.888 * lD
+        else:                       # oil continuous
+            if v_m < 10:
+                G = 0.0127 * lmu / D ** 1.415 - 0.284 + 0.167 * lv + 0.113 * lD
+            else:
+                X = -lv * (0.01 * lmu / D ** 1.571 + 0.397 + 0.63 * lD)
+                G = 0.0274 * lmu / D ** 1.371 + 0.161 + 0.569 * lD + X
+        rho_s0 = (rho_l * (v_sl + v_b) + rho_g * v_sg) / (v_m + v_b)
+        if v_m < 10:
+            G = max(G, -0.065 * v_m)
+        else:
+            G = max(G, -v_b / (v_m + v_b) * (1 - rho_s0 / rho_l))
+        rho_s = min(max(rho_s0 + G * rho_l, rho_g), rho_l)
+        Re = 1488.0 * rho_l * v_m * D / max(mu_l, 1e-9)
+        f = _haaland_friction(Re, rel_roughness)
+        fric = f * rho_l * v_m ** 2 / (2 * G_C * D) / PSI_TO_PSF \
+            * max((v_sl + v_b) / (v_m + v_b) + G, 0.0)
+        H_L = min(max((rho_s - rho_g) / max(rho_l - rho_g, 1e-6), lam), 1.0)
+        return fric, rho_s * sin_t / PSI_TO_PSF, H_L, rho_s, Re, f
+
+    def _mist():
+        rho_n = rho_l * lam + rho_g * (1 - lam)
+        Re = 1488.0 * rho_g * v_sg * D / max(mu_g, 1e-9)
+        f = _haaland_friction(Re, rel_roughness)
+        fric = f * rho_g * v_sg ** 2 / (2 * G_C * D) / PSI_TO_PSF
+        return fric, rho_n * sin_t / PSI_TO_PSF, lam, rho_n, Re, f
+
+    if v_sg / v_m < L_B:
+        (fric, hyd, H_L, rho_s, Re, f), pat = _bubble(), "bubble"
+    elif NGV < L_S:
+        (fric, hyd, H_L, rho_s, Re, f), pat = _slug(), "slug"
+    elif NGV > L_M:
+        (fric, hyd, H_L, rho_s, Re, f), pat = _mist(), "mist"
+    else:
+        a = (L_M - NGV) / max(L_M - L_S, 1e-9)
+        s_, m_ = _slug(), _mist()
+        fric, hyd, H_L, rho_s, Re, f = [a * x + (1 - a) * y
+                                        for x, y in zip(s_, m_)]
+        pat = "transition"
+    # Physical bound: in upward flow the slip density cannot fall below
+    # the no-slip density (the Gamma term can push it there at low v_m).
+    rho_n = rho_l * lam + rho_g * (1 - lam)
+    if rho_s < rho_n:
+        rho_s, H_L = rho_n, lam
+        hyd = rho_s * sin_t / PSI_TO_PSF
+    Ek = 0.0 if pat in ("bubble", "slug") else \
+        rho_s * v_m * v_sg / (G_C * max(P_psia, 1.0) * PSI_TO_PSF)
+    return _result(fric, hyd, Ek, H_L, lam, pat + " (Ork.)", rho_s, v_m,
+                   D, Re, f)
+
+
+# ----------------------------------------------------------------------
 # CORRELATION ROUTER
 # ----------------------------------------------------------------------
-CORRELATIONS = ("Beggs & Brill", "Hagedorn & Brown", "Gray")
+CORRELATIONS = ("Beggs & Brill", "Hagedorn & Brown", "Gray",
+                "Mukherjee & Brill", "Hasan & Kabir (mechanistic)",
+                "Orkiszewski", "No-slip homogeneous")
+
+CORRELATION_NOTES = {
+    "Beggs & Brill": "Empirical, all inclinations (1973/77 map).",
+    "Hagedorn & Brown": "Vertical oil wells, Griffith bubble correction.",
+    "Gray": "Vertical wet-gas / condensate wells.",
+    "Mukherjee & Brill": "Empirical, all inclinations incl. downhill.",
+    "Hasan & Kabir (mechanistic)": "Drift-flux model, vertical/deviated wells.",
+    "Orkiszewski": "Vertical oil wells, slug flow with liquid distribution.",
+    "No-slip homogeneous": "Lower bound (no slip), single-phase / mist.",
+}
+
 
 
 def recommend_correlation(fluid_type, theta_deg, GLR_scf_stb=None):
@@ -494,27 +792,33 @@ def recommend_correlation(fluid_type, theta_deg, GLR_scf_stb=None):
     rationale = "Beggs-Brill is the general-purpose default."
     if fluid_type in ("Wet Gas", "Gas-Condensate", "Dry Gas") and vertical:
         rec = "Gray"
-        alts = ["Beggs & Brill"]
+        alts = ["Hasan & Kabir (mechanistic)", "No-slip homogeneous",
+                "Beggs & Brill"]
         rationale = ("Gray was developed for vertical wet-gas / "
                       "condensate wells and outperforms Beggs-Brill in "
                       "that regime.")
-    elif fluid_type in ("Light Oil", "Heavy Oil") and vertical:
+    elif fluid_type in ("Light Oil", "Heavy Oil", "Water") and vertical:
         rec = "Hagedorn & Brown"
-        alts = ["Beggs & Brill", "Duns-Ros (not implemented)",
-                "Orkiszewski (not implemented)"]
+        alts = ["Orkiszewski", "Hasan & Kabir (mechanistic)",
+                "Mukherjee & Brill", "Beggs & Brill"]
         rationale = ("Hagedorn-Brown with the Griffith bubble-flow "
                       "correction is the long-standing default for "
-                      "vertical oil wells with slug flow. Duns-Ros and "
-                      "Orkiszewski are also relevant at high GOR but "
-                      "are not implemented in this tool — Beggs-Brill "
-                      "is provided as an alternative.")
+                      "vertical oil wells with slug flow. Compare with "
+                      "Orkiszewski and the Hasan-Kabir mechanistic model, "
+                      "and calibrate against well tests.")
         if GLR_scf_stb is not None and GLR_scf_stb > 5000:
-            rationale += (" The very high GLR places this in the "
-                           "Duns-Ros / Orkiszewski sweet spot; treat "
-                           "H-B and B-B results as screening only.")
+            rationale += (" At this high GLR, mist/annular flow is likely; "
+                           "check Hasan & Kabir and Gray as well.")
+            alts = ["Hasan & Kabir (mechanistic)", "Gray"] + alts[:2]
+    elif fluid_type in ("Light Oil", "Heavy Oil", "Water") and theta_deg >= 15:
+        rec = "Mukherjee & Brill"
+        alts = ["Hasan & Kabir (mechanistic)", "Beggs & Brill"]
+        rationale = ("Deviated well: Mukherjee-Brill was developed on "
+                      "inclined pipe (all angles); the Hasan-Kabir drift-"
+                      "flux model includes a deviation correction.")
     elif horizontal_ish or theta_deg < 0:
         rec = "Beggs & Brill"
-        alts = ["Hagedorn & Brown (not appropriate here)"]
+        alts = ["Mukherjee & Brill"]
         rationale = ("Beggs-Brill is the standard for horizontal, "
                       "inclined and downhill flowlines; it handles "
                       "the inclination correction properly.")
@@ -523,7 +827,24 @@ def recommend_correlation(fluid_type, theta_deg, GLR_scf_stb=None):
 
 
 def _select_dpdL(method, v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
-                  D_in_inch, theta_deg, rel_roughness, P_psia, sigma):
+                  D_in_inch, theta_deg, rel_roughness, P_psia, sigma,
+                  water_frac=0.0):
+    if method == "Mukherjee & Brill":
+        return _mukherjee_brill_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                                     D_in_inch, theta_deg, rel_roughness,
+                                     P_psia, sigma)
+    if method.startswith("Hasan & Kabir"):
+        return _hasan_kabir_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                                 D_in_inch, theta_deg, rel_roughness,
+                                 P_psia, sigma)
+    if method == "Orkiszewski":
+        return _orkiszewski_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                                 D_in_inch, theta_deg, rel_roughness,
+                                 P_psia, sigma, water_frac)
+    if method == "No-slip homogeneous":
+        return _noslip_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g,
+                            D_in_inch, theta_deg, rel_roughness, P_psia,
+                            sigma)
     if method == "Hagedorn & Brown":
         return _hagedorn_brown_dpdL(v_sl, v_sg, rho_l, rho_g, mu_l,
                                      mu_g, D_in_inch, theta_deg,
@@ -543,7 +864,8 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                     q_liq_bbl_d, q_gas_mscf_d,
                     api, gas_sg, water_cut_frac, salinity_wt_pct,
                     D_in_inch, rel_roughness, method,
-                    n_seg_inner=10, sigma=30.0):
+                    n_seg_inner=10, sigma=30.0,
+                    hold_mult=1.0, fric_mult=1.0):
     """March from outlet (known P) to inlet, returning the full
     pressure profile.
 
@@ -577,47 +899,72 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
             # Linear T interp from outlet to inlet over total length
             frac = cum / total_len if total_len > 0 else 0.0
             T_here = T_outlet_F + (T_inlet_F - T_outlet_F) * frac
-            P_here = Ps[-1]
-            # Properties at current P, T
-            Z = _gas_z_simple(P_here, T_here, gas_sg)
-            mu_g = _gas_viscosity_lee(P_here, T_here, gas_sg, Z)
-            rho_g = _gas_density_at(P_here, T_here, gas_sg, Z)
-            # Solution GOR (Standing-like; very simple screening)
-            # Phase split. Only the gas NOT dissolved in the oil is free
-            # gas; water carries no dissolved gas and has Bw ~ 1.
-            wc = max(0.0, min(water_cut_frac, 1.0))
-            q_oil = q_liq_bbl_d * (1.0 - wc)
-            q_wat = q_liq_bbl_d * wc
-            GOR = (q_gas_mscf_d * 1000.0 / q_oil) if q_oil > 1e-9 else 0.0
-            # Standing Rs: Rs = gg * [(P/18.2 + 1.4) * 10^x]^1.2048
-            x_st = 0.0125 * api - 0.00091 * T_here
-            Rs = gas_sg * max((P_here / 18.2 + 1.4) * 10 ** x_st, 0.0) ** 1.2048
-            Rs = min(Rs, GOR)
-            gamma_o = 141.5 / (api + 131.5)
-            Bo = 0.972 + 0.000147 * (Rs * (gas_sg / gamma_o) ** 0.5
-                                     + 1.25 * T_here) ** 1.175
-            q_gas_free = max(q_gas_mscf_d - Rs * q_oil / 1000.0, 0.0)
-            # Live-oil viscosity (Beggs-Robinson): mu = a * mu_od^b
-            mu_od = _oil_viscosity_simple(api, T_here)
-            mu_o = (10.715 * (Rs + 100.0) ** -0.515
-                    * mu_od ** (5.44 * (Rs + 150.0) ** -0.338))
-            rho_o = _oil_density(api, gas_sg, P_here, Rs, Bo)
-            rho_w = _water_density(salinity_wt_pct, T_here)
-            # Liquid mixture weighted by IN-SITU volumes
-            v_o, v_w = q_oil * Bo, q_wat * 1.0
-            f_o = v_o / (v_o + v_w) if (v_o + v_w) > 0 else 1.0
-            rho_l = rho_o * f_o + rho_w * (1.0 - f_o)
-            mu_w = max(0.3 + 0.005 * (T_here - 60.0), 0.1)
-            mu_l = mu_o * f_o + mu_w * (1.0 - f_o)
-            # In-situ liquid volume already includes Bo -> pass Bo = 1
-            v_sl, v_sg = _superficial_velocities(
-                v_o + v_w, q_gas_free, D_in_inch, P_here, T_here, Z, 1.0)
-            dpdL = _select_dpdL(method, v_sl, v_sg, rho_l, rho_g,
-                                  mu_l, mu_g, D_in_inch, theta,
-                                  rel_roughness, P_here, sigma)
-            P_next = P_here + dpdL["dpdL_psi_ft"] * dl
-            # Guard against runaway negative pressure
-            P_next = max(P_next, 1.0)
+            def _grad(P_here):
+                # Properties at current P, T
+                Z = _gas_z_simple(P_here, T_here, gas_sg)
+                mu_g = _gas_viscosity_lee(P_here, T_here, gas_sg, Z)
+                rho_g = _gas_density_at(P_here, T_here, gas_sg, Z)
+                # Solution GOR (Standing-like; very simple screening)
+                # Phase split. Only the gas NOT dissolved in the oil is free
+                # gas; water carries no dissolved gas and has Bw ~ 1.
+                wc = max(0.0, min(water_cut_frac, 1.0))
+                q_oil = q_liq_bbl_d * (1.0 - wc)
+                q_wat = q_liq_bbl_d * wc
+                GOR = (q_gas_mscf_d * 1000.0 / q_oil) if q_oil > 1e-9 else 0.0
+                # Standing Rs: Rs = gg * [(P/18.2 + 1.4) * 10^x]^1.2048
+                x_st = 0.0125 * api - 0.00091 * T_here
+                Rs = gas_sg * max((P_here / 18.2 + 1.4) * 10 ** x_st, 0.0) ** 1.2048
+                Rs = min(Rs, GOR)
+                gamma_o = 141.5 / (api + 131.5)
+                Bo = 0.972 + 0.000147 * (Rs * (gas_sg / gamma_o) ** 0.5
+                                         + 1.25 * T_here) ** 1.175
+                q_gas_free = max(q_gas_mscf_d - Rs * q_oil / 1000.0, 0.0)
+                # Live-oil viscosity (Beggs-Robinson): mu = a * mu_od^b
+                mu_od = _oil_viscosity_simple(api, T_here)
+                mu_o = (10.715 * (Rs + 100.0) ** -0.515
+                        * mu_od ** (5.44 * (Rs + 150.0) ** -0.338))
+                rho_o = _oil_density(api, gas_sg, P_here, Rs, Bo)
+                rho_w = _water_density(salinity_wt_pct, T_here)
+                # Liquid mixture weighted by IN-SITU volumes
+                v_o, v_w = q_oil * Bo, q_wat * 1.0
+                f_o = v_o / (v_o + v_w) if (v_o + v_w) > 0 else 1.0
+                rho_l = rho_o * f_o + rho_w * (1.0 - f_o)
+                mu_w = max(0.3 + 0.005 * (T_here - 60.0), 0.1)
+                mu_l = mu_o * f_o + mu_w * (1.0 - f_o)
+                # In-situ liquid volume already includes Bo -> pass Bo = 1
+                v_sl, v_sg = _superficial_velocities(
+                    v_o + v_w, q_gas_free, D_in_inch, P_here, T_here, Z, 1.0)
+                dpdL = _select_dpdL(method, v_sl, v_sg, rho_l, rho_g,
+                                      mu_l, mu_g, D_in_inch, theta,
+                                      rel_roughness, P_here, sigma,
+                                      water_frac=1.0 - f_o)
+                if hold_mult != 1.0 or fric_mult != 1.0:
+                    # Calibration multipliers (PROSPER-style "parameter
+                    # 1 / parameter 2"): gravity and friction terms.
+                    dpdL = dict(dpdL)
+                    dpdL["dpdL_hydro"] *= hold_mult
+                    dpdL["dpdL_fric"] *= fric_mult
+                    dpdL["dpdL_psi_ft"] = (
+                        (dpdL["dpdL_fric"] + dpdL["dpdL_hydro"])
+                        / max(1.0 - dpdL["Ek"], 0.05))
+                return dpdL
+
+            # Adaptive sub-stepping: limit the pressure change per step to
+            # 5 % of the local pressure. A fixed explicit step let a steep
+            # gradient (high-rate gas, low outlet P) jump hundreds of psi in
+            # one step and evaluate the next step at the wrong density.
+            P_next, rem, it = Ps[-1], dl, 0
+            dpdL = _grad(P_next)          # also covers zero-length segments
+            while rem > 1e-9 and it < 400:
+                if it:
+                    dpdL = _grad(P_next)
+                g = dpdL["dpdL_psi_ft"]
+                h = rem if g == 0 else min(rem, 0.05 * max(P_next, 1.0) / abs(g))
+                h = max(h, dl / 200.0)
+                h = min(h, rem)
+                P_next = max(P_next + g * h, 1.0)
+                rem -= h
+                it += 1
             stations.append(cum)
             Ps.append(P_next)
             Ts.append(T_here)
@@ -638,7 +985,8 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
 def lift_curve(rates_bbl_d, GLR_scf_stb,
                 P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                 api, gas_sg, water_cut_frac, salinity_wt_pct,
-                D_in_inch, rel_roughness, method):
+                D_in_inch, rel_roughness, method,
+                hold_mult=1.0, fric_mult=1.0):
     """Build a Tubing/Flowline Performance Curve.
 
     Returns a list of dicts, one per rate:
@@ -655,7 +1003,7 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                 gas_sg=gas_sg, water_cut_frac=water_cut_frac,
                 salinity_wt_pct=salinity_wt_pct,
                 D_in_inch=D_in_inch, rel_roughness=rel_roughness,
-                method=method)
+                method=method, hold_mult=hold_mult, fric_mult=fric_mult)
         except Exception as e:
             out.append({"q_liq_bbl_d": q, "q_gas_mscf_d": q_gas,
                         "P_inlet_psia": np.nan,
@@ -676,3 +1024,369 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                     "H_L_avg": float(np.nanmean(r["H_L"])),
                     "dP_total_psi": r["P_inlet_psia"] - P_outlet_psia})
     return out
+
+
+# ======================================================================
+# Inflow performance (IPR) and IPR / VLP operating point
+# ======================================================================
+# All pressures psia, liquid rates STB/d, gas rates Mscf/d. Every IPR is
+# referenced to the SAME node as the VLP inlet (bottom of the last pipe
+# segment), so the two curves can be intersected directly.
+
+IPR_MODELS = ("Straight-line PI (undersaturated oil)",
+              "Vogel (saturated oil)",
+              "Composite PI + Vogel (Pr > Pb)",
+              "Gas back-pressure (C, n)",
+              "Darcy radial — oil (pseudo-steady state)",
+              "Darcy radial — gas (pseudo-steady state, non-Darcy D)")
+IPR_GAS_MODELS = (IPR_MODELS[3], IPR_MODELS[5])
+IPR_DARCY_MODELS = (IPR_MODELS[4], IPR_MODELS[5])
+
+
+def _vogel_frac(x):
+    """q/qmax for Vogel at x = Pwf/Pr (or Pwf/Pb)."""
+    x = min(max(x, 0.0), 1.0)
+    return 1.0 - 0.2 * x - 0.8 * x * x
+
+
+def _vogel_x(frac):
+    """Inverse Vogel: x = Pwf/Pr for a given q/qmax."""
+    frac = min(max(frac, 0.0), 1.0)
+    return (-0.2 + np.sqrt(0.04 + 3.2 * (1.0 - frac))) / 1.6
+
+
+def _pi_or_composite(model, Pr, J, Pb=None):
+    """Parameter dict for a straight-line / composite IPR with index J."""
+    p = {"model": model, "Pr": float(Pr), "J": float(J)}
+    if Pb and 0.0 < Pb < Pr:
+        qb = J * (Pr - Pb)
+        p.update(kind="composite", Pb=float(Pb), qb=qb, aof=qb + J * Pb / 1.8)
+    else:
+        p.update(kind="pi", aof=J * Pr)
+    return p
+
+
+def _composite_basis(Pr, Pb, pwf):
+    """q / J for the composite IPR at pwf."""
+    if pwf >= Pb:
+        return Pr - pwf
+    return (Pr - Pb) + Pb / 1.8 * _vogel_frac(pwf / Pb)
+
+
+def calibrate_ipr(model, Pr, q_test, pwf_test, Pb=None, n=1.0):
+    """Fit an empirical IPR to one well-test point (q_test at pwf_test).
+    Returns the parameter dict (with `aof` and `J`)."""
+    if q_test <= 0 or not (0.0 <= pwf_test < Pr):
+        raise ValueError("Test point must have q > 0 and 0 <= Pwf < Pr.")
+    return fit_ipr(model, Pr, [(q_test, pwf_test)], Pb=Pb, n=n)["params"]
+
+
+# ---- Darcy (radial inflow) ----------------------------------------------
+def darcy_oil_J(k_md, h_ft, mu_cp, Bo, re_ft, rw_ft, skin):
+    """Pseudo-steady-state productivity index, STB/d/psi:
+    J = k h / [141.2 Bo mu (ln(re/rw) - 0.75 + S)]."""
+    den = 141.2 * Bo * mu_cp * (math.log(re_ft / rw_ft) - 0.75 + skin)
+    if den <= 0:
+        raise ValueError("ln(re/rw) - 0.75 + S must be > 0 (skin too "
+                         "negative for this drainage radius).")
+    return k_md * h_ft / den
+
+
+def make_darcy_oil(Pr, k_md, h_ft, mu_cp, Bo, re_ft, rw_ft, skin, Pb=None):
+    """Darcy radial oil IPR; Vogel below Pb when 0 < Pb < Pr."""
+    J = darcy_oil_J(k_md, h_ft, mu_cp, Bo, re_ft, rw_ft, skin)
+    p = _pi_or_composite(IPR_MODELS[4], Pr, J, Pb)
+    p.update(k=k_md, h=h_ft, mu=mu_cp, Bo=Bo, re=re_ft, rw=rw_ft, S=skin)
+    return p
+
+
+def _mu_z(P, T_F, gas_sg):
+    Z = _gas_z_simple(max(P, 14.7), T_F, gas_sg)
+    return _gas_viscosity_lee(max(P, 14.7), T_F, gas_sg, Z) * Z
+
+
+def make_darcy_gas(Pr, k_md, h_ft, T_F, gas_sg, re_ft, rw_ft, skin,
+                   D_nd=0.0):
+    """Darcy radial gas IPR (pressure-squared form, mu*z at the average
+    pressure) with rate-dependent skin D (1 / (Mscf/d)):
+        Pr^2 - Pwf^2 = a mu z q + b mu z q^2,
+        a = 1422 T (ln(re/rw) - 0.75 + S) / (k h),  b = 1422 T D / (k h)."""
+    T_R = T_F + 459.67
+    lnr = math.log(re_ft / rw_ft) - 0.75 + skin
+    if lnr <= 0:
+        raise ValueError("ln(re/rw) - 0.75 + S must be > 0.")
+    p = {"model": IPR_MODELS[5], "kind": "darcy_gas", "Pr": float(Pr),
+         "a": 1422.0 * T_R * lnr / (k_md * h_ft),
+         "b": 1422.0 * T_R * max(D_nd, 0.0) / (k_md * h_ft),
+         "T_F": T_F, "gas_sg": gas_sg, "k": k_md, "h": h_ft,
+         "re": re_ft, "rw": rw_ft, "S": skin, "D": max(D_nd, 0.0)}
+    p["aof"] = ipr_rate(p, 0.0)
+    p["J"] = ipr_rate(p, 0.9 * Pr) / (0.1 * Pr)
+    return p
+
+
+# ---- evaluation ---------------------------------------------------------
+def ipr_rate(p, pwf):
+    """Inflow rate at a flowing bottom-hole pressure (STB/d or Mscf/d)."""
+    Pr, kd = p["Pr"], p["kind"]
+    pwf = min(max(float(pwf), 0.0), Pr)
+    if kd == "pi":
+        return p["J"] * (Pr - pwf)
+    if kd == "vogel":
+        return p["qmax"] * _vogel_frac(pwf / Pr)
+    if kd == "composite":
+        return p["J"] * _composite_basis(Pr, p["Pb"], pwf)
+    if kd == "backpressure":
+        return p["C"] * (Pr ** 2 - pwf ** 2) ** p["n"]
+    if kd == "darcy_gas":
+        mz = _mu_z(0.5 * (Pr + pwf), p["T_F"], p["gas_sg"])
+        dp2 = Pr ** 2 - pwf ** 2
+        A, B = p["a"] * mz, p["b"] * mz
+        if B <= 1e-15:
+            return dp2 / A
+        return (-A + math.sqrt(A * A + 4 * B * dp2)) / (2 * B)
+    raise ValueError(f"Unknown IPR kind {kd!r}")
+
+
+def ipr_pwf(p, q):
+    """Flowing bottom-hole pressure delivering rate q (NaN beyond AOF)."""
+    Pr, kd = p["Pr"], p["kind"]
+    q = float(q)
+    if q < 0 or q > p["aof"] * (1 + 1e-9):
+        return float("nan")
+    if kd == "pi":
+        return Pr - q / p["J"]
+    if kd == "vogel":
+        return Pr * _vogel_x(q / p["qmax"])
+    if kd == "composite":
+        if q <= p["qb"]:
+            return Pr - q / p["J"]
+        return p["Pb"] * _vogel_x((q - p["qb"]) / (p["J"] * p["Pb"] / 1.8))
+    if kd == "backpressure":
+        return float(np.sqrt(max(Pr ** 2 - (q / p["C"]) ** (1.0 / p["n"]),
+                                 0.0)))
+    # monotone in pwf -> bisection (darcy_gas)
+    lo, hi = 0.0, Pr
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if ipr_rate(p, mid) > q:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+# ---- calibration against one or more well tests --------------------------
+def fit_ipr(model, Pr, points, Pb=None, n=1.0, darcy=None):
+    """Least-squares fit of an IPR to well-test points [(q, pwf), ...]
+    (q: STB/d liquid, or Mscf/d for the gas models; pwf at the node).
+
+    Empirical models: J (PI, composite), qmax (Vogel), C and n
+    (back-pressure; n is fitted when >= 2 points, else held).
+    Darcy models (darcy = reservoir properties dict): the skin S is
+    solved; for gas with >= 2 points the non-Darcy D is fitted too.
+    Returns {"params", "fitted": {name: value}, "rmse_pwf", "n_points"}.
+    """
+    pts = [(float(q), float(w)) for q, w in points
+           if q and q > 0 and w is not None and 0 <= w < Pr]
+    if not pts:
+        raise ValueError("No valid test point (need q > 0 and Pwf < Pr).")
+    q = np.array([a for a, _ in pts])
+    w = np.array([b for _, b in pts])
+    fitted = {}
+    if model == IPR_MODELS[0]:
+        x = Pr - w
+        J = float((q @ x) / (x @ x))
+        p = _pi_or_composite(model, Pr, J)
+        fitted["J"] = J
+    elif model == IPR_MODELS[1]:
+        f = np.array([_vogel_frac(v / Pr) for v in w])
+        qmax = float((q @ f) / (f @ f))
+        p = {"model": model, "kind": "vogel", "Pr": float(Pr), "qmax": qmax,
+             "aof": qmax, "J": 1.8 * qmax / Pr}
+        fitted["qmax"] = qmax
+    elif model == IPR_MODELS[2]:
+        if not (Pb and 0.0 < Pb < Pr):
+            raise ValueError("Composite IPR needs 0 < Pb < Pr.")
+        g = np.array([_composite_basis(Pr, Pb, v) for v in w])
+        J = float((q @ g) / (g @ g))
+        p = _pi_or_composite(model, Pr, J, Pb)
+        fitted["J"] = J
+    elif model == IPR_MODELS[3]:
+        dp2 = Pr ** 2 - w ** 2
+        if len(pts) >= 2 and np.ptp(np.log(dp2)) > 1e-6:
+            nn, lc = np.polyfit(np.log(dp2), np.log(q), 1)
+            nn = float(min(max(nn, 0.5), 1.0))
+            C = float(np.exp(np.mean(np.log(q) - nn * np.log(dp2))))
+            fitted["n"] = nn
+        else:
+            nn = float(n)
+            C = float(np.exp(np.mean(np.log(q) - nn * np.log(dp2))))
+        p = {"model": model, "kind": "backpressure", "Pr": float(Pr),
+             "C": C, "n": nn, "aof": C * Pr ** (2 * nn)}
+        p["J"] = ipr_rate(p, 0.9 * Pr) / (0.1 * Pr)
+        fitted["C"] = C
+    elif model == IPR_MODELS[4]:
+        d = darcy
+        x = np.array([(_composite_basis(Pr, Pb, v) if (Pb and 0 < Pb < Pr)
+                       else Pr - v) for v in w])
+        J = float((q @ x) / (x @ x))
+        S = (d["k"] * d["h"] / (141.2 * d["Bo"] * d["mu"] * J)
+             - math.log(d["re"] / d["rw"]) + 0.75)
+        p = make_darcy_oil(Pr, d["k"], d["h"], d["mu"], d["Bo"], d["re"],
+                           d["rw"], S, Pb)
+        fitted["S"] = S
+    elif model == IPR_MODELS[5]:
+        d = darcy
+        T_R = d["T_F"] + 459.67
+        mz = np.array([_mu_z(0.5 * (Pr + v), d["T_F"], d["gas_sg"])
+                       for v in w])
+        y = (Pr ** 2 - w ** 2) / mz              # = a q + b q^2
+        kh = d["k"] * d["h"]
+        if len(pts) >= 2 and np.ptp(q) > 1e-6 * q.max():
+            A = np.c_[q, q ** 2]
+            (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+            if b < 0:
+                a, b = float((q @ y) / (q @ q)), 0.0
+            Dn = b * kh / (1422.0 * T_R)
+            fitted["D"] = float(Dn)
+        else:
+            b = 1422.0 * T_R * d.get("D", 0.0) / kh
+            a = float(np.mean((y - b * q ** 2) / q))
+            Dn = d.get("D", 0.0)
+        S = a * kh / (1422.0 * T_R) - math.log(d["re"] / d["rw"]) + 0.75
+        p = make_darcy_gas(Pr, d["k"], d["h"], d["T_F"], d["gas_sg"],
+                           d["re"], d["rw"], S, Dn)
+        fitted["S"] = S
+    else:
+        raise ValueError(f"Unknown IPR model {model!r}")
+    pred = np.array([ipr_pwf(p, a) for a in q])
+    rm = float(np.sqrt(np.nanmean((pred - w) ** 2))) if len(q) else 0.0
+    return {"params": p, "fitted": fitted, "rmse_pwf": rm,
+            "n_points": len(pts)}
+
+
+# ---- VLP calibration ------------------------------------------------------
+def _vlp_at_tests(tests, common, method, hold_mult=1.0, fric_mult=1.0):
+    """Predicted node pressure for each test: dicts with q (STB/d), thp
+    (psia), glr (scf/STB), wc. `common` holds the march_pressure kwargs
+    that do not change between tests."""
+    out = []
+    for t in tests:
+        try:
+            r = march_pressure(
+                t["thp"], common["T_outlet_F"], common["T_inlet_F"],
+                common["segments"], t["q"], t["q"] * t["glr"] / 1000.0,
+                common["api"], common["gas_sg"], t["wc"],
+                common["salinity_wt_pct"], common["D_in_inch"],
+                common["rel_roughness"], method,
+                hold_mult=hold_mult, fric_mult=fric_mult)
+            out.append(float(r["P_inlet_psia"]))
+        except Exception:
+            out.append(float("nan"))
+    return np.array(out)
+
+
+def rank_correlations(tests, common, methods=None):
+    """Score every correlation against measured node pressures.
+    Returns rows sorted by mean absolute % error."""
+    meas = np.array([t["pwf"] for t in tests], float)
+    rows = []
+    for m in (methods or CORRELATIONS):
+        pred = _vlp_at_tests(tests, common, m)
+        err = pred - meas
+        ok = np.isfinite(err)
+        if not ok.any():
+            continue
+        rows.append({"method": m, "pred": pred,
+                     "mae": float(np.mean(np.abs(err[ok]))),
+                     "mape": float(np.mean(np.abs(err[ok] / meas[ok])) * 100),
+                     "bias": float(np.mean(err[ok])),
+                     "n_ok": int(ok.sum())})
+    return sorted(rows, key=lambda r: r["mape"])
+
+
+def tune_vlp(tests, common, method, tune_friction=None,
+             hold_bounds=(0.5, 1.5), fric_bounds=(0.3, 3.0)):
+    """Fit gravity (holdup) and friction multipliers so the chosen
+    correlation matches the measured node pressures (least squares on
+    relative error). With a single test only the gravity multiplier is
+    fitted (two unknowns cannot be identified from one point)."""
+    from scipy.optimize import least_squares
+    meas = np.array([t["pwf"] for t in tests], float)
+    if tune_friction is None:
+        tune_friction = len(tests) >= 2
+
+    def resid(x):
+        hm = x[0]
+        fm = x[1] if tune_friction else 1.0
+        pr = _vlp_at_tests(tests, common, method, hm, fm)
+        r = (pr - meas) / meas
+        return np.where(np.isfinite(r), r, 1.0)
+
+    x0 = [1.0, 1.0] if tune_friction else [1.0]
+    lb = [hold_bounds[0]] + ([fric_bounds[0]] if tune_friction else [])
+    ub = [hold_bounds[1]] + ([fric_bounds[1]] if tune_friction else [])
+    sol = least_squares(resid, x0, bounds=(lb, ub), diff_step=1e-3,
+                        xtol=1e-6, ftol=1e-8)
+    hm = float(sol.x[0])
+    fm = float(sol.x[1]) if tune_friction else 1.0
+    before = _vlp_at_tests(tests, common, method)
+    after = _vlp_at_tests(tests, common, method, hm, fm)
+    at_bound = any(abs(v - b) < 1e-3 for v, b in
+                   ((hm, hold_bounds[0]), (hm, hold_bounds[1]),
+                    (fm, fric_bounds[0]), (fm, fric_bounds[1]))
+                   if (tune_friction or v is hm))
+    return {"method": method, "hold_mult": hm, "fric_mult": fm,
+            "tuned_friction": bool(tune_friction),
+            "pred_before": before, "pred_after": after, "meas": meas,
+            "mape_before": float(np.nanmean(np.abs(before - meas) / meas) * 100),
+            "mape_after": float(np.nanmean(np.abs(after - meas) / meas) * 100),
+            "at_bound": bool(at_bound)}
+
+
+def correct_pressure_to_node(P_datum, datum_tvd_ft, node_tvd_ft, grad_psi_ft):
+    """Shift a static reservoir pressure from its datum to the node depth
+    with a static fluid gradient (deeper node -> higher pressure)."""
+    return P_datum + grad_psi_ft * (node_tvd_ft - datum_tvd_ft)
+
+
+def operating_points(q_vlp, p_vlp, ipr_pwf_fn):
+    """Intersections of a VLP (required node pressure vs rate) with an
+    IPR given as Pwf(q).
+
+    Returns a list (low -> high rate) of dicts {q, pwf, stable}. A crossing
+    is stable when the VLP rises faster than the IPR there
+    (dVLP/dq > dIPR/dq); on the gravity-dominated (left) branch it is not.
+    """
+    q = np.asarray(q_vlp, float)
+    pv = np.asarray(p_vlp, float)
+    pi = np.array([ipr_pwf_fn(x) for x in q])
+    d = pv - pi
+    out = []
+    for i in range(len(q) - 1):
+        a, b = d[i], d[i + 1]
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        if a == 0 or a * b < 0:
+            t = 0.0 if a == 0 else a / (a - b)
+            qx = q[i] + t * (q[i + 1] - q[i])
+            px = pv[i] + t * (pv[i + 1] - pv[i])
+            s_vlp = (pv[i + 1] - pv[i]) / (q[i + 1] - q[i])
+            s_ipr = (pi[i + 1] - pi[i]) / (q[i + 1] - q[i])
+            out.append({"q": float(qx), "pwf": float(px),
+                        "stable": bool(s_vlp > s_ipr)})
+    return out
+
+
+def well_trajectory(segments):
+    """(horizontal displacement, TVD, MD) arrays from the WELLHEAD down,
+    for segments listed OUTLET -> INLET with inclination measured from
+    horizontal, positive when the flow goes up (producer)."""
+    x, z, md = [0.0], [0.0], [0.0]
+    for L, th in segments:
+        r = np.radians(th)
+        x.append(x[-1] + L * np.cos(r))
+        z.append(z[-1] + L * np.sin(r))       # TVD increases downward
+        md.append(md[-1] + L)
+    return np.array(x), np.array(z), np.array(md)

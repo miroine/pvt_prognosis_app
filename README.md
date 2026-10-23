@@ -49,6 +49,84 @@ reference).
 
 ## Change history
 
+## v1.4.5 — More flow correlations, Darcy IPR, calibration
+
+**Multiphase-flow correlations (7)**
+- New: Mukherjee & Brill (1985, all inclinations incl. downhill),
+  Hasan & Kabir (1988 drift-flux, deviation-corrected), Orkiszewski (1967,
+  Griffith bubble / slug with liquid-distribution coefficient / Duns & Ros
+  mist), No-slip homogeneous (lower bound). Existing: Beggs & Brill,
+  Hagedorn & Brown, Gray.
+- Hagedorn & Brown: chart fits replaced by Trick's rational fits for CNL,
+  HL/psi and psi - the old fit clamped H_L to the no-slip value.
+- Correlation recommendation updated (deviated oil -> Mukherjee & Brill),
+  reference expander with the models and equations.
+- Overlay any other correlations on the lift-curve plot.
+
+**IPR**
+- Darcy radial inflow, pseudo-steady state: oil (k, h, mu, Bo, re, rw,
+  skin; Vogel below Pb when Pb > 0) and gas (pressure-squared form with
+  mu*z at the average pressure and non-Darcy coefficient D).
+- Optional skin calibration of the Darcy models to the test point.
+
+**Calibration**
+- Well-test table (rate, THP, Pwf at the node, optional GLR / WC).
+- IPR fit to all tests: J, qmax, C and n, skin, or skin and D.
+- VLP: rank all correlations against the tests (MAPE, MAE, bias), one
+  click to use the best; tune the chosen correlation with gravity and
+  friction multipliers (gravity only for one test), predicted-vs-measured
+  plot, applied to the lift curve, traverse, schematic hover and the VFP
+  export.
+- Tests plotted on the IPR / VLP chart.
+
+## v1.4.4 — Interactive (JavaScript) well schematic
+
+- New `well_schematic.py`: the Nodal Analysis well schematic is now a
+  JavaScript / SVG drawing rendered in the page (no extra package):
+  formation layers with lithology patterns, cap rock and reservoir, sea and
+  seabed or ground level, platform deck and Christmas tree, every casing
+  string with cement, shoes and liner hanger, tubing with animated flow,
+  production packer, perforation jets, solution node (reference depth) and
+  the Pr datum, with callouts for every component.
+- Hover the well for MD, TVD, temperature, the casing strings and tubing at
+  that depth and, after a run, the pressure from the traverse at the
+  operating point. Toggles for flow animation, geology and labels.
+- "Completion details (schematic)" expander: offshore platform / onshore,
+  water depth, editable casing programme (defaults scale with the well),
+  packer depth, perforated interval, rathole, reservoir thickness. Drawing
+  only - the VLP still uses the tubing ID to the solution node.
+- Deviated wells keep true scale when they fit; otherwise the horizontal
+  scale is compressed (stated on the drawing). Flowlines keep the Plotly
+  schematic.
+
+## v1.4.3 — Nodal analysis: well schematic, reference depth, IPR / VLP QC
+
+**New (Nodal Analysis / Lift Curves)**
+- **Well schematic**: trajectory (TVD vs displacement) from the segments,
+  casing/tubing, outlet node (THP, T) and the **solution node** (MD/TVD,
+  inlet T) with perforations, plus the Pr datum when it differs.
+- **Assumptions table** next to the schematic: reference depth, outlet
+  node, temperature profile, pipe, correlation, PVT basis, rate basis,
+  Pr at the node and the fitted IPR.
+- **IPR on the same plot as the VLP**, both at the solution node:
+  straight-line PI, Vogel, composite PI + Vogel, gas back-pressure (C, n),
+  each calibrated from one well test. Optional Pr datum shifted to the
+  node with a static gradient.
+- Operating point(s) with stability (stable when the VLP rises faster
+  than the IPR), metrics (rate, gas rate, Pwf, drawdown, % AOF), a QC
+  checklist (no intersection, unstable crossing, THP > Pr ...) and a CSV
+  of the IPR / VLP table.
+
+**Fixes (nodal.py)**
+- Beggs & Brill two-phase friction factor: the S(y) branches were swapped
+  and a sign guard made exp(S) overflow -> NaN points on the lift curve.
+- Beggs & Brill flow-pattern map: very dry flow (lambda < 0.01) is now
+  distributed when Fr >= L1 (was always segregated).
+- Pressure marching uses adaptive sub-steps (<= 5 % of P per step); the
+  fixed explicit step could jump hundreds of psi on steep gradients.
+- "Stable point" on the VLP renamed to "VLP minimum (stability limit)" -
+  the operating point is the IPR / VLP intersection.
+
 ## v1.4.2 — SI by default, unit-consistent messages, E300 + multi-export everywhere
 
 **Bugs fixed**

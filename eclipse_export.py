@@ -18,7 +18,7 @@ PVTG format (the dual of PVTO):
   /
 """
 
-APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 

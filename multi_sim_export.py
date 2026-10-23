@@ -46,7 +46,7 @@ All builders take the same `case` dict:
 Only the fields relevant to `kind` need to be populated.
 """
 
-APP_VERSION = "1.4.2"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.5"   # must match pvt_app.py (deployment check)
 
 import io
 import json

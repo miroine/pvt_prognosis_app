@@ -274,6 +274,119 @@ b = liq["bhp_table_disp"][0, 0, 0, 0]
 check("VFP FLO=OIL axis consistent with LIQ", close(oil_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
 check("VFP FLO=GAS axis consistent with LIQ", close(gas_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
 
+
+# 9b. IPR / VLP at the solution node ---------------------------------------
+print("\n9b. IPR / VLP")
+for m in N.IPR_MODELS[:4]:
+    gas = "Gas" in m
+    pp = N.calibrate_ipr(m, 3500.0, 5000.0 if gas else 2000.0, 2500.0,
+                         Pb=3000.0, n=0.85)
+    check(f"IPR {m.split(' (')[0]}: reproduces the test point",
+          close(N.ipr_rate(pp, 2500.0), 5000.0 if gas else 2000.0, 1e-9))
+    check(f"IPR {m.split(' (')[0]}: Pwf(q) inverts q(Pwf)",
+          all(close(N.ipr_rate(pp, N.ipr_pwf(pp, q)), q, 1e-6)
+              for q in (1.0, 0.3 * pp["aof"], 0.95 * pp["aof"])))
+pp = N.calibrate_ipr(N.IPR_MODELS[1], 3000.0, 1000.0, 1500.0)
+check("Vogel qmax = q / (1 - 0.2x - 0.8x^2), x = 0.5 -> 1000/0.7",
+      close(pp["qmax"], 1000.0 / 0.7, 1e-9))
+pp = N.calibrate_ipr(N.IPR_MODELS[2], 3500.0, 2000.0, 3200.0, Pb=3000.0)
+check("Composite IPR continuous at Pb",
+      close(N.ipr_rate(pp, 3000.0 + 1e-6), N.ipr_rate(pp, 3000.0 - 1e-6), 1e-6))
+check("Pr datum correction: node 200 ft deeper, 0.35 psi/ft -> +70 psi",
+      close(N.correct_pressure_to_node(3500.0, 7800.0, 8000.0, 0.35), 3570.0, 1e-12))
+_q = [500.0, 1000, 2000, 3000, 4000, 5000]
+_v = [2600.0, 2000, 1800, 2000, 2400, 3000]          # J-shaped VLP
+pp = N.calibrate_ipr(N.IPR_MODELS[0], 2700.0, 1000.0, 2450.0)  # J = 4
+ops = N.operating_points(_q, _v, lambda q: N.ipr_pwf(pp, q))
+check("Operating points: left crossing unstable, right crossing stable",
+      len(ops) == 2 and not ops[0]["stable"] and ops[1]["stable"],
+      str([(round(o["q"]), o["stable"]) for o in ops]))
+x_, z_, md_ = N.well_trajectory([(2000.0, 30.0), (6000.0, 90.0)])
+check("Trajectory: TVD = 2000 sin30 + 6000, MD = 8000",
+      close(z_[-1], 7000.0, 1e-9) and close(md_[-1], 8000.0, 1e-12))
+r = N.lift_curve(list(np.linspace(200, 6000, 10)), 500, 200, 80, 180,
+                 [(8000, 90)], 35, 0.75, 0.1, 2.0, 2.992, 6e-4, "Beggs & Brill")
+check("Beggs & Brill VLP has no failed (NaN) points",
+      all(np.isfinite(x["P_inlet_psia"]) for x in r))
+
+# 9c. Well schematic (JS) ---------------------------------------------------
+print("\n9c. Well schematic")
+import json as _json
+import well_schematic as WS
+cp = WS.default_casing_program(2500.0, seabed_md=345.0)
+check("Default casing programme: OD decreasing, shoes deepening, conductor below seabed",
+      all(a["OD (in)"] > b["OD (in)"] and a["Shoe MD"] < b["Shoe MD"] for a, b in zip(cp, cp[1:]))
+      and cp[0]["Shoe MD"] > 345.0 and cp[-1]["Shoe MD"] == 2500.0)
+tr = WS.trajectory_points([(600.0, 90.0), (1000.0, 45.0)], rathole=40.0)
+check("Schematic trajectory: MD = 1640, TVD = 600 + 1040 sin45",
+      close(tr[-1][0], 1640.0, 1e-6) and close(tr[-1][2], 600 + 1040 * np.sin(np.pi / 4), 1e-4))
+check("Tubing OD from ID 2.992 in -> 3 1/2 in", WS.tubing_od_for_id(2.992) == 3.5)
+_h = WS.build_schematic_html({"traj": tr, "unit": "m", "strings": [], "tubing": {"od": 3.5, "id": 2.992, "bottom": 1500, "label": "3½\""},
+                              "packer_md": 1400, "perf": [1580, 1620], "node": {"md": 1600, "tvd": 1300}, "datum_tvd": None,
+                              "water_depth": 0, "air_gap": 0, "res_top_tvd": 1280, "res_bot_tvd": 1340, "fluid": "oil",
+                              "outlet_txt": "x", "T_top": 20, "T_bot": 80, "T_unit": "C", "P_profile": None, "P_unit": "bara"})
+check("Schematic HTML embeds valid JSON spec and no unfilled placeholders",
+      "__SPEC__" not in _h and "__HEIGHT__" not in _h
+      and _json.loads(_h.split("const S = ", 1)[1].split(";\n", 1)[0])["node"]["md"] == 1600)
+
+# 9d. Darcy IPR, multi-point fits, new correlations, VLP tuning ------------
+print("\n9d. Darcy IPR / calibration / correlations")
+po = N.make_darcy_oil(3500.0, 100.0, 50.0, 1.0, 1.2, 1490.0, 0.354, 0.0)
+J_hand = 100 * 50 / (141.2 * 1.2 * 1.0 * (np.log(1490 / 0.354) - 0.75))
+check("Darcy oil J = kh / [141.2 Bo mu (ln re/rw - 0.75 + S)]", close(po["J"], J_hand, 1e-12),
+      f"J = {po['J']:.4f} STB/d/psi")
+fo = N.fit_ipr(N.IPR_MODELS[4], 3500.0, [(N.ipr_rate(po, 2500.0), 2500.0)],
+               darcy={"k": 100.0, "h": 50.0, "mu": 1.0, "Bo": 1.2,
+                      "re": 1490.0, "rw": 0.354})
+check("Darcy oil calibration recovers the skin (S = 0)", abs(fo["fitted"]["S"]) < 1e-6)
+fo2 = N.fit_ipr(N.IPR_MODELS[4], 3500.0, [(0.5 * N.ipr_rate(po, 2500.0), 2500.0)],
+                darcy={"k": 100.0, "h": 50.0, "mu": 1.0, "Bo": 1.2,
+                       "re": 1490.0, "rw": 0.354})
+check("Halving the rate at the same drawdown -> positive skin", fo2["fitted"]["S"] > 5)
+pg = N.make_darcy_gas(4000.0, 10.0, 60.0, 220.0, 0.70, 1490.0, 0.354, 2.0, 1e-4)
+pts = [(N.ipr_rate(pg, w), w) for w in (3600.0, 3000.0, 2200.0)]
+fg = N.fit_ipr(N.IPR_MODELS[5], 4000.0, pts,
+               darcy={"k": 10.0, "h": 60.0, "T_F": 220.0, "gas_sg": 0.70,
+                      "re": 1490.0, "rw": 0.354})
+check("Darcy gas calibration recovers S = 2 and D = 1e-4 from 3 tests",
+      abs(fg["fitted"]["S"] - 2.0) < 0.05 and abs(fg["fitted"]["D"] - 1e-4) < 5e-6,
+      f"S {fg['fitted']['S']:.3f}, D {fg['fitted']['D']:.2e}")
+check("Darcy gas Pwf(q) inverts q(Pwf)",
+      close(N.ipr_rate(pg, N.ipr_pwf(pg, 0.6 * pg["aof"])), 0.6 * pg["aof"], 1e-6))
+pb_ = N.calibrate_ipr(N.IPR_MODELS[3], 4000.0, 5000.0, 3000.0, n=0.8)
+pts = [(N.ipr_rate(pb_, w), w) for w in (3500.0, 2500.0, 1500.0)]
+fb = N.fit_ipr(N.IPR_MODELS[3], 4000.0, pts)
+check("Back-pressure multi-point fit recovers n = 0.8", abs(fb["fitted"]["n"] - 0.8) < 1e-6)
+_r = {}
+for m in N.CORRELATIONS:
+    rr = N.lift_curve(list(np.linspace(300, 5000, 6)), 500, 200, 80, 180,
+                      [(8000, 90)], 35, 0.75, 0.1, 2.0, 2.992, 6e-4, m)
+    _r[m] = [x["P_inlet_psia"] for x in rr]
+check(f"All {len(N.CORRELATIONS)} correlations converge on a vertical oil well",
+      all(np.all(np.isfinite(v)) for v in _r.values()))
+_ns = np.array(_r["No-slip homogeneous"])
+check("Oil-well slip correlations >= no-slip lower bound (vertical, low rate)",
+      all(_r[m][0] >= _ns[0] - 1.0 for m in N.CORRELATIONS if m != "Gray"), 
+      str({m[:10]: round(v[0]) for m, v in _r.items()}))
+hb = N.lift_curve([1000], 500, 200, 80, 180, [(8000, 90)], 35, 0.75, 0.1,
+                  2.0, 2.992, 6e-4, "Hagedorn & Brown")[0]
+check("Hagedorn-Brown holdup above no-slip (chart fits, not clamped)",
+      hb["H_L_avg"] > 0.45, f"H_L avg {hb['H_L_avg']:.2f}")
+common = dict(T_outlet_F=80.0, T_inlet_F=180.0, segments=[(8000.0, 90.0)],
+              api=35.0, gas_sg=0.75, salinity_wt_pct=2.0, D_in_inch=2.992,
+              rel_roughness=6e-4)
+truth = [dict(q=q_, thp=thp_, glr=500.0, wc=0.1) for q_, thp_ in ((1000, 250), (2500, 300), (4000, 400))]
+for t, pv in zip(truth, N._vlp_at_tests(truth, common, "Hagedorn & Brown", 1.10, 1.30)):
+    t["pwf"] = float(pv)
+tv = N.tune_vlp(truth, common, "Hagedorn & Brown")
+check("VLP tuning recovers gravity 1.10 / friction 1.30 multipliers",
+      abs(tv["hold_mult"] - 1.10) < 0.01 and abs(tv["fric_mult"] - 1.30) < 0.05
+      and tv["mape_after"] < 0.1,
+      f"{tv['hold_mult']:.3f} / {tv['fric_mult']:.3f}, MAPE {tv['mape_before']:.1f} -> {tv['mape_after']:.3f} %")
+rk = N.rank_correlations(truth, common)
+check("Correlation ranking puts the generating correlation's family on top",
+      rk[0]["mape"] <= min(r["mape"] for r in rk) and len(rk) == len(N.CORRELATIONS))
+
 # 10. Deployment stamp ------------------------------------------------------
 print("\n10. Deployment")
 import os, re
