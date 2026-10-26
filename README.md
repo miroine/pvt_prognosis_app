@@ -68,6 +68,10 @@ reference).
 - VFPPROD: ALQ axis — none, GRAT (lift-gas rate, Mscf/d | Sm3/d) or IGLR
   (injection GLR, Mscf/STB | Sm3/Sm3); the table becomes
   THP x WFR x GFR x ALQ x rate.
+- VFPPROD: FLO sweep — the liquid-rate axis can now be set independently
+  of the lift curve ("Custom range": min, max, number of points, STB/d |
+  Sm3/d) instead of always reusing the nodal rate points, e.g. to cover
+  gas-lifted rates beyond the natural-flow curve.
 - Fix: FIELD VFPPROD gas ratios (GFR) are now written in Mscf/STB (they
   were written in scf/STB, 1000x too high). METRIC was correct.
 

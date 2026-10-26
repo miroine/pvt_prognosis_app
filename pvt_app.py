@@ -269,7 +269,7 @@ with st.sidebar:
             "nd_pr", "nd_datum", "nd_grad", "nd_qtest", "nd_pwftest",
             "nd_ipr_pb", "nd_ipr_pb_d", "nd_dre", "nd_dh", "nd_drw", "nd_dD",
             "nd_gl_md", "nd_gl_q", "nd_gl_dpv", "nd_gl_pinj", "nd_gl_qmax",
-            "vfp_thp", "vfp_glr",
+            "vfp_thp", "vfp_glr", "vfp_qmin", "vfp_qmax",
         ]
         # Per-row widgets (separator stages, lab rows, region tables)
         _unit_dep_prefixes = (
@@ -9832,6 +9832,49 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                             _nd["method"]),
                         key="vfp_method")
                 with vc2:
+                    _q_unit = "STB/d" if unit_system == "Field" else "Sm³/d"
+                    _q_fac = 1.0 if unit_system == "Field" else 0.158987
+                    _lc_rates = list(_nd["rates_bbl_d"])
+                    st.caption(f"**FLO sweep** — liquid rates ({_q_unit})")
+                    vfp_rate_src = st.radio(
+                        "Rate axis",
+                        ["Lift-curve rates", "Custom range"],
+                        horizontal=True, key="vfp_rate_src",
+                        help="Lift-curve rates reuse the min/max/points "
+                             "from the nodal run above. Custom range lets "
+                             "you widen or refine the liquid-rate axis "
+                             "for the VFP (e.g. to cover gas-lifted rates "
+                             "beyond the natural-flow curve).")
+                    _q_floor = 1.0 if unit_system == "Field" else 0.1
+                    if vfp_rate_src == "Custom range":
+                        rc1, rc2, rc3 = st.columns(3)
+                        vfp_qmin_disp = rc1.number_input(
+                            f"Min ({_q_unit})",
+                            value=float(round(min(_lc_rates) * _q_fac, 1)),
+                            min_value=_q_floor, key="vfp_qmin",
+                            format="%.1f")
+                        vfp_qmax_disp = rc2.number_input(
+                            f"Max ({_q_unit})",
+                            value=float(round(max(_lc_rates) * _q_fac, 1)),
+                            min_value=_q_floor, key="vfp_qmax",
+                            format="%.1f")
+                        vfp_npts = rc3.number_input(
+                            "Points", value=len(_lc_rates),
+                            min_value=2, max_value=50, step=1,
+                            key="vfp_npts")
+                        if vfp_qmax_disp <= vfp_qmin_disp:
+                            st.warning("Max rate must exceed min rate — "
+                                       "falling back to lift-curve rates.")
+                            vfp_rates_bbl = _lc_rates
+                        else:
+                            vfp_rates_bbl = list(np.linspace(
+                                vfp_qmin_disp / _q_fac,
+                                vfp_qmax_disp / _q_fac, int(vfp_npts)))
+                    else:
+                        vfp_rates_bbl = _lc_rates
+                        st.caption(f"{len(_lc_rates)} rates, "
+                                   f"{min(_lc_rates)*_q_fac:,.1f} – "
+                                   f"{max(_lc_rates)*_q_fac:,.1f} {_q_unit}")
                     st.caption("**THP sweep** — outlet pressure values "
                                 f"({L['P']})")
                     _thp_default = ("100, 200, 400, 800"
@@ -9934,7 +9977,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                            f"{_nd['fric_mult']:.3f}) are applied when the VFP "
                            f"correlation is {_nd.get('method')}.")
             # Estimate eval count
-            n_rates = len(_nd["rates_bbl_d"])
+            n_rates = len(vfp_rates_bbl)
             n_eval_est = (len(thp_psia) * max(len(wct_vals), 1)
                            * max(len(glr_field), 1) * len(_alq_field) * n_rates)
             st.caption(f"Estimated {n_eval_est} nodal evaluations "
@@ -9942,7 +9985,10 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         f"{len(wct_vals)} WCT × "
                         f"{len(glr_field)} GLR × "
                         f"{len(_alq_field)} ALQ × "
-                        f"{n_rates} rates from the lift curve).")
+                        f"{n_rates} rates"
+                        + (" from the lift curve)."
+                           if vfp_rate_src == "Lift-curve rates"
+                           else " from the custom range)."))
             if n_eval_est > 2000:
                 st.warning("That's a lot of evaluations — this will "
                             "take a while.")
@@ -9959,9 +10005,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                                    text=f"Sweeping nodal cases... "
                                         f"{int(frac*100)}%")
                 try:
-                    # Express the lift-curve rates on the chosen FLO axis
+                    # Express the liquid rates on the chosen FLO axis
                     # (STB/d oil/water/liquid, or Mscf/d for gas).
-                    _base_q = list(_nd["rates_bbl_d"])
+                    _base_q = list(vfp_rates_bbl)
                     if vfp_flo == "OIL":
                         _flo_axis = [q * (1.0 - _nd["wct"]) for q in _base_q]
                     elif vfp_flo == "WAT":
