@@ -14,7 +14,7 @@ Black-oil CVD for WET GAS:
     * Bo_cond(P) / Bg(Pdew) (approximate).
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from correlations import OilCorrelations, GasCorrelations, WetGasCorrelations

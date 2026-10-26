@@ -51,7 +51,7 @@ limit, find a stable operating point, or compare lift options, not as
 the final design number.
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import math
 import numpy as np
@@ -865,9 +865,16 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                     api, gas_sg, water_cut_frac, salinity_wt_pct,
                     D_in_inch, rel_roughness, method,
                     n_seg_inner=10, sigma=30.0,
-                    hold_mult=1.0, fric_mult=1.0, pvt=None):
+                    hold_mult=1.0, fric_mult=1.0, pvt=None,
+                    gl_inj_mscf_d=0.0, gl_inj_md_ft=None, gl_gas_sg=None):
     """March from outlet (known P) to inlet, returning the full
     pressure profile.
+
+    Continuous gas lift: `gl_inj_mscf_d` of lift gas (specific gravity
+    `gl_gas_sg`, default = formation gas) enters the tubing at measured
+    depth `gl_inj_md_ft` (from the outlet). Above that point the free-gas
+    rate is formation gas + lift gas (free-gas properties from the mixed
+    gravity); below it, formation gas only.
 
     segments : list of (length_ft, inclination_deg) tuples ordered from
                OUTLET to INLET. For a vertical well being lifted, the
@@ -891,19 +898,38 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
     fric = [0.0]
     hydro = [0.0]
     total_len = sum(s[0] for s in segments)
+    gl_on = (gl_inj_mscf_d or 0.0) > 0 and gl_inj_md_ft is not None \
+        and 0.0 < gl_inj_md_ft < total_len
+    if gl_on:
+        # split the segment that contains the injection point
+        _segs, _c = [], 0.0
+        for L_, th_ in segments:
+            if _c < gl_inj_md_ft < _c + L_:
+                _segs += [(gl_inj_md_ft - _c, th_), (_c + L_ - gl_inj_md_ft, th_)]
+            else:
+                _segs.append((L_, th_))
+            _c += L_
+        segments = _segs
+        sg_lift = gas_sg if gl_gas_sg is None else gl_gas_sg
+    q_gas_formation = q_gas_mscf_d
     cum = 0.0
     for seg_len, theta in segments:
         dl = seg_len / n_seg_inner
+        above_inj = gl_on and (cum + 0.5 * seg_len) < gl_inj_md_ft
+        q_gas_seg = q_gas_formation + (gl_inj_mscf_d if above_inj else 0.0)
+        sg_free = ((q_gas_formation * gas_sg + gl_inj_mscf_d * sg_lift)
+                   / max(q_gas_seg, 1e-12)) if above_inj else gas_sg
         for _ in range(n_seg_inner):
             cum += dl
             # Linear T interp from outlet to inlet over total length
             frac = cum / total_len if total_len > 0 else 0.0
             T_here = T_outlet_F + (T_inlet_F - T_outlet_F) * frac
-            def _grad(P_here):
-                # Properties at current P, T
-                Z = _gas_z_simple(P_here, T_here, gas_sg)
-                mu_g = _gas_viscosity_lee(P_here, T_here, gas_sg, Z)
-                rho_g = _gas_density_at(P_here, T_here, gas_sg, Z)
+            def _grad(P_here, q_gas_mscf_d=q_gas_seg, sg_free=sg_free):
+                # Properties at current P, T (free gas: lift + formation
+                # gas mixture above the injection point)
+                Z = _gas_z_simple(P_here, T_here, sg_free)
+                mu_g = _gas_viscosity_lee(P_here, T_here, sg_free, Z)
+                rho_g = _gas_density_at(P_here, T_here, sg_free, Z)
                 # Solution GOR (Standing-like; very simple screening)
                 # Phase split. Only the gas NOT dissolved in the oil is free
                 # gas; water carries no dissolved gas and has Bw ~ 1.
@@ -1002,14 +1028,19 @@ def march_pressure(P_outlet_psia, T_outlet_F, T_inlet_F, segments,
             "pattern": patterns,
             "dpdL_fric": np.array(fric),
             "dpdL_hydro": np.array(hydro),
-            "P_inlet_psia": Ps[-1]}
+            "P_inlet_psia": Ps[-1],
+            "gl_inj_md_ft": gl_inj_md_ft if gl_on else None,
+            "P_inj_psia": (float(np.interp(gl_inj_md_ft, stations, Ps))
+                           if gl_on else None)}
 
 
 def lift_curve(rates_bbl_d, GLR_scf_stb,
                 P_outlet_psia, T_outlet_F, T_inlet_F, segments,
                 api, gas_sg, water_cut_frac, salinity_wt_pct,
                 D_in_inch, rel_roughness, method,
-                hold_mult=1.0, fric_mult=1.0, pvt=None):
+                hold_mult=1.0, fric_mult=1.0, pvt=None,
+                gl_inj_mscf_d=0.0, gl_inj_md_ft=None, gl_gas_sg=None,
+                gl_iglr_scf_stb=None):
     """Build a Tubing/Flowline Performance Curve.
 
     Returns a list of dicts, one per rate:
@@ -1027,7 +1058,11 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                 salinity_wt_pct=salinity_wt_pct,
                 D_in_inch=D_in_inch, rel_roughness=rel_roughness,
                 method=method, hold_mult=hold_mult, fric_mult=fric_mult,
-                pvt=pvt)
+                pvt=pvt,
+                gl_inj_mscf_d=(q * gl_iglr_scf_stb / 1000.0
+                               if gl_iglr_scf_stb is not None
+                               else gl_inj_mscf_d),
+                gl_inj_md_ft=gl_inj_md_ft, gl_gas_sg=gl_gas_sg)
         except Exception as e:
             out.append({"q_liq_bbl_d": q, "q_gas_mscf_d": q_gas,
                         "P_inlet_psia": np.nan,
@@ -1046,7 +1081,8 @@ def lift_curve(rates_bbl_d, GLR_scf_stb,
                     "P_inlet_psia": r["P_inlet_psia"],
                     "dominant_pattern": dominant,
                     "H_L_avg": float(np.nanmean(r["H_L"])),
-                    "dP_total_psi": r["P_inlet_psia"] - P_outlet_psia})
+                    "dP_total_psi": r["P_inlet_psia"] - P_outlet_psia,
+                    "P_inj_psia": r.get("P_inj_psia")})
     return out
 
 
@@ -1308,7 +1344,10 @@ def _vlp_at_tests(tests, common, method, hold_mult=1.0, fric_mult=1.0):
                 common["salinity_wt_pct"], common["D_in_inch"],
                 common["rel_roughness"], method,
                 hold_mult=hold_mult, fric_mult=fric_mult,
-                pvt=common.get("pvt"))
+                pvt=common.get("pvt"),
+                gl_inj_mscf_d=t.get("q_inj", common.get("gl_inj_mscf_d", 0.0)),
+                gl_inj_md_ft=common.get("gl_inj_md_ft"),
+                gl_gas_sg=common.get("gl_gas_sg"))
             out.append(float(r["P_inlet_psia"]))
         except Exception:
             out.append(float("nan"))
@@ -1418,3 +1457,87 @@ def well_trajectory(segments):
         z.append(z[-1] + L * np.sin(r))       # TVD increases downward
         md.append(md[-1] + L)
     return np.array(x), np.array(z), np.array(md)
+
+
+# ======================================================================
+# Continuous gas lift: injection-pressure check and performance curve
+# ======================================================================
+def gas_column_pressure(P_top_psia, tvd_ft, gas_sg, T_top_F, T_bot_F,
+                        n_steps=40):
+    """Static gas-column pressure at depth tvd_ft below a surface pressure
+    P_top (casing annulus, no flow): dP/dz = rho_g g, rho_g from the
+    real-gas law with the Brill-Beggs Z. Returns psia."""
+    P = float(P_top_psia)
+    if tvd_ft <= 0:
+        return P
+    dz = tvd_ft / n_steps
+    for i in range(n_steps):
+        T = T_top_F + (T_bot_F - T_top_F) * (i + 0.5) / n_steps
+        # midpoint (RK2) step
+        Pm = P + 0.5 * dz * _gas_density_at(P, T, gas_sg,
+                                            _gas_z_simple(P, T, gas_sg)) / PSI_TO_PSF
+        rho = _gas_density_at(Pm, T, gas_sg, _gas_z_simple(Pm, T, gas_sg))
+        P += rho * dz / PSI_TO_PSF
+    return P
+
+
+def required_surface_injection_pressure(P_tubing_at_valve_psia, valve_tvd_ft,
+                                        gas_sg, T_surf_F, T_valve_F,
+                                        dP_valve_psi=100.0):
+    """Casing-head pressure needed so that the annulus gas at the valve
+    exceeds the tubing pressure by dP_valve. Solved by bisection on the
+    static gas column."""
+    target = P_tubing_at_valve_psia + dP_valve_psi
+    lo, hi = 14.7, target
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if gas_column_pressure(mid, valve_tvd_ft, gas_sg, T_surf_F,
+                               T_valve_F) < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def point_of_balance(traverse, md_to_tvd, P_inj_surf_psia, gas_sg, T_surf_F,
+                     T_bot_F, dP_valve_psi=100.0):
+    """Deepest MD where the annulus gas pressure (from the available
+    surface injection pressure) minus the valve differential still
+    exceeds the tubing pressure of the given traverse. None if the
+    injection pressure is insufficient even at the top."""
+    st_ = np.asarray(traverse["stations_ft"])
+    Pt = np.asarray(traverse["P_psia"])
+    tvd_end = max(md_to_tvd(st_[-1]), 1.0)
+    best = None
+    for md, pt in zip(st_, Pt):
+        tvd = md_to_tvd(md)
+        Tz = T_surf_F + (T_bot_F - T_surf_F) * min(max(tvd / tvd_end, 0), 1)
+        pc = gas_column_pressure(P_inj_surf_psia, tvd, gas_sg, T_surf_F, Tz,
+                                 n_steps=20)
+        if pc - dP_valve_psi >= pt:
+            best = float(md)
+        else:
+            break
+    return best
+
+
+def gas_lift_performance(inj_rates_mscf_d, rates_bbl_d, ipr_pwf_liq, lc_kwargs):
+    """Gas-lift performance curve: for each lift-gas rate build the VLP
+    (lift_curve with lc_kwargs) and intersect it with the IPR (Pwf as a
+    function of LIQUID rate). Returns rows {q_inj, q_liq, pwf, stable}
+    (q_liq None when the well does not flow)."""
+    out = []
+    for qi in inj_rates_mscf_d:
+        kw = dict(lc_kwargs, gl_inj_mscf_d=float(qi))
+        res = lift_curve(rates_bbl_d, **kw)
+        qv = [r["q_liq_bbl_d"] for r in res if r["P_inlet_psia"] == r["P_inlet_psia"]]
+        pv = [r["P_inlet_psia"] for r in res if r["P_inlet_psia"] == r["P_inlet_psia"]]
+        ops = [o for o in operating_points(qv, pv, ipr_pwf_liq) if o["stable"]]
+        if ops:
+            o = max(ops, key=lambda x: x["q"])
+            out.append({"q_inj": float(qi), "q_liq": o["q"], "pwf": o["pwf"],
+                        "stable": True})
+        else:
+            out.append({"q_inj": float(qi), "q_liq": None, "pwf": None,
+                        "stable": False})
+    return out

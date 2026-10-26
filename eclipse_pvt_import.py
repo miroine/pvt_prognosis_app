@@ -25,7 +25,7 @@ tubing with the ideal-gas temperature ratio, everything else is taken at
 table conditions.
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import re
 import numpy as np

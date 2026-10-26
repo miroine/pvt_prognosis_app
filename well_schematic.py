@@ -13,7 +13,7 @@ Pure Python builds a JSON spec; the HTML page renders it with plain JS +
 SVG (no CDN, no extra package), shown with streamlit.components.v1.html.
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import json
 import numpy as np
@@ -286,6 +286,26 @@ if (S.packer_md>0 && S.packer_md<tb){
   }
 }
 
+// ---------- gas-lift valve (side-pocket mandrel) ----------
+const gGL = grp("gl");
+if (S.gl && S.gl.md > 0 && S.gl.md < tb){
+  const r0 = S.tubing.od*k/2;
+  const a1=at(S.gl.md-14/s, -r0), a2=at(S.gl.md-14/s, -(r0+7)), a3=at(S.gl.md+14/s, -(r0+7)), a4=at(S.gl.md+14/s, -r0);
+  el("polygon",{points:[a1,a2,a3,a4].map(p=>p[0]+","+p[1]).join(" "),fill:"#2a9d8f",stroke:"#1d6f65","stroke-width":1},gGL);
+  // gas bubbles entering the tubing above the valve
+  for (let j=0;j<5;j++){
+    const b=at(S.gl.md-(6+j*9)/s, -r0*0.35*((j%2)?1:-1));
+    el("circle",{cx:b[0],cy:b[1],r:2.2,fill:"#ffffff",stroke:"#2a9d8f","stroke-width":1},gGL);
+  }
+  // annulus gas arrows down to the valve
+  for (let j=1;j<=3;j++){
+    const m = S.gl.md*j/4;
+    const p0=at(m-10/s, -(r0+9)), p1=at(m+10/s, -(r0+9));
+    el("line",{x1:p0[0],y1:p0[1],x2:p1[0],y2:p1[1],stroke:"#2a9d8f","stroke-width":2},gGL);
+    el("circle",{cx:p1[0],cy:p1[1],r:2.4,fill:"#2a9d8f"},gGL);
+  }
+}
+
 // ---------- wellhead & Christmas tree ----------
 const gTree = grp("tree");
 const wx = X(0), wy = Y(0);
@@ -306,6 +326,13 @@ el("rect",{x:wx+tw/2+14,y:wy-53,width:9,height:19,fill:"#7b241c",rx:1},gTree);
 el("polygon",{points:`${wx+tw/2+52},${wy-52} ${wx+tw/2+66},${wy-43.5} ${wx+tw/2+52},${wy-35}`,fill:"#243746"},gTree);
 el("text",{x:wx+tw/2+70,y:wy-48,class:"lblb"},gTree).textContent="Outlet node";
 el("text",{x:wx+tw/2+70,y:wy-35,class:"lbl"},gTree).textContent=S.outlet_txt;
+if (S.gl && S.gl.md > 0){
+  // lift-gas inlet on the casing (annulus) side of the wellhead
+  el("rect",{x:wx-tw/2-52,y:wy-11,width:46,height:7,fill:"#2a9d8f"},gTree);
+  el("polygon",{points:`${wx-tw/2-6},${wy-14} ${wx-tw/2+4},${wy-7.5} ${wx-tw/2-6},${wy-1}`,fill:"#1d6f65"},gTree);
+  el("text",{x:wx-tw/2-56,y:wy-14,class:"lblb","text-anchor":"end",fill:"#1d6f65"},gTree).textContent="Lift gas in";
+  if (S.gl.txt) el("text",{x:wx-tw/2-56,y:wy-1,class:"lbl","text-anchor":"end"},gTree).textContent=S.gl.txt;
+}
 
 // ---------- datum, node, labels ----------
 const gLbl = grp("lbls");
@@ -323,6 +350,7 @@ strings.forEach(c=>notes.push({md:c.shoe, off:c.od*k/2+8, t:`${c.label} ${c.name
 strings.filter(c=>c.top>0.5).forEach(c=>notes.push({md:c.top, off:c.od*k/2+6, t:`Liner hanger (${c.label})`, t2:`MD ${c.top.toFixed(0)} ${U}`}));
 if (S.packer_md>0) notes.push({md:S.packer_md, off:S.tubing.od*k/2+12, t:"Production packer", t2:`MD ${S.packer_md.toFixed(0)} ${U}`});
 notes.push({md:tb, off:S.tubing.od*k/2+4, t:`${S.tubing.label} tubing shoe`, t2:`MD ${tb.toFixed(0)} ${U}`});
+if (S.gl && S.gl.md > 0 && S.gl.md < tb) notes.push({md:S.gl.md, off:S.tubing.od*k/2+8, t:"Gas-lift valve (operating)", t2:`MD ${S.gl.md.toFixed(0)} ${U}`});
 notes.push({md:(S.perf[0]+S.perf[1])/2, off:prodOD*k/2+18, t:"Perforations", t2:`${S.perf[0].toFixed(0)}–${S.perf[1].toFixed(0)} ${U} MD`});
 notes.push({md:S.node.md, off:9, t:"Solution node = reference depth", t2:`MD ${S.node.md.toFixed(0)} / TVD ${S.node.tvd.toFixed(0)} ${U}`, hot:true});
 notes.forEach(n=>{const p=at(n.md, n.off); n.ax=p[0]; n.ay=p[1];});
@@ -369,6 +397,7 @@ sv.addEventListener("mousemove", ev=>{
   if (S.P_label && P!==null && md<=S.node.md) h += `<br><span style="opacity:.75">${S.P_label}</span>`;
   h += `<br><b>Casing</b> ${here}`;
   if (md <= tb) h += `<br><b>Tubing</b> ${S.tubing.label} (ID ${S.tubing.id.toFixed(3)} in)`;
+  if (S.gl && S.gl.md > 0) h += md < S.gl.md ? `<br><b style="color:#7fd1c7">Above gas-lift valve</b> (formation + lift gas)` : ``;
   if (md >= S.perf[0] && md <= S.perf[1]) h += `<br><b style="color:#ff8c69">Perforated interval</b>`;
   tip.innerHTML = h; tip.style.display="block";
   let tx = ev.clientX-r.left+14, ty = ev.clientY-r.top+12;

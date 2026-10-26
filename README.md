@@ -49,6 +49,28 @@ reference).
 
 ## Change history
 
+## v1.4.7 — Gas lift and ALQ in the lift curves / VFP
+
+- Lift curves: "Artificial lift" section — natural flow or continuous gas
+  lift: operating-valve depth (MD), lift-gas rate (the ALQ), lift-gas
+  gravity, valve dP, available casing-head injection pressure.
+- March: above the valve the free gas is formation + lift gas (mixed
+  gravity); the segment is split exactly at the valve.
+- Gas-lift results: tubing pressure at the valve, required casing-head
+  injection pressure (static annulus gas column + valve dP), check against
+  the available pressure, deepest feasible injection point (point of
+  balance), and the gas-lift performance curve (IPR/VLP liquid rate vs
+  lift-gas rate, maximum marked, CSV). Traverse shows the valve and the
+  annulus gas-pressure line; the schematic draws the valve, the lift-gas
+  inlet and annulus gas.
+- Well tests take an optional lift-gas rate per test (calibration with
+  gas lift on).
+- VFPPROD: ALQ axis — none, GRAT (lift-gas rate, Mscf/d | Sm3/d) or IGLR
+  (injection GLR, Mscf/STB | Sm3/Sm3); the table becomes
+  THP x WFR x GFR x ALQ x rate.
+- Fix: FIELD VFPPROD gas ratios (GFR) are now written in Mscf/STB (they
+  were written in scf/STB, 1000x too high). METRIC was correct.
+
 ## v1.4.6 — Imported ECLIPSE PVT for the nodal analysis
 
 - New `eclipse_pvt_import.py`: reads PVTO, PVDO, PVTG, PVDG, PVTW,

@@ -19,7 +19,7 @@ This is intentionally simple — for proper coefficient regression, fit the
 EOS instead via eos_tuning.py.
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from scipy.optimize import minimize

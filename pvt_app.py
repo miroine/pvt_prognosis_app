@@ -14,7 +14,7 @@ import numpy as np
 # deep inside a page with a cryptic AttributeError/ImportError. The stamp
 # is read from the file TEXT, so it works even if a stale module would
 # itself fail to import.
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 import os as _os, re as _re
 _here = _os.path.dirname(_os.path.abspath(__file__))
 _REQUIRED = ['components', 'composition_guess', 'composition_pvt', 'correlation_experiments', 'correlation_tuning', 'correlations', 'documentation', 'e300_export', 'eclipse_export', 'eclipse_pvt_import', 'eclipse_qc', 'eos_pr', 'eos_tuning', 'experiments', 'export_utils', 'fluid_registry', 'hydrate', 'lbc', 'mascot', 'monte_carlo', 'multi_region', 'multi_sim_export', 'nodal', 'phase_envelope', 'presets', 'rock_comp', 'separator', 'solids_risk', 'theme', 'ui_helpers', 'units', 'validators', 'vfp_export', 'well_schematic']
@@ -268,6 +268,7 @@ with st.sidebar:
             "nd_glr", "nd_qmin", "nd_qmax", "nd_traverse_idx",
             "nd_pr", "nd_datum", "nd_grad", "nd_qtest", "nd_pwftest",
             "nd_ipr_pb", "nd_ipr_pb_d", "nd_dre", "nd_dh", "nd_drw", "nd_dD",
+            "nd_gl_md", "nd_gl_q", "nd_gl_dpv", "nd_gl_pinj", "nd_gl_qmax",
             "vfp_thp", "vfp_glr",
         ]
         # Per-row widgets (separator stages, lab rows, region tables)
@@ -7873,7 +7874,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
     def _nd_completion_and_schematic(segments, unit_system, node_md_ft,
                                      node_tvd_ft, ID_in, nd_fluid,
                                      outlet_txt, T_top, T_bot, T_unit,
-                                     P_unit, datum_ft, sig):
+                                     P_unit, datum_ft, sig, gl=None):
         """Completion inputs (drawing only) + the JS schematic HTML."""
         _f = unit_system == "Field"
         lf, lu = (1.0, "ft") if _f else (0.3048, "m")
@@ -7976,6 +7977,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             "T_top": T_top, "T_bot": T_bot, "T_unit": T_unit,
             "P_profile": prof["profile"] if prof else None,
             "P_label": prof["label"] if prof else None, "P_unit": P_unit,
+            "gl": gl,
             "title": (f"Well schematic — {nd_fluid}, "
                       f"{'offshore' if wd > 0 else 'onshore'}"),
         }
@@ -8230,6 +8232,59 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
         nd_npts = st.slider("Number of rate points", 5, 20, 10,
                              key="nd_npts")
 
+        # ---- Artificial lift: continuous gas lift ----
+        nd_gl = None
+        if nd_geom_kind != "Horizontal flowline":
+            st.markdown("### Artificial lift")
+            _al = st.radio("Lift method", ["Natural flow",
+                                           "Continuous gas lift"],
+                           horizontal=True, key="nd_al_kind")
+            if _al == "Continuous gas lift":
+                _f = unit_system == "Field"
+                g1, g2 = st.columns(2)
+                with g1:
+                    _gl_md = st.number_input(
+                        f"Injection (operating valve) depth, MD ({nd_len_unit})",
+                        value=float(round(0.8 * nd_len_default)), min_value=1.0,
+                        key="nd_gl_md",
+                        help="Measured depth of the operating gas-lift valve "
+                             "below the outlet (wellhead).")
+                    _gl_q = st.number_input(
+                        "Lift-gas rate (ALQ) "
+                        + ("(Mscf/d)" if _f else "(Sm³/d)"),
+                        value=(1000.0 if _f else 28317.0), min_value=0.0,
+                        key="nd_gl_q",
+                        help="Injected gas rate at standard conditions — the "
+                             "ECLIPSE VFP 'GRAT' artificial-lift quantity.")
+                    _gl_dpv = st.number_input(
+                        f"Valve ΔP, casing − tubing ({L['P']})",
+                        value=(100.0 if _f else 7.0), min_value=0.0,
+                        key="nd_gl_dpv")
+                with g2:
+                    _gl_sg = st.number_input(
+                        "Lift-gas specific gravity (air = 1)",
+                        value=0.65, min_value=0.55, max_value=1.2,
+                        key="nd_gl_sg")
+                    _gl_pav = st.number_input(
+                        f"Available injection pressure at the casing head "
+                        f"({L['P']}, 0 = not checked)",
+                        value=(1800.0 if _f else 125.0), min_value=0.0,
+                        key="nd_gl_pinj")
+                    _gl_qmax = st.number_input(
+                        "Max lift-gas rate for the performance curve "
+                        + ("(Mscf/d)" if _f else "(Sm³/d)"),
+                        value=(4000.0 if _f else 113000.0), min_value=1.0,
+                        key="nd_gl_qmax")
+                nd_gl = {
+                    "md_ft": _gl_md if nd_len_unit == "ft" else _gl_md / 0.3048,
+                    "q_mscf_d": _gl_q if _f else _gl_q / 28.3168,
+                    "sg": _gl_sg,
+                    "dp_valve_psi": _gl_dpv if _f else _gl_dpv * 14.50377,
+                    "p_avail_psia": (U.to_field_P(_gl_pav, unit_system)
+                                     if _gl_pav > 0 else None),
+                    "qmax_mscf_d": _gl_qmax if _f else _gl_qmax / 28.3168,
+                }
+
         # ---- Reservoir inflow (IPR) at the solution node ----
         nd_ipr = None
         nd_tests, nd_fit_ipr_tests = [], False
@@ -8397,7 +8452,8 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             st.caption("Measured rate, wellhead pressure and flowing "
                        "pressure at the solution node (gauge pressure "
                        "corrected to the node depth). Blank GLR / WC use "
-                       "the case values. The rows below are an EXAMPLE — "
+                       "the case values (blank lift gas = the case lift-gas "
+                       "rate). The rows below are an EXAMPLE — "
                        "replace them with your tests.")
             _qu = "STB/d" if unit_system == "Field" else "Sm³/d"
             _gu = "scf/STB" if unit_system == "Field" else "Sm³/Sm³"
@@ -8409,7 +8465,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                 "Test": lab, f"Liquid rate ({_qu})": round(q_ * _qf_in, 1),
                 f"THP ({L['P']})": round(U.to_user_P(thp_, unit_system), 2),
                 f"Pwf at node ({L['P']})": round(U.to_user_P(pw_, unit_system), 2),
-                f"GLR ({_gu})": None, "WC (frac)": None}
+                f"GLR ({_gu})": None, "WC (frac)": None,
+                **({f"Lift gas ({'Mscf/d' if unit_system == 'Field' else 'Sm³/d'})": None}
+                   if nd_gl is not None else {})}
                 for lab, q_, thp_, pw_ in _ex])
             try:
                 _tdf = st.data_editor(_tdf0, key=f"nd_tests_{unit_system}",
@@ -8444,9 +8502,19 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         raise ValueError
                 except (TypeError, ValueError):
                     wc_ = nd_wc
-                nd_tests.append({"label": str(r.get("Test", "")), "q": q_,
-                                 "thp": thp_, "pwf": pw_, "glr": glr_,
-                                 "wc": min(max(wc_, 0.0), 1.0)})
+                _t = {"label": str(r.get("Test", "")), "q": q_,
+                      "thp": thp_, "pwf": pw_, "glr": glr_,
+                      "wc": min(max(wc_, 0.0), 1.0)}
+                if nd_gl is not None:
+                    _lg = r.get(f"Lift gas ({'Mscf/d' if unit_system == 'Field' else 'Sm³/d'})")
+                    try:
+                        _lg = float(_lg) * (1.0 if unit_system == "Field" else 1 / 28.3168)
+                        if _lg != _lg:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        _lg = nd_gl["q_mscf_d"]
+                    _t["q_inj"] = max(_lg, 0.0)
+                nd_tests.append(_t)
             nd_fit_ipr_tests = False
             if nd_ipr is not None:
                 nd_fit_ipr_tests = st.checkbox(
@@ -8694,6 +8762,16 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             # ---- Well schematic, solution node and assumptions ----
             _tx, _tz, _tmd = ND.well_trajectory(segments)
             node_md_ft, node_tvd_ft = float(_tmd[-1]), float(_tz[-1])
+            # Gas-lift injection point (must lie inside the string)
+            _gl_kw = {}
+            if nd_gl is not None and not (nd_geom_kind == "Horizontal flowline"):
+                _gl_md_use = min(nd_gl["md_ft"], 0.995 * node_md_ft)
+                if nd_gl["md_ft"] >= node_md_ft:
+                    st.warning("Gas-lift valve depth is at or below the "
+                               "solution node — moved just above it.")
+                _gl_kw = dict(gl_inj_mscf_d=nd_gl["q_mscf_d"],
+                              gl_inj_md_ft=_gl_md_use, gl_gas_sg=nd_gl["sg"])
+                _gl_tvd_ft = float(np.interp(_gl_md_use, _tmd, _tz))
             _lf = 1.0 if unit_system == "Field" else 0.3048
             _lu = "ft" if unit_system == "Field" else "m"
             _is_flowline = nd_geom_kind == "Horizontal flowline"
@@ -8794,7 +8872,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     return ND.ipr_pwf(nd_ipr_p, q_liq * nd_GLR / 1000.0)
                 return ND.ipr_pwf(nd_ipr_p, q_liq)
 
-            _nd_sig = repr((nd_pvt_sig, tuple(segments), nd_Pout_psia, nd_Tout_F,
+            _nd_sig = repr((nd_pvt_sig, repr(_gl_kw), tuple(segments), nd_Pout_psia, nd_Tout_F,
                             nd_Tin_F, nd_GLR, nd_api, nd_gas_sg, nd_wc,
                             nd_sal, ID_in, nd_roughness, chosen, unit_system,
                             repr(sorted((nd_ipr or {}).items())),
@@ -8821,7 +8899,12 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         T_unit=L['T'], P_unit=L['P'],
                         datum_ft=(nd_ipr["datum_ft"] if nd_ipr is not None
                                   else None),
-                        sig=_nd_sig)
+                        sig=_nd_sig,
+                        gl=({"md": _gl_kw["gl_inj_md_ft"] * _lf,
+                             "txt": (f"{_gl_kw['gl_inj_mscf_d']:,.0f} Mscf/d"
+                                     if unit_system == "Field" else
+                                     f"{_gl_kw['gl_inj_mscf_d'] * 28.3168:,.0f} Sm³/d")}
+                            if _gl_kw else None))
             with sc1:
               if nd_schem_html is not None:
                 _render_html_component(nd_schem_html, height=800)
@@ -8991,6 +9074,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                               segments=segments, api=nd_api,
                               gas_sg=nd_gas_sg, salinity_wt_pct=nd_sal,
                               D_in_inch=ID_in, rel_roughness=nd_roughness)
+            _nd_common.update(_gl_kw)
             _cal_sig = repr((sorted((k, repr(v)) for k, v in _nd_common.items()),
                              repr(nd_tests), nd_pvt_sig))
             _nd_common["pvt"] = nd_pvt
@@ -9141,7 +9225,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         segments, nd_api, nd_gas_sg, nd_wc, nd_sal,
                         ID_in, nd_roughness, chosen,
                         hold_mult=nd_hold_mult, fric_mult=nd_fric_mult,
-                        pvt=nd_pvt)
+                        pvt=nd_pvt, **_gl_kw)
 
                 # ---- Results table ----
                 st.markdown("### Pressure Drop / Lift Curve Table")
@@ -9181,6 +9265,11 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                 fig = go.Figure()
                 _tuned_lbl = (f", tuned ×{nd_hold_mult:.2f}/×{nd_fric_mult:.2f}"
                               if (nd_hold_mult, nd_fric_mult) != (1.0, 1.0) else "")
+                if _gl_kw:
+                    _tuned_lbl += (f", gas lift "
+                                   + (f"{_gl_kw['gl_inj_mscf_d']:,.0f} Mscf/d"
+                                      if unit_system == "Field" else
+                                      f"{_gl_kw['gl_inj_mscf_d'] * 28.3168:,.0f} Sm³/d"))
                 fig.add_trace(go.Scatter(
                     x=qs_disp, y=Ps_user, mode="lines+markers",
                     name=f"VLP — {chosen}{_tuned_lbl} (THP {nd_Pout_user:.1f} {L['P']})",
@@ -9194,7 +9283,8 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         _rc = ND.lift_curve(rates, nd_GLR, nd_Pout_psia,
                                             nd_Tout_F, nd_Tin_F, segments,
                                             nd_api, nd_gas_sg, nd_wc, nd_sal,
-                                            ID_in, nd_roughness, _cm, pvt=nd_pvt)
+                                            ID_in, nd_roughness, _cm, pvt=nd_pvt,
+                                            **_gl_kw)
                     except Exception:
                         continue
                     fig.add_trace(go.Scatter(
@@ -9304,7 +9394,8 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                                 nd_gas_sg, nd_wc, nd_sal, ID_in,
                                 nd_roughness, chosen,
                                 hold_mult=nd_hold_mult,
-                                fric_mult=nd_fric_mult, pvt=nd_pvt)
+                                fric_mult=nd_fric_mult, pvt=nd_pvt,
+                                **_gl_kw)
                             _new = {"sig": _nd_sig, "label": _slbl,
                                     "profile": [[float(m * _lf),
                                                  float(U.to_user_P(p, unit_system))]
@@ -9403,6 +9494,160 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                         file_name="IPR_VLP_node.csv", mime="text/csv",
                         key="nd_ipr_vlp_csv")
 
+                # ---- Gas lift: injection check + performance curve ----
+                if _gl_kw:
+                    st.markdown("### 🛢️ Gas lift")
+                    _md2tvd = lambda m: float(np.interp(m, _tmd, _tz))
+                    _gq_u = "Mscf/d" if unit_system == "Field" else "Sm³/d"
+                    _gq = (lambda v: v) if unit_system == "Field" else (lambda v: v * 28.3168)
+                    _dpu = (lambda v: v) if unit_system == "Field" else (lambda v: v / 14.50377)
+                    _st_ops_gl = [o for o in nd_ops if o["stable"]]
+                    if _st_ops_gl:
+                        _q_gl = max(_st_ops_gl, key=lambda o: o["q"])["q"]
+                        _gl_basis = "operating point"
+                    elif valid:
+                        _q_gl = q_min / _qf
+                        _gl_basis = "VLP-minimum rate (no IPR operating point)"
+                    else:
+                        _q_gl = None
+                    if _q_gl:
+                        _trg = ND.march_pressure(
+                            nd_Pout_psia, nd_Tout_F, nd_Tin_F, segments,
+                            _q_gl, _q_gl * nd_GLR / 1000.0, nd_api,
+                            nd_gas_sg, nd_wc, nd_sal, ID_in, nd_roughness,
+                            chosen, hold_mult=nd_hold_mult,
+                            fric_mult=nd_fric_mult, pvt=nd_pvt, **_gl_kw)
+                        _Pv = _trg["P_inj_psia"]
+                        _Tv = float(np.interp(_gl_kw["gl_inj_md_ft"],
+                                              _trg["stations_ft"], _trg["T_F"]))
+                        _Preq = ND.required_surface_injection_pressure(
+                            _Pv, _gl_tvd_ft, nd_gl["sg"], nd_Tout_F, _Tv,
+                            nd_gl["dp_valve_psi"])
+                        k_ = st.columns(4)
+                        k_[0].metric("Valve depth",
+                                     f"{_gl_kw['gl_inj_md_ft']*_lf:,.0f} {_lu} MD",
+                                     f"TVD {_gl_tvd_ft*_lf:,.0f} {_lu}", delta_color="off")
+                        k_[1].metric("Lift gas (ALQ)",
+                                     f"{_gq(nd_gl['q_mscf_d']):,.0f} {_gq_u}",
+                                     f"total GLR {U.to_user_Rs(nd_GLR + nd_gl['q_mscf_d'] * 1000 / max(_q_gl, 1e-9), unit_system):,.0f} {L['Rs']}",
+                                     delta_color="off")
+                        k_[2].metric("Tubing P at valve",
+                                     f"{U.to_user_P(_Pv, unit_system):.1f} {L['P']}")
+                        k_[3].metric("Required casing-head P",
+                                     f"{U.to_user_P(_Preq, unit_system):.1f} {L['P']}",
+                                     f"valve ΔP {_dpu(nd_gl['dp_valve_psi']):.1f}",
+                                     delta_color="off")
+                        st.caption(f"Evaluated at the {_gl_basis}: "
+                                   f"{_q_gl * _qf:,.0f} {q_lbl}. Static gas "
+                                   f"column in the annulus (gravity "
+                                   f"{nd_gl['sg']:.3f}), linear temperature.")
+                        if nd_gl["p_avail_psia"]:
+                            _pob = ND.point_of_balance(
+                                _trg, _md2tvd, nd_gl["p_avail_psia"],
+                                nd_gl["sg"], nd_Tout_F, nd_Tin_F,
+                                nd_gl["dp_valve_psi"])
+                            if _Preq <= nd_gl["p_avail_psia"]:
+                                st.success(
+                                    f"✅ Available injection pressure "
+                                    f"{U.to_user_P(nd_gl['p_avail_psia'], unit_system):.1f} "
+                                    f"{L['P']} is enough for injection at the valve "
+                                    f"(needs {U.to_user_P(_Preq, unit_system):.1f}).")
+                            else:
+                                st.error(
+                                    f"❌ Available injection pressure "
+                                    f"{U.to_user_P(nd_gl['p_avail_psia'], unit_system):.1f} "
+                                    f"{L['P']} is below the "
+                                    f"{U.to_user_P(_Preq, unit_system):.1f} {L['P']} "
+                                    f"needed at this valve depth — the gas cannot "
+                                    f"enter there.")
+                            if _pob is not None:
+                                st.caption(
+                                    f"Deepest feasible injection point (point of "
+                                    f"balance − valve ΔP) for this rate: "
+                                    f"MD {_pob * _lf:,.0f} {_lu} "
+                                    f"(TVD {_md2tvd(_pob) * _lf:,.0f} {_lu}).")
+                            else:
+                                st.caption("The available injection pressure "
+                                           "does not reach the tubing pressure "
+                                           "at any depth for this rate.")
+                    # Gas-lift performance curve (needs the IPR)
+                    if nd_ipr_p is not None:
+                        _qi = list(np.linspace(0.0, nd_gl["qmax_mscf_d"], 11))
+                        if nd_gl["q_mscf_d"] not in _qi:
+                            _qi = sorted(_qi + [nd_gl["q_mscf_d"]])
+                        with st.spinner("Gas-lift performance curve..."):
+                            _glpc = ND.gas_lift_performance(
+                                _qi, rates, _ipr_pwf_liq,
+                                dict(GLR_scf_stb=nd_GLR,
+                                     P_outlet_psia=nd_Pout_psia,
+                                     T_outlet_F=nd_Tout_F, T_inlet_F=nd_Tin_F,
+                                     segments=segments, api=nd_api,
+                                     gas_sg=nd_gas_sg, water_cut_frac=nd_wc,
+                                     salinity_wt_pct=nd_sal, D_in_inch=ID_in,
+                                     rel_roughness=nd_roughness, method=chosen,
+                                     hold_mult=nd_hold_mult,
+                                     fric_mult=nd_fric_mult, pvt=nd_pvt,
+                                     gl_inj_md_ft=_gl_kw["gl_inj_md_ft"],
+                                     gl_gas_sg=_gl_kw["gl_gas_sg"]))
+                        _ok = [r for r in _glpc if r["q_liq"] is not None]
+                        figl = go.Figure()
+                        figl.add_trace(go.Scatter(
+                            x=[_gq(r["q_inj"]) for r in _ok],
+                            y=[r["q_liq"] * _qf for r in _ok],
+                            mode="lines+markers", name="Liquid rate",
+                            line=dict(color=TH.DARK_NAVY, width=3)))
+                        _cur = [r for r in _ok if abs(r["q_inj"] - nd_gl["q_mscf_d"]) < 1e-6]
+                        if _cur:
+                            figl.add_trace(go.Scatter(
+                                x=[_gq(_cur[0]["q_inj"])], y=[_cur[0]["q_liq"] * _qf],
+                                mode="markers", name="Current lift-gas rate",
+                                marker=dict(size=14, color="#F2A900", symbol="star",
+                                            line=dict(color=TH.DARK_NAVY, width=1))))
+                        if _ok:
+                            _best = max(_ok, key=lambda r: r["q_liq"])
+                            figl.add_trace(go.Scatter(
+                                x=[_gq(_best["q_inj"])], y=[_best["q_liq"] * _qf],
+                                mode="markers", name="Maximum liquid rate",
+                                marker=dict(size=13, color=TH.PISTACHIO,
+                                            symbol="triangle-up",
+                                            line=dict(color=TH.DARK_NAVY, width=1))))
+                        figl.update_layout(**TH.plotly_layout(
+                            title="Gas-lift performance curve (IPR / VLP "
+                                  "operating point vs lift gas)",
+                            xtitle=f"Lift-gas rate ({_gq_u})",
+                            ytitle=f"Liquid rate ({q_lbl})", height=400))
+                        figl.update_xaxes(rangemode="tozero")
+                        figl.update_yaxes(rangemode="tozero")
+                        st.plotly_chart(figl, width='stretch', key="nd_glpc")
+                        _nf = [r for r in _glpc if r["q_inj"] == 0.0]
+                        if _nf and _nf[0]["q_liq"] is None:
+                            st.caption("At zero lift gas the well does not "
+                                       "flow naturally against this THP.")
+                        if _ok and _best["q_inj"] >= max(_qi) - 1e-6:
+                            st.caption("The liquid rate still rises at the "
+                                       "maximum lift-gas rate — extend the "
+                                       "range to find the optimum.")
+                        elif _ok:
+                            st.caption(
+                                f"Maximum liquid rate "
+                                f"{_best['q_liq'] * _qf:,.0f} {q_lbl} at "
+                                f"{_gq(_best['q_inj']):,.0f} {_gq_u} of lift "
+                                f"gas; beyond it extra gas adds friction "
+                                f"faster than it lightens the column. The "
+                                f"economic optimum lies to the left, where the "
+                                f"extra liquid no longer pays for the gas.")
+                        _gtab = pd.DataFrame({
+                            f"Lift gas ({_gq_u})": [_gq(r["q_inj"]) for r in _glpc],
+                            f"Liquid rate ({q_lbl})": [(r["q_liq"] * _qf if r["q_liq"] else None) for r in _glpc],
+                            f"Pwf ({L['P']})": [(U.to_user_P(r["pwf"], unit_system) if r["pwf"] else None) for r in _glpc]})
+                        st.download_button("⬇ Download gas-lift performance (CSV)",
+                                           _gtab.to_csv(index=False).encode(),
+                                           file_name="gas_lift_performance.csv",
+                                           mime="text/csv", key="nd_glpc_csv")
+                    else:
+                        st.caption("Turn on the IPR to get the gas-lift "
+                                   "performance curve (liquid rate vs lift gas).")
+
                 # ---- Engineering analysis ----
                 st.markdown("### Engineering analysis")
                 if valid and len(valid) >= 3:
@@ -9470,7 +9715,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     _q_bbl, _q_bbl * nd_GLR / 1000.0, nd_api,
                     nd_gas_sg, nd_wc, nd_sal, ID_in, nd_roughness,
                     chosen, hold_mult=nd_hold_mult, fric_mult=nd_fric_mult,
-                    pvt=nd_pvt)
+                    pvt=nd_pvt, **_gl_kw)
                 _x = (trav["stations_ft"] if unit_system == "Field"
                        else trav["stations_ft"] * 0.3048)
                 _xlbl = ("Distance from outlet (ft)"
@@ -9483,6 +9728,28 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                        for p in trav["P_psia"]],
                     mode="lines", name="Pressure",
                     line=dict(color=TH.DARK_NAVY, width=3)))
+                if _gl_kw and trav.get("P_inj_psia") is not None:
+                    _xi = _gl_kw["gl_inj_md_ft"] * _lf
+                    fig2.add_trace(go.Scatter(
+                        x=[_xi], y=[U.to_user_P(trav["P_inj_psia"], unit_system)],
+                        mode="markers", name="Gas-lift valve (tubing P)",
+                        marker=dict(size=13, color="#2a9d8f", symbol="diamond",
+                                    line=dict(color=TH.DARK_NAVY, width=1))))
+                    _pc0 = nd_gl["p_avail_psia"] or ND.required_surface_injection_pressure(
+                        trav["P_inj_psia"], _gl_tvd_ft, nd_gl["sg"], nd_Tout_F,
+                        nd_Tin_F, nd_gl["dp_valve_psi"])
+                    _mds = np.linspace(0.0, _gl_kw["gl_inj_md_ft"], 25)
+                    _tv_end = max(node_tvd_ft, 1.0)
+                    _pcs = [ND.gas_column_pressure(
+                        _pc0, float(np.interp(m, _tmd, _tz)), nd_gl["sg"], nd_Tout_F,
+                        nd_Tout_F + (nd_Tin_F - nd_Tout_F) * float(np.interp(m, _tmd, _tz)) / _tv_end,
+                        n_steps=15) for m in _mds]
+                    fig2.add_trace(go.Scatter(
+                        x=_mds * _lf, y=[U.to_user_P(p, unit_system) for p in _pcs],
+                        mode="lines", name=("Annulus gas — available injection P"
+                                            if nd_gl["p_avail_psia"] else
+                                            "Annulus gas — required injection P"),
+                        line=dict(color="#e76f51", width=2, dash="dash")))
                 fig2.update_layout(**TH.plotly_layout(
                     title=f"Pressure profile at {_trav_q:.0f} {q_lbl} "
                           f"— {chosen}",
@@ -9520,6 +9787,7 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     "method": chosen,
                     "hold_mult": nd_hold_mult, "fric_mult": nd_fric_mult,
                     "pvt": nd_pvt,
+                    "gl": (dict(_gl_kw) if _gl_kw else None),
                 }
 
         # ---- ECLIPSE VFP export ----
@@ -9586,6 +9854,38 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     vfp_glr_txt = st.text_input(
                         "GLR/GOR values",
                         value=_glr_default_disp, key="vfp_glr")
+                    _gl_last = _nd.get("gl")
+                    st.caption("**ALQ** — artificial-lift quantity")
+                    vfp_alq_kind = st.selectbox(
+                        "ALQ variable",
+                        ["None", "GRAT — lift-gas rate", "IGLR — injection GLR"],
+                        **({} if "vfp_alq_kind" in st.session_state else
+                           {"index": 1 if _gl_last else 0}),
+                        key="vfp_alq_kind",
+                        help="Gas-lift VFP: one BHP curve per lift-gas rate "
+                             "(GRAT) or injection gas-liquid ratio (IGLR). "
+                             "Lift gas enters at the valve depth of the "
+                             "gas-lift case.")
+                    vfp_alq_txt = ""
+                    if vfp_alq_kind.startswith("GRAT"):
+                        vfp_alq_txt = st.text_input(
+                            "Lift-gas rates "
+                            + ("(Mscf/d)" if unit_system == "Field" else "(Sm³/d)"),
+                            value=("0, 500, 1000, 2000" if unit_system == "Field"
+                                   else "0, 15000, 30000, 60000"),
+                            key=f"vfp_alq_grat_{unit_system}")
+                    elif vfp_alq_kind.startswith("IGLR"):
+                        vfp_alq_txt = st.text_input(
+                            "Injection GLR values "
+                            + ("(scf/STB)" if unit_system == "Field" else "(Sm³/Sm³)"),
+                            value=("0, 500, 1000, 2000" if unit_system == "Field"
+                                   else "0, 90, 180, 360"),
+                            key=f"vfp_alq_iglr_{unit_system}")
+                    if not vfp_alq_kind.startswith("None") and not _gl_last:
+                        st.caption("No gas-lift case is active: the valve "
+                                   "depth defaults to 80 % of the string "
+                                   "and lift gas uses gravity 0.65. Set up "
+                                   "gas lift above and rerun to control them.")
 
             # Parse the comma-separated sweeps in display units, then
             # convert back to field units (which the internal lift-curve
@@ -9612,6 +9912,22 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             else:
                 glr_field = [g * 5.6146 for g in glr_user]
 
+            _alq_user = _parse_list(vfp_alq_txt)
+            if vfp_alq_kind.startswith("GRAT"):
+                _alq_kind = "GRAT"
+                _alq_field = [a if unit_system == "Field" else a / 28.3168
+                              for a in _alq_user]
+            elif vfp_alq_kind.startswith("IGLR"):
+                _alq_kind = "IGLR"
+                _alq_field = [a if unit_system == "Field" else a * 5.6146
+                              for a in _alq_user]
+            else:
+                _alq_kind, _alq_field = " ", [0.0]
+            if _alq_kind != " " and not _alq_field:
+                _alq_kind, _alq_field = " ", [0.0]
+            _glv = _nd.get("gl") or {}
+            _gl_md_vfp = _glv.get("gl_inj_md_ft", 0.8 * _nd["depth_ft"])
+            _gl_sg_vfp = _glv.get("gl_gas_sg", 0.65)
             if (_nd.get("hold_mult", 1.0), _nd.get("fric_mult", 1.0)) != (1.0, 1.0):
                 st.caption(f"Calibrated {_nd.get('method')} multipliers "
                            f"(gravity × {_nd['hold_mult']:.3f}, friction × "
@@ -9620,11 +9936,12 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
             # Estimate eval count
             n_rates = len(_nd["rates_bbl_d"])
             n_eval_est = (len(thp_psia) * max(len(wct_vals), 1)
-                           * max(len(glr_field), 1) * n_rates)
+                           * max(len(glr_field), 1) * len(_alq_field) * n_rates)
             st.caption(f"Estimated {n_eval_est} nodal evaluations "
                         f"({len(thp_psia)} THP × "
                         f"{len(wct_vals)} WCT × "
                         f"{len(glr_field)} GLR × "
+                        f"{len(_alq_field)} ALQ × "
                         f"{n_rates} rates from the lift curve).")
             if n_eval_est > 2000:
                 st.warning("That's a lot of evaluations — this will "
@@ -9676,7 +9993,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                                    if vfp_method == _nd.get("method") else 1.0),
                         fric_mult=(_nd.get("fric_mult", 1.0)
                                    if vfp_method == _nd.get("method") else 1.0),
-                        pvt=_nd.get("pvt"))
+                        pvt=_nd.get("pvt"),
+                        alq_values=_alq_field, alq_kind=_alq_kind,
+                        gl_inj_md_ft=_gl_md_vfp, gl_gas_sg=_gl_sg_vfp)
                 except Exception as e:
                     pbar.empty()
                     st.error(f"VFP build failed: {e}")
@@ -9713,7 +10032,12 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                                   f"({_nd['depth_ft']*0.3048:.0f} m)\n"
                                   f"Fluid: API {_nd['api']:.1f}, "
                                   f"SG_gas {_nd['gas_sg']:.3f}\n"
-                                  f"Units: {vfp_units}"))
+                                  + (f"Gas lift: ALQ {_alq_kind}, valve MD "
+                                     f"{_gl_md_vfp:.0f} ft "
+                                     f"({_gl_md_vfp*0.3048:.0f} m), lift-gas "
+                                     f"SG {_gl_sg_vfp:.3f}\n"
+                                     if _alq_kind != " " else "")
+                                  + f"Units: {vfp_units}"))
                     st.session_state["_vfp_deck"] = deck
                     st.session_state["_vfp_table"] = tbl
 
@@ -9732,15 +10056,25 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                 _tbl = st.session_state.get("_vfp_table")
                 if _tbl is not None:
                     bhp = _tbl["bhp_table_disp"]
-                    nt, nw, ng, nq = bhp.shape
+                    if bhp.ndim == 4:
+                        bhp = bhp[:, :, :, None, :]
+                    nt, nw, ng, na, nq = bhp.shape
                     fig = go.Figure()
-                    # One curve per THP at the first WCT/GLR
-                    for it in range(min(nt, 6)):
-                        fig.add_trace(go.Scatter(
-                            x=_tbl["rates_disp"],
-                            y=bhp[it, 0, 0, :],
-                            mode="lines+markers",
-                            name=f"THP={_tbl['thp_disp'][it]:.0f}"))
+                    if na > 1:
+                        # One curve per ALQ at the first THP/WCT/GLR
+                        for ia in range(min(na, 8)):
+                            fig.add_trace(go.Scatter(
+                                x=_tbl["rates_disp"], y=bhp[0, 0, 0, ia, :],
+                                mode="lines+markers",
+                                name=f"ALQ={_tbl['alq_disp'][ia]:.4g}"))
+                    else:
+                        # One curve per THP at the first WCT/GLR
+                        for it in range(min(nt, 6)):
+                            fig.add_trace(go.Scatter(
+                                x=_tbl["rates_disp"],
+                                y=bhp[it, 0, 0, 0, :],
+                                mode="lines+markers",
+                                name=f"THP={_tbl['thp_disp'][it]:.0f}"))
                     _p_unit = "bara" if _tbl["units"] == "METRIC" else "psia"
                     _q_unit = ("Sm³/d" if _tbl["units"] == "METRIC"
                                 else ("STB/d" if vfp_flo == "LIQ" or vfp_flo == "OIL"
@@ -9748,7 +10082,9 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
                     fig.update_layout(**TH.plotly_layout(
                         title=f"VFP slice: BHP vs rate "
                               f"(WCT={_tbl['wfr_disp'][0]}, "
-                              f"GLR={_tbl['gfr_disp'][0]})",
+                              f"GLR={_tbl['gfr_disp'][0]:.4g}"
+                              + (f", THP={_tbl['thp_disp'][0]:.0f}" if na > 1 else "")
+                              + ")",
                         xtitle=f"Rate ({_q_unit})",
                         ytitle=f"BHP ({_p_unit})",
                         height=400))
@@ -9756,14 +10092,13 @@ elif fluid == "📈 Nodal Analysis / Lift Curves":
 
     st.markdown("---")
     st.caption(
-        "⚠️ Screening tool: Beggs-Brill (1973, rev. 1979), Hagedorn-"
-        "Brown (1965) with Griffith bubble correction, and Gray (1974) "
-        "are implemented. Duns-Ros and Orkiszewski are recommended where "
-        "appropriate but not implemented — the tool falls back to "
-        "Beggs-Brill in those cases. Fluid properties use screening "
-        "correlations (Sutton, Brill-Beggs Z, Lee viscosity, Standing-"
-        "style Rs/Bo). For design work use a mechanistic two-phase "
-        "model (PIPESIM, OLGA).")
+        "⚠️ Screening tool: seven multiphase correlations (Beggs & Brill, "
+        "Hagedorn & Brown, Gray, Mukherjee & Brill, Hasan & Kabir, "
+        "Orkiszewski, no-slip), screening or imported black-oil PVT, "
+        "continuous gas lift with a static annulus gas column and a fixed "
+        "valve ΔP (no valve mechanics / unloading design). Calibrate "
+        "against well tests; for design work use a full nodal / "
+        "transient tool (PROSPER, PIPESIM, OLGA).")
 
 
 # ================================================================

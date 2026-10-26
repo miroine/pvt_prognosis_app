@@ -8,7 +8,8 @@ required at a node as a function of:
     THP    — tubing-head pressure (the outlet pressure)
     WFR    — water-phase ratio (WCT, WGR, WOR)
     GFR    — gas-phase ratio (GOR, GLR, OGR)
-    ALQ    — artificial-lift quantity (we leave as 0)
+    ALQ    — artificial-lift quantity: lift-gas rate (GRAT) or injection
+             GLR (IGLR) for continuous gas lift, or none
 
 The simulator interpolates this table during a run to get inlet P as a
 function of operating conditions. Our `nodal.lift_curve` produces the
@@ -31,7 +32,7 @@ References:
     OPM Flow keyword reference (open-source equivalent)
 """
 
-APP_VERSION = "1.4.6"   # must match pvt_app.py (deployment check)
+APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
 import numpy as np
 from nodal import lift_curve, march_pressure
@@ -110,6 +111,10 @@ def build_vfp_table(
     hold_mult=1.0,
     fric_mult=1.0,
     pvt=None,
+    alq_values=None,
+    alq_kind=" ",
+    gl_inj_md_ft=None,
+    gl_gas_sg=None,
 ):
     """Build a VFPPROD table from a sweep of nodal calculations.
 
@@ -122,22 +127,28 @@ def build_vfp_table(
         n_evals        : number of nodal calculations done (for the UI
             progress bar).
 
-    Note: ALQ (artificial-lift quantity) is held at zero — we don't
-    model gas-lift here. The table body still has the ALQ dimension as
-    required by ECLIPSE; it just has a single value.
+    ALQ: alq_kind ' ' (none, single ALQ = 0), 'GRAT' (lift-gas rate,
+    alq_values in Mscf/d) or 'IGLR' (injection gas-liquid ratio, alq_values
+    in scf/STB). Lift gas enters at gl_inj_md_ft (MD from the outlet).
+    bhp_table_disp is indexed [thp][wfr][gfr][alq][rate].
     """
+    alq_kind = (alq_kind or " ").strip().upper() or " "
+    if alq_kind not in ("GRAT", "IGLR") or not alq_values:
+        alq_kind, alq_values = " ", [0.0]
     nq = len(flow_rates_bbl_d)
     nt = len(thp_values_psia)
     nw = max(1, len(wct_values))
     ng = max(1, len(glr_values_scf_stb))
+    na = len(alq_values)
 
-    bhp = np.full((nt, nw, ng, nq), np.nan)
+    bhp = np.full((nt, nw, ng, na, nq), np.nan)
 
     n_eval = 0
-    total = nt * nw * ng
+    total = nt * nw * ng * na
     for it, P_thp in enumerate(thp_values_psia):
-        for iw, wct in enumerate(wct_values):
-            for ig, glr in enumerate(glr_values_scf_stb):
+      for iw, wct in enumerate(wct_values):
+        for ig, glr in enumerate(glr_values_scf_stb):
+            for ia, alq in enumerate(alq_values):
                 # The FLO axis is in FLO units (STB/d for LIQ/OIL/WAT,
                 # Mscf/d for GAS). Convert each FLO value to the liquid
                 # rate the lift-curve march needs. Previously the axis was
@@ -164,12 +175,16 @@ def build_vfp_table(
                     hold_mult=hold_mult,
                     fric_mult=fric_mult,
                     pvt=pvt,
+                    gl_inj_mscf_d=(alq if alq_kind == "GRAT" else 0.0),
+                    gl_iglr_scf_stb=(alq if alq_kind == "IGLR" else None),
+                    gl_inj_md_ft=gl_inj_md_ft,
+                    gl_gas_sg=gl_gas_sg,
                 ) if ok else []
                 res = [{"P_inlet_psia": np.nan} for _ in flow_rates_bbl_d]
                 for i, r in zip(ok, res_ok):
                     res[i] = r
                 for iq, r in enumerate(res):
-                    bhp[it, iw, ig, iq] = r["P_inlet_psia"]
+                    bhp[it, iw, ig, ia, iq] = r["P_inlet_psia"]
                 n_eval += 1
                 if progress_callback is not None:
                     progress_callback(n_eval / total)
@@ -181,12 +196,16 @@ def build_vfp_table(
                        for q in flow_rates_bbl_d]
         thp_disp = [_conv_P(p, units) for p in thp_values_psia]
         gfr_disp = [_conv_ratio(g, units) for g in glr_values_scf_stb]
+        alq_disp = ([a * _MSCF_TO_SM3 for a in alq_values] if alq_kind == "GRAT"
+                    else [_conv_ratio(a, units) for a in alq_values]
+                    if alq_kind == "IGLR" else list(alq_values))
         bhp_disp = bhp * _PSIA_TO_BARA
         depth_disp = depth_ft * _FT_TO_M
     else:
         rates_disp = list(flow_rates_bbl_d)
         thp_disp = list(thp_values_psia)
         gfr_disp = list(glr_values_scf_stb)
+        alq_disp = list(alq_values)
         bhp_disp = bhp.copy()
         depth_disp = depth_ft
 
@@ -196,6 +215,8 @@ def build_vfp_table(
         "thp_disp": thp_disp,
         "wfr_disp": wfr_disp,
         "gfr_disp": gfr_disp,
+        "alq_disp": alq_disp,
+        "alq_kind": alq_kind,
         "bhp_table_disp": bhp_disp,
         "depth_disp": depth_disp,
         "n_evals": n_eval,
@@ -253,8 +274,8 @@ def format_vfpprod(table, comment=""):
     out.append(
         "-- table_no datum   FLO   WFR    GFR    ALQ  UNITS    TAB")
     out.append(
-        f"   {tno}    {depth:9.2f}  '{flo}'  'WCT'  'GLR'  ' '   "
-        f"{unit_tag}  'BHP' /")
+        f"   {tno}    {depth:9.2f}  '{flo}'  'WCT'  'GLR'  "
+        f"'{table.get('alq_kind', ' ')}'   {unit_tag}  'BHP' /")
 
     def _fmt_row(values, width=10, ncols=8):
         s = []
@@ -270,23 +291,40 @@ def format_vfpprod(table, comment=""):
     out.append(_fmt_row(thps) + " /")
     out.append("-- WFR (water-fraction) values")
     out.append(_fmt_row(wfrs) + " /")
-    out.append("-- GFR (gas ratio) values")
-    out.append(_fmt_row(gfrs) + " /")
-    out.append("-- ALQ values")
-    out.append("   0.0 /")
+    # ECLIPSE FIELD gas ratios are Mscf/STB (METRIC sm3/sm3). The table
+    # dict keeps scf/STB for display; the deck must be divided by 1000
+    # (it was written in scf/STB, i.e. 1000x too high).
+    out.append("-- GFR (gas ratio) values" + (" (Mscf/STB)" if units != "METRIC"
+                                              else " (Sm3/Sm3)"))
+    out.append(_fmt_row([g / 1000.0 for g in gfrs] if units != "METRIC"
+                        else gfrs) + " /")
+    _ak = table.get("alq_kind", " ")
+    out.append("-- ALQ values" + (" (lift-gas rate, "
+                                  + ("Sm3/d" if units == "METRIC" else "Mscf/d") + ")"
+                                  if _ak == "GRAT" else
+                                  " (injection GLR, "
+                                  + ("Sm3/Sm3" if units == "METRIC" else "Mscf/STB") + ")"
+                                  if _ak == "IGLR" else ""))
+    _alq = table.get("alq_disp", [0.0])
+    if _ak == "IGLR" and units != "METRIC":
+        _alq = [a / 1000.0 for a in _alq]          # scf/STB -> Mscf/STB
+    out.append(_fmt_row(_alq) + " /")
 
     out.append("-- BHP table body: thp wfr gfr alq <BHP at each rate>")
-    nt, nw, ng, nq = bhp.shape
+    if bhp.ndim == 4:                              # legacy 4-D table
+        bhp = bhp[:, :, :, None, :]
+    nt, nw, ng, na, nq = bhp.shape
     for it in range(nt):
         for iw in range(nw):
             for ig in range(ng):
-                bvals = [bhp[it, iw, ig, iq] for iq in range(nq)]
-                # Replace NaN with a large sentinel so the deck loads;
-                # the simulator will see the missing-data flag.
-                bvals = [v if v == v else 99999.0 for v in bvals]
-                row = f"   {it+1:2d} {iw+1:2d} {ig+1:2d}  1 "
-                row += " ".join(f"{v:10.4g}" for v in bvals)
-                row += " /"
-                out.append(row)
+                for ia in range(na):
+                    bvals = [bhp[it, iw, ig, ia, iq] for iq in range(nq)]
+                    # Replace NaN with a large sentinel so the deck loads;
+                    # the simulator will see the missing-data flag.
+                    bvals = [v if v == v else 99999.0 for v in bvals]
+                    row = f"   {it+1:2d} {iw+1:2d} {ig+1:2d} {ia+1:2d} "
+                    row += " ".join(f"{v:10.4g}" for v in bvals)
+                    row += " /"
+                    out.append(row)
     out.append("/")
     return "\n".join(out) + "\n"

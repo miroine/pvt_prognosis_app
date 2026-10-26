@@ -270,9 +270,9 @@ kw = dict(thp_values_psia=[200], wct_values=[0.5], glr_values_scf_stb=[500],
 liq = V.build_vfp_table(flow_rates_bbl_d=[1000], flo_kind="LIQ", **kw)
 oil_ = V.build_vfp_table(flow_rates_bbl_d=[500], flo_kind="OIL", **kw)
 gas_ = V.build_vfp_table(flow_rates_bbl_d=[500], flo_kind="GAS", **kw)
-b = liq["bhp_table_disp"][0, 0, 0, 0]
-check("VFP FLO=OIL axis consistent with LIQ", close(oil_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
-check("VFP FLO=GAS axis consistent with LIQ", close(gas_["bhp_table_disp"][0, 0, 0, 0], b, 1e-6))
+b = liq["bhp_table_disp"][0, 0, 0, 0, 0]
+check("VFP FLO=OIL axis consistent with LIQ", close(oil_["bhp_table_disp"][0, 0, 0, 0, 0], b, 1e-6))
+check("VFP FLO=GAS axis consistent with LIQ", close(gas_["bhp_table_disp"][0, 0, 0, 0, 0], b, 1e-6))
 
 
 # 9b. IPR / VLP at the solution node ---------------------------------------
@@ -424,6 +424,55 @@ check("VLP with the imported tables within 15 % of the correlation VLP (same flu
       str([round(x["P_inlet_psia"]) for x in _b]) + " vs " + str([round(y["P_inlet_psia"]) for y in _a]))
 _pgd = N.make_darcy_gas(4000.0, 10.0, 60.0, 220.0, 0.7, 1490.0, 0.354, 0.0, 0.0, pvt=_pg)
 check("Darcy gas IPR runs on mu*z from the imported gas table", _pgd["aof"] > 0)
+
+# 9f. Continuous gas lift + ALQ in the VFP ----------------------------------
+print("\n9f. Gas lift / ALQ")
+_gk = dict(GLR_scf_stb=150, P_outlet_psia=200, T_outlet_F=80, T_inlet_F=180,
+           segments=[(8000, 90)], api=30, gas_sg=0.75, water_cut_frac=0.5,
+           salinity_wt_pct=2, D_in_inch=2.992, rel_roughness=6e-4,
+           method="Hagedorn & Brown")
+_r0 = N.lift_curve([1500], **_gk)[0]["P_inlet_psia"]
+_r1 = N.lift_curve([1500], gl_inj_mscf_d=1000, gl_inj_md_ft=6500, **_gk)[0]["P_inlet_psia"]
+check("Lift gas lowers the flowing BHP", _r1 < _r0 - 200, f"{_r0:.0f} -> {_r1:.0f} psia")
+_ta = N.march_pressure(200, 80, 180, [(8000, 90)], 1500, 225, 30, 0.75, 0.5, 2,
+                       2.992, 6e-4, "Hagedorn & Brown")
+_tb = N.march_pressure(200, 80, 180, [(8000, 90)], 1500, 225, 30, 0.75, 0.5, 2,
+                       2.992, 6e-4, "Hagedorn & Brown", gl_inj_mscf_d=1000, gl_inj_md_ft=6500)
+_ga = np.diff(_ta["P_psia"]) / np.diff(_ta["stations_ft"])
+_gb = np.diff(_tb["P_psia"]) / np.diff(_tb["stations_ft"])
+_below = _tb["stations_ft"][1:] > 6600
+_pb_ = float(np.interp(6500, _tb["stations_ft"], _tb["P_psia"]))
+check("Below the valve the gradient is the natural-flow gradient (same P-dependence)",
+      abs(float(np.interp(_pb_ + 300, _ta["P_psia"], np.r_[_ga[0], _ga])) -
+          float(np.interp(_pb_ + 300, _tb["P_psia"], np.r_[_gb[0], _gb]))) < 0.02)
+check("Valve split exactly at the injection depth", np.isclose(_tb["stations_ft"], 6500).any())
+_gc_ = N.gas_column_pressure(1500.0, 6500.0, 0.7, 80.0, 160.0)
+_zav = N._gas_z_simple(1650.0, 120.0, 0.7)
+_ref = 1500.0 * np.exp(0.01875 * 0.7 * 6500.0 / (_zav * 579.67))
+check("Static gas column vs the average-Z closed form (+-1 %)", close(_gc_, _ref, 0.01),
+      f"{_gc_:.0f} vs {_ref:.0f} psia")
+_req = N.required_surface_injection_pressure(1200.0, 6500.0, 0.7, 80.0, 160.0, 100.0)
+check("Required casing-head P puts annulus at tubing P + valve dP",
+      close(N.gas_column_pressure(_req, 6500.0, 0.7, 80.0, 160.0), 1300.0, 1e-4))
+_ipr_ = N.calibrate_ipr(N.IPR_MODELS[0], 3000.0, 1000.0, 2500.0)
+_glpc_ = N.gas_lift_performance([0, 250, 1000, 4000], list(np.linspace(100, 6000, 20)),
+                                lambda q: N.ipr_pwf(_ipr_, q), dict(_gk, gl_inj_md_ft=6500))
+_ql = [r["q_liq"] for r in _glpc_]
+check("Gas-lift performance: dead at 0, rate rises with lift gas",
+      _ql[0] is None and all(a is not None for a in _ql[1:]) and _ql[1] < _ql[2],
+      str([None if v is None else round(v) for v in _ql]))
+_vt = V.build_vfp_table(flow_rates_bbl_d=[500, 1500], thp_values_psia=[200], wct_values=[0.5],
+                        glr_values_scf_stb=[150], depth_ft=8000, T_outlet_F=80, T_inlet_F=180,
+                        segments=[(8000, 90)], api=30, gas_sg=0.75, salinity_wt_pct=2,
+                        D_in_inch=2.992, rel_roughness=6e-4, method="Hagedorn & Brown",
+                        alq_values=[0, 1000], alq_kind="GRAT", gl_inj_md_ft=6500)
+_dk = V.format_vfpprod(_vt)
+check("VFP with ALQ: 5-D table, 'GRAT' header, two ALQ records, BHP falls with ALQ",
+      _vt["bhp_table_disp"].shape == (1, 1, 1, 2, 2) and "'GRAT'" in _dk
+      and "  1  1  1  2 " in _dk
+      and _vt["bhp_table_disp"][0, 0, 0, 1, 1] < _vt["bhp_table_disp"][0, 0, 0, 0, 1])
+check("VFP FIELD gas ratio written in Mscf/STB (150 scf/STB -> 0.15)",
+      "0.15 /" in _dk.split("-- GFR")[1].split("--")[0])
 
 # 10. Deployment stamp ------------------------------------------------------
 print("\n10. Deployment")
