@@ -34,6 +34,7 @@ References:
 
 APP_VERSION = "1.4.7"   # must match pvt_app.py (deployment check)
 
+import math
 import numpy as np
 from nodal import lift_curve, march_pressure
 
@@ -189,7 +190,13 @@ def build_vfp_table(
                 if progress_callback is not None:
                     progress_callback(n_eval / total)
 
-    # Display-unit copies
+    # Display-unit copies. The VFPPROD datum (item 2) is the TRUE VERTICAL
+    # depth the BHP values refer to; the table's inlet node sits at the
+    # bottom of the last segment, so datum = sum(L sin(theta)). The
+    # measured length (depth_ft) was written before, which is only right
+    # for a vertical well.
+    tvd_ft = sum(L * math.sin(math.radians(th)) for L, th in segments)
+    datum_ft = max(tvd_ft, 0.0) if segments else depth_ft
     if units == "METRIC":
         rates_disp = [(_conv_gas_rate(q, units) if flo_kind == "GAS"
                         else _conv_rate(q, flo_kind, units))
@@ -200,14 +207,16 @@ def build_vfp_table(
                     else [_conv_ratio(a, units) for a in alq_values]
                     if alq_kind == "IGLR" else list(alq_values))
         bhp_disp = bhp * _PSIA_TO_BARA
-        depth_disp = depth_ft * _FT_TO_M
+        depth_disp = datum_ft * _FT_TO_M
+        md_disp = depth_ft * _FT_TO_M
     else:
         rates_disp = list(flow_rates_bbl_d)
         thp_disp = list(thp_values_psia)
         gfr_disp = list(glr_values_scf_stb)
         alq_disp = list(alq_values)
         bhp_disp = bhp.copy()
-        depth_disp = depth_ft
+        depth_disp = datum_ft
+        md_disp = depth_ft
 
     wfr_disp = list(wct_values)
     return {
@@ -219,6 +228,7 @@ def build_vfp_table(
         "alq_kind": alq_kind,
         "bhp_table_disp": bhp_disp,
         "depth_disp": depth_disp,
+        "md_disp": md_disp,
         "n_evals": n_eval,
         "units": units,
         "method": method,

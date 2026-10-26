@@ -220,8 +220,11 @@ def _beggs_brill_holdup(v_sl, v_sg, D_ft, theta_deg, rho_l, sigma=30.0):
     else:
         H_L0 = lambda_l
     H_L0 = max(H_L0, lambda_l)   # cannot be less than no-slip
-    # Liquid velocity number for the inclination correction
-    Nlv = v_sl * (rho_l / (G_C * sigma * 1e-3)) ** 0.25
+    # Liquid velocity number for the inclination correction. Field form
+    # (ft/s, lb/ft3, dyn/cm): Nlv = 1.938 v_sl (rho_l / sigma)^0.25 — the
+    # same number used by H-B and M-B below. The previous expression
+    # divided by g_c*sigma*1e-3 and came out ~22 % too high.
+    Nlv = 1.938 * v_sl * (rho_l / max(sigma, 1e-3)) ** 0.25
     # C and B(angle) by flow pattern
     if theta_deg >= 0.0:
         # Uphill

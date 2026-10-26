@@ -74,6 +74,17 @@ reference).
   gas-lifted rates beyond the natural-flow curve.
 - Fix: FIELD VFPPROD gas ratios (GFR) are now written in Mscf/STB (they
   were written in scf/STB, 1000x too high). METRIC was correct.
+- Fix: the VFPPROD datum depth (header item 2) is now the TVD of the
+  inlet node, sum(L sin(theta)); the measured length was written before,
+  which is only right for a vertical well. The deck header comment now
+  records MD, datum TVD, ID, fluid, PVT source and temperatures so a
+  table can be reconciled against a PROSPER / PIPESIM model.
+- Fix: Beggs & Brill liquid-velocity number Nlv (inclination correction)
+  uses the field-unit form 1.938 v_sl (rho_l/sigma)^0.25; it was ~22 %
+  too high (small effect on uphill holdup).
+- UI: the "Inclined" geometry shows the resulting TVD and the equivalent
+  PROSPER deviation (from vertical). The app's inclination is measured
+  from HORIZONTAL: inclination = 90 - deviation.
 
 ## v1.4.6 — Imported ECLIPSE PVT for the nodal analysis
 
